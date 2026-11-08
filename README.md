@@ -13,8 +13,16 @@ The autopilot never reads game state directly. It only sees what its sensors put
 
 ## Status
 Architecture phase. **No code yet.**
-- The design lives in the PRD (Claude Docs): https://claude.ai/artifact/GMXC6hxBEY8Vg7T42goYwU. It holds the decision log, the architecture, and the implementation plan with Phases 0–6.
-- Open design questions are tracked as [issues](../../issues), each with possible solutions and a recommendation. Resolve the `blocker` issues first.
+
+| Doc | What's in it |
+| --- | --- |
+| [docs/PRD.md](docs/PRD.md) | Goals, features and sensors, architecture, buses, timing, tech stack, constraints, decision log D1–D21, spikes |
+| [docs/implementation-plan.md](docs/implementation-plan.md) | Crate layout, contracts to freeze first (IPC, graphics shim, config), Phases 0–6 with checklists and gates |
+| [docs/design-review.md](docs/design-review.md) | The first design review: a critique of every decision, with alternatives |
+
+These were exported on 2026-11-08 from the [Claude Doc](https://claude.ai/artifact/GMXC6hxBEY8Vg7T42goYwU). **The copies in `docs/` are the ones to edit from now on.**
+
+Open design questions are tracked as [issues](../../issues), each with possible solutions and a recommendation. They come from a second, independent review and **aren't reflected in `docs/` yet**. Resolve the `blocker` issues first, then update the docs as each one is decided.
 
 ## Target machine
 A gaming PC with an RTX 4070 Ti (12 GB) and a Ryzen 7 7800X3D. GTA and all builds and tests run there.

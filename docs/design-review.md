@@ -8,6 +8,8 @@ Keep 7, change 8. D12 is now decided as recommended. Most changes refine a decis
 
 **Outcome:** every recommendation below was accepted on 2026-11-08 and applied to the PRD's decision log as D1 to D21.
 
+**Superseded in part:** a second, independent review (GitHub issues #1–#11) revised several of these decisions on 2026-11-08 and added D22–D29. Where this page and the PRD disagree, the PRD wins. This page is kept as the record of the first review.
+
 | ID | Decision | Verdict | The change, in one line |
 | --- | --- | --- | --- |
 | D1 | Rust core | Keep | Speed comes from the architecture; Rust buys safety and tooling |
@@ -46,7 +48,7 @@ Enhanced is the right target: better visuals help the camera models, and it's wh
 | Option | Good | Bad |
 | --- | --- | --- |
 | **Enhanced only** (current) | Best visuals; one target | If depth access fails (S2), lidar and vision are blocked with no plan B |
-| Legacy only | DX11 is easy to hook; DeepGTAV-era code and offsets apply; no BattlEye | Worse visuals; older edition, likely to get less mod attention over time |
+| Legacy only | DX11 is easy to hook; DeepGTAV-era code and offsets apply (Legacy has also had BattlEye since September 2024, bypassed the same way with `-nobattleye`) | Worse visuals; older edition, likely to get less mod attention over time |
 | **Enhanced target, Legacy fallback** | Same plan, plus an exit if S2 fails; Script Hook V code is identical on both | Edition-specific code must be kept in one place |
 | Support both permanently | Widest reach | Double testing for every patch |
 
@@ -106,7 +108,7 @@ Starting with ground truth is right, but it has a trap. Features tuned on perfec
 | **Ground truth through Phase 4, then vision** (current) | Fast path to a drivable car | Features overfit to perfect data |
 | Vision from day one | Realistic from the start | Months before anything drives; perception and control bugs get tangled |
 | Ground truth forever, vision only for show | Simplest | Gives up the "how a real car sees" goal |
-| **Ground truth through a sensor error model** | Misses, false positives, position noise and latency per sensor; tuned to real sensor specs | Error model takes about a week to build |
+| **Ground truth through a sensor error model** | Misses, false positives, position noise and latency per sensor; tuned to real sensor specs | A real piece of work to build and tune |
 | **Ground truth recorded alongside vision as a scoring oracle** | Measures vision accuracy for free, every drive | More recording volume |
 
 **Recommendation: keep the order and add both.** Make the error model mandatory from Phase 2; calibrate it later from measured vision errors. Record ground truth on every drive so Phase 5 can score vision against it.
@@ -197,7 +199,7 @@ Decided: GTA and the core run on a dedicated gaming PC with an RTX 4070 Ti and a
 
 ## D13 · openpilot: change to borrowing pieces now
 
-Running openpilot whole is a fun Phase 6 stretch goal. Its pieces are useful much earlier, and waiting means re-deriving what it already solved. openpilot is MIT-licensed and runs on Linux, so it would need WSL2, which this machine already uses for Docker.
+Running openpilot whole is a fun Phase 6 stretch goal. Its pieces are useful much earlier, and waiting means re-deriving what it already solved. openpilot is MIT-licensed and runs on Linux, so it would need WSL2 on the gaming PC.
 
 | Option | Good | Bad |
 | --- | --- | --- |

@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "spikes/*", "xtask"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[profile.release]
+# Keep line tables so a crash inside the game still gives a usable stack.
+debug = "line-tables-only"

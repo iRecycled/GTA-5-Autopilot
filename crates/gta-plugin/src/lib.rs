@@ -9,7 +9,7 @@
 //! - on release, steering stops at once, throttle is dropped and any brake
 //!   fades out over about a second; TAKE OVER shows on the HUD.
 //!
-//! Driver keys: F10 engage / cancel ACC · Page Up / Page Down set speed ±5 km/h
+//! Driver keys: F10 engage / cancel ACC · F3 cancel · Page Up / Page Down set speed ±5 km/h
 //! · Home cycle the time gap. AEB is always armed.
 //! Test keys: F6 60 fps cap · F7 teleport to the next test spot · F8 spawn a
 //! Sultan · F9 GTA AI drives · F11 spawn a lead car ahead (12 m/s) · F5 the
@@ -47,6 +47,7 @@ const VK_F7: i32 = 0x76;
 const VK_F8: i32 = 0x77;
 const VK_F9: i32 = 0x78;
 const VK_F10: i32 = 0x79;
+const VK_F3: i32 = 0x72;
 const VK_F4: i32 = 0x73;
 const VK_F5: i32 = 0x74;
 const VK_F11: i32 = 0x7A;
@@ -105,7 +106,7 @@ fn run_stem() -> String {
 }
 
 struct Keys {
-    prev: [bool; 11],
+    prev: [bool; 12],
 }
 
 impl Keys {
@@ -184,7 +185,7 @@ fn run() {
     };
     let _ = log.flush();
 
-    let mut keys = Keys { prev: [false; 11] };
+    let mut keys = Keys { prev: [false; 12] };
     let mut lead: Option<tools::Lead> = None;
     let mut aeb_last = false;
     let mut fcw_last = false;
@@ -245,7 +246,13 @@ fn run() {
             cap60 = !cap60;
             let _ = writeln!(log, "frame {frame}: 60 fps cap {}", if cap60 { "ON" } else { "OFF" });
         }
+        if keys.pressed(11, VK_F3) && engage_req {
+            engage_req = false;
+            let _ = writeln!(log, "frame {frame}: cancel button");
+        }
         if keys.pressed(1, VK_F7) {
+            // Test cars from an earlier test stay behind otherwise.
+            tools::clear_lead(&mut lead);
             tools::teleport(ped, veh, spot, &mut log);
             spot = (spot + 1) % tools::spot_count().max(1);
             last_tick = wall_time_ns();

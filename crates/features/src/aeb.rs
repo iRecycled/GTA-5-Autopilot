@@ -54,14 +54,14 @@ impl Default for AebConfig {
             partial_ttc: 1.6,
             full_ttc: 0.9,
             hysteresis: 0.4,
-            partial_decel_cmd: 4.0,
+            partial_decel_cmd: 5.0,
             hold_time: 3.0,
             min_speed: 2.0,
             min_closing: 1.0,
             min_brake_time: 0.5,
             driver_cancel_throttle: 0.8,
-            partial_decel: 3.0,
-            full_decel: 5.0,
+            partial_decel: 4.0,
+            full_decel: 6.5,
             stop_margin: 1.0,
         }
     }
@@ -191,7 +191,7 @@ mod tests {
         // 34 m: TTC 2.4 s and 2.97 m/s² needed: warn only.
         assert_eq!(a.step(0.01, v, Some(lead(34.0, 0.0)), 0.0, 0.0).stage, AebStage::Warn);
         let r = a.step(0.01, v, Some(lead(24.0, 0.0)), 0.0, 0.0); // 1.7 s, 4.3 m/s² needed
-        assert_eq!((r.stage, r.decel), (AebStage::Partial, 4.0));
+        assert_eq!((r.stage, r.decel), (AebStage::Partial, 5.0));
         let r = a.step(0.01, v, Some(lead(10.0, 0.0)), 0.0, 0.0); // 0.7 s
         assert_eq!((r.stage, r.decel), (AebStage::Full, f32::INFINITY));
         assert_eq!(a.activations, 1);

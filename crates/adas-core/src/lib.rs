@@ -75,11 +75,16 @@ pub struct Core {
     prev_speed: Option<f32>,
     /// The AEB deceleration loop's integral (brake demand).
     aeb_i: f32,
+    /// The host's brake gain, learned on line: deceleration per unit of brake
+    /// demand (m/s²). Hosts differ a lot (sim 8, GTA about 80 at light
+    /// braking); this is the D19 vehicle profile, learned rather than tuned.
+    brake_gain: f32,
+    prev_brake: f32,
 }
 
-/// Feed-forward guess for the AEB deceleration loop: deceleration per unit of
-/// brake demand (m/s²). The integral corrects for the host's real brakes.
-const BRAKE_FF_GAIN: f32 = 8.0;
+/// Starting guess for the brake gain (m/s² per unit of brake demand); learned
+/// from then on. The deceleration loop's integral covers the rest.
+const BRAKE_GAIN_INIT: f32 = 8.0;
 /// Integral gain of the AEB deceleration loop (demand per m/s²·s).
 const AEB_KI: f32 = 0.35;
 
@@ -115,6 +120,8 @@ impl Core {
             a_est: 0.0,
             prev_speed: None,
             aeb_i: 0.0,
+            brake_gain: BRAKE_GAIN_INIT,
+            prev_brake: 0.0,
         }
     }
 
@@ -162,13 +169,18 @@ impl Core {
         let dt = if self.last_game_us == 0 { 0.0 } else { s.header.game_time_us.saturating_sub(self.last_game_us) as f32 / 1e6 };
         self.last_game_us = s.header.game_time_us;
 
-        // Acceleration from speed (the deceleration loop's feedback).
+        // Acceleration from speed (the deceleration loop's feedback), and the
+        // brake gain from what last frame's brake demand achieved.
         if dt > 0.0 && !paused {
             if let Some(p) = self.prev_speed {
                 let a = (s.speed - p) / dt;
                 self.a_est += (a - self.a_est) * (dt / 0.08).min(1.0);
             }
             self.prev_speed = Some(s.speed);
+            if self.prev_brake >= 0.03 && s.speed > 2.0 && self.a_est < -0.5 {
+                let g = (-self.a_est / self.prev_brake).clamp(3.0, 150.0);
+                self.brake_gain += (g - self.brake_gain) * (dt / 0.5).min(1.0);
+            }
         }
 
         // --- Perception (always) ---
@@ -264,7 +276,7 @@ impl Core {
                 // Track the requested deceleration on the host's brakes.
                 let brake = if a.decel.is_finite() {
                     self.aeb_i = (self.aeb_i + AEB_KI * (a.decel + self.a_est) * dt).clamp(-0.6, 0.6);
-                    (a.decel / BRAKE_FF_GAIN + self.aeb_i).clamp(0.05, 1.0)
+                    (a.decel / self.brake_gain + self.aeb_i).clamp(0.02, 1.0)
                 } else {
                     1.0
                 };
@@ -281,6 +293,9 @@ impl Core {
                 cmd.brake = 0.0;
             }
         }
+
+        // Only a commanded brake that the host will apply counts for learning.
+        self.prev_brake = if cmd.flags & (command_flags::ENGAGED | command_flags::AEB) != 0 && !paused { cmd.brake } else { 0.0 };
 
         // --- HUD ---
         let acc_on = self.state != State::Off && matches!(self.feature, Feature::Acc(_));

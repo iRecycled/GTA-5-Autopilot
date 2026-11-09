@@ -17,6 +17,7 @@
 
 pub mod actuators;
 pub mod degrade;
+pub mod driver;
 pub mod features;
 pub mod layout;
 pub mod msgs;
@@ -54,7 +55,7 @@ pub enum State {
 pub enum Event {
     None,
     Engaged,
-    /// The driver braked or steered.
+    /// The driver braked.
     CancelledByDriver,
     /// The engage request was withdrawn.
     Disengaged,
@@ -63,9 +64,24 @@ pub enum Event {
     /// An impact was detected (as an airbag controller's crash signal would
     /// report it): everything is cancelled.
     Impact,
-    /// The feature can't run (D21): engaging was refused, or it disengaged.
+    /// The feature can't run (D21): engaging was refused, or, while engaged,
+    /// a takeover request starts (D11).
     Unavailable(degrade::Reason),
+    /// The driver answered a takeover request (accelerator or steering).
+    TakenOver,
+    /// A takeover request went unanswered: the car makes a controlled stop
+    /// with its hazard lights on.
+    ControlledStop,
 }
+
+/// Takeover escalation (D11): a visual request at once, a chime from
+/// `TAKEOVER_CHIME_AFTER`, a controlled stop at `TAKEOVER_DECEL` from
+/// `TAKEOVER_STOP_AFTER` (s since the request).
+pub const TAKEOVER_CHIME_AFTER: f32 = 1.5;
+pub const TAKEOVER_STOP_AFTER: f32 = 4.0;
+pub const TAKEOVER_DECEL: f32 = 2.0;
+/// The controlled stop's deceleration builds up over this long (s).
+pub const TAKEOVER_DECEL_RAMP: f32 = 0.8;
 
 /// An impact, as crash sensing judges one: more than `IMPACT_DV` of speed
 /// lost within `IMPACT_WINDOW_US` (a mean of over 15 m/s², about 1.5 g).
@@ -117,6 +133,9 @@ pub struct Core {
     avail: degrade::Availability,
     /// Track ids of the follow lead and the collision threat, last step (for views).
     lead_ids: (Option<u32>, Option<u32>),
+    driver: driver::DriverMonitor,
+    /// A takeover request in progress: (seconds since it started, why).
+    takeover: Option<(f32, degrade::Reason)>,
 }
 
 /// Starting guess for the brake gain (m/s² per unit of brake demand); learned
@@ -186,7 +205,14 @@ impl Core {
             scan_arrived: false,
             avail: degrade::evaluate(None, degrade::Health::default()),
             lead_ids: (None, None),
+            driver: driver::DriverMonitor::new(),
+            takeover: None,
         }
+    }
+
+    /// The takeover request in progress, if any: (seconds since it started, why).
+    pub fn takeover(&self) -> Option<(f32, degrade::Reason)> {
+        self.takeover
     }
 
     /// Track ids of the follow lead and the collision threat after the last step.
@@ -255,12 +281,14 @@ impl Core {
     pub fn step(&mut self, inp: Inputs) -> (Command, Event) {
         let host = inp.sample;
         let request = host.flags & sample_flags::ENGAGE_REQUEST != 0;
-        let cancel = host.flags & sample_flags::DRIVER_CANCEL != 0;
-        let override_ = host.flags & sample_flags::DRIVER_OVERRIDE != 0;
         let paused = host.flags & sample_flags::PAUSED != 0;
 
         let dt = if self.last_game_us == 0 { 0.0 } else { host.header.game_time_us.saturating_sub(self.last_game_us) as f32 / 1e6 };
         self.last_game_us = host.header.game_time_us;
+
+        // The driver (D11): brake cancels, gas overrides, steering pauses lateral.
+        let drv = self.driver.step(host, if paused { 0.0 } else { dt });
+        let (cancel, override_) = (drv.brake, drv.gas);
 
         // --- The buses and perception (always) ---
         // From here on the core works on the car as the ADAS ECU sees it on
@@ -339,8 +367,34 @@ impl Core {
         if impact && self.state != State::Off {
             self.state = State::Off;
             event = Event::Impact;
+        } else if self.state != State::Off
+            && let Some((t, why)) = self.takeover
+        {
+            // A takeover request runs until the driver answers it (D11).
+            if cancel {
+                self.state = State::Off;
+                event = Event::CancelledByDriver;
+            } else if !request {
+                self.state = State::Off;
+                event = Event::Disengaged;
+            } else if drv.gas || drv.steering {
+                self.state = State::Off;
+                event = Event::TakenOver;
+            } else if aeb_braking {
+                self.state = State::Off;
+                event = Event::CancelledByAeb;
+            } else {
+                let t2 = if paused { t } else { t + dt };
+                if t < TAKEOVER_STOP_AFTER && t2 >= TAKEOVER_STOP_AFTER {
+                    event = Event::ControlledStop;
+                }
+                self.takeover = Some((t2, why));
+                self.state = State::Active;
+            }
         } else if self.state != State::Off && let Err(r) = feature_ok {
-            self.state = State::Off;
+            // The feature can't continue: ask the driver to take over.
+            self.takeover = Some((0.0, r));
+            self.state = State::Active;
             event = Event::Unavailable(r);
         } else if self.state == State::Off {
             if request && !self.prev_request && !cancel && !aeb_braking && let Err(r) = feature_ok {
@@ -368,9 +422,14 @@ impl Core {
             self.state = if override_ { State::Override } else { State::Active };
         }
         self.prev_request = request;
+        if self.state == State::Off {
+            self.takeover = None;
+        }
+        let takeover_t = self.takeover.map(|(t, _)| t);
+        let stopping = takeover_t.is_some_and(|t| t >= TAKEOVER_STOP_AFTER);
 
-        // Buttons work while ACC is engaged.
-        if self.state != State::Off && matches!(self.feature, Feature::Acc(_)) {
+        // Buttons work while ACC is engaged (not during a takeover request).
+        if self.state != State::Off && takeover_t.is_none() && matches!(self.feature, Feature::Acc(_)) {
             if s.buttons & buttons::SPEED_UP != 0 {
                 self.acc.speed_up();
             }
@@ -390,7 +449,9 @@ impl Core {
         let mut following = false;
         if self.state != State::Off {
             cmd.flags = command_flags::ENGAGED;
-            if !paused && dt > 0.0 {
+            // During a takeover request the feature doesn't run: the car
+            // coasts, then makes a controlled stop (below).
+            if !paused && dt > 0.0 && takeover_t.is_none() {
                 self.t_engaged += dt;
                 let out = features::run(
                     &self.feature,
@@ -417,6 +478,10 @@ impl Core {
                 cmd.diag = out.diag;
             }
         }
+        // The driver steering pauses lateral control (D11).
+        if drv.steering {
+            cmd.flags &= !command_flags::STEER;
+        }
 
         // --- Arbitration: AEB wins (in the brake ECU) ---
         let gains = actuators::Gains { throttle: THROTTLE_GAIN, brake: self.brake_gain };
@@ -427,6 +492,13 @@ impl Core {
             req.hold = cmd.flags & command_flags::HOLD != 0;
             req.steer_request = cmd.flags & command_flags::STEER != 0;
             req.steer_angle = cmd.steer_angle;
+        }
+        if let Some(t) = takeover_t.filter(|_| stopping) {
+            // The controlled stop: a steady deceleration, ramped in to limit
+            // jerk (about 2.5 m/s³), then the standstill hold, hazards on.
+            let ramp = ((t - TAKEOVER_STOP_AFTER) / TAKEOVER_DECEL_RAMP).clamp(0.0, 1.0);
+            req.accel = -TAKEOVER_DECEL * ramp;
+            req.hold = s.speed < 0.3;
         }
         if let Some(a) = aeb {
             if a.warn {
@@ -462,11 +534,15 @@ impl Core {
             }
         }
 
+        if stopping {
+            cmd.flags |= command_flags::HAZARDS;
+        }
+
         // Only a commanded brake that the host will apply counts for learning.
         self.prev_brake = if cmd.flags & (command_flags::ENGAGED | command_flags::AEB) != 0 && !paused { cmd.brake } else { 0.0 };
 
         // --- HUD ---
-        let acc_on = self.state != State::Off && matches!(self.feature, Feature::Acc(_));
+        let acc_on = self.state != State::Off && takeover_t.is_none() && matches!(self.feature, Feature::Acc(_));
         let mut f = 0;
         if acc_on {
             f |= hud_flags::ACC;
@@ -489,13 +565,24 @@ impl Core {
         if self.state == State::Override {
             f |= hud_flags::OVERRIDE;
         }
-        let message = match feature_ok {
+        let mut message = match feature_ok {
             Err(r) => {
                 f |= hud_flags::UNAVAILABLE;
                 r.code()
             }
             Ok(()) => 0,
         };
+        if let Some((t, why)) = self.takeover {
+            // The request stands until the driver answers, even if the cause clears.
+            f |= hud_flags::TAKEOVER;
+            if t >= TAKEOVER_CHIME_AFTER {
+                f |= hud_flags::TAKEOVER_CHIME;
+            }
+            if t >= TAKEOVER_STOP_AFTER {
+                f |= hud_flags::CONTROLLED_STOP;
+            }
+            message = why.code();
+        }
         if self.avail.aeb.is_err() {
             f |= hud_flags::AEB_OFF;
         }
@@ -684,6 +771,104 @@ mod tests {
             let (_, e) = step(&mut core, i, sample_flags::ENGAGE_REQUEST, v);
             assert_ne!(e, Event::Impact, "glitch at step {i}");
         }
+    }
+
+    /// ACC at 20 m/s, then the radar's bus goes silent for good.
+    fn acc_with_a_dead_radar() -> (Core, u32) {
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        core.set_info(&full_info());
+        let mut seq = 1;
+        for _ in 0..60 {
+            step(&mut core, seq, sample_flags::ENGAGE_REQUEST, 20.0);
+            seq += 1;
+        }
+        assert_eq!(core.state(), State::Active);
+        core.vehicle_mut().inject("adas", None, can::FaultKind::Drop, 1.0, f64::NEG_INFINITY, f64::INFINITY).unwrap();
+        (core, seq)
+    }
+
+    #[test]
+    fn an_unanswered_takeover_request_escalates_to_a_controlled_stop() {
+        let (mut core, mut seq) = acc_with_a_dead_radar();
+        let mut events = Vec::new();
+        let (mut asked, mut chimed, mut stopped) = (None, None, None);
+        let mut speed = 20.0f32;
+        let mut last = Command::default();
+        for _ in 0..60 * 20 {
+            let (c, e) = step(&mut core, seq, sample_flags::ENGAGE_REQUEST, speed);
+            let t = seq as f32 / 60.0;
+            if e != Event::None {
+                events.push(e);
+            }
+            let f = core.hud().flags;
+            if f & hud_flags::TAKEOVER != 0 && asked.is_none() {
+                asked = Some(t);
+            }
+            if f & hud_flags::TAKEOVER_CHIME != 0 && chimed.is_none() {
+                chimed = Some(t);
+            }
+            if f & hud_flags::CONTROLLED_STOP != 0 && stopped.is_none() {
+                stopped = Some(t);
+            }
+            // The car obeys the brake (8 m/s² per unit, the initial gain).
+            speed = (speed - 8.0 * c.brake / 60.0).max(0.0);
+            last = c;
+            seq += 1;
+        }
+        let (asked, chimed, stopped) = (asked.expect("takeover requested"), chimed.expect("chime"), stopped.expect("controlled stop"));
+        assert!(matches!(events[0], Event::Unavailable(degrade::Reason::RadarSilent)), "{events:?}");
+        assert!(events.contains(&Event::ControlledStop), "{events:?}");
+        assert!((chimed - asked - TAKEOVER_CHIME_AFTER).abs() < 0.05 && (stopped - asked - TAKEOVER_STOP_AFTER).abs() < 0.05);
+        // Stopped, held, hazards on, still engaged (the system has the car).
+        assert!(speed < 0.3, "still at {speed} m/s");
+        assert!(last.flags & command_flags::HAZARDS != 0 && last.flags & command_flags::HOLD != 0 && last.flags & command_flags::ENGAGED != 0);
+        assert_eq!(core.hud().message, degrade::Reason::RadarSilent.code());
+    }
+
+    #[test]
+    fn the_driver_answers_a_takeover_request_with_the_accelerator() {
+        let (mut core, mut seq) = acc_with_a_dead_radar();
+        for _ in 0..60 * 2 {
+            step(&mut core, seq, sample_flags::ENGAGE_REQUEST, 20.0);
+            seq += 1;
+        }
+        assert!(core.takeover().is_some());
+        let mut s = sample(seq, sample_flags::ENGAGE_REQUEST, 20.0);
+        s.driver_throttle = 0.3;
+        let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), stick: None });
+        assert_eq!(e, Event::TakenOver);
+        assert_eq!(c.flags & command_flags::HAZARDS, 0);
+        assert_eq!(core.state(), State::Off);
+        assert_eq!(core.hud().flags & hud_flags::TAKEOVER, 0);
+    }
+
+    #[test]
+    fn steering_pauses_lateral_but_does_not_cancel() {
+        let mut core = with_info(Feature::TestDriver(Default::default()), false);
+        let stick = Some(Stick { throttle: 0.0, brake: 0.0, steer: 0.5 });
+        let mut steered = |seq: u32, driver_steer: f32| {
+            let mut s = sample(seq, sample_flags::ENGAGE_REQUEST, 5.0);
+            s.driver_steer = driver_steer;
+            let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), stick });
+            (c.flags & command_flags::STEER != 0, e)
+        };
+        let mut seq = 1;
+        for _ in 0..30 {
+            steered(seq, 0.0);
+            seq += 1;
+        }
+        assert!(steered(seq, 0.0).0, "the test driver steers");
+        // The driver holds a steering key for half a second.
+        let mut flags = Vec::new();
+        for _ in 0..30 {
+            seq += 1;
+            let (st, e) = steered(seq, 1.0);
+            assert_ne!(e, Event::CancelledByDriver);
+            flags.push(st);
+        }
+        assert!(flags[0], "a key tap doesn't count yet");
+        assert!(!*flags.last().unwrap(), "held: lateral control paused");
+        assert_ne!(core.state(), State::Off);
     }
 
     #[test]

@@ -189,6 +189,10 @@ fn run() {
     let mut lead: Option<tools::Lead> = None;
     let mut aeb_last = false;
     let mut fcw_last = false;
+    // D11: the core was engaged last fresh frame; hazards; the last chime.
+    let mut core_was_engaged = false;
+    let mut hazards_on = false;
+    let mut last_chime = 0u64;
     let mut cap60 = false;
     let mut spot = 0usize;
     // Set once a test tool has been used (F7 or F8): police stay away from then on.
@@ -267,7 +271,9 @@ fn run() {
         }
         if keys.pressed(2, VK_F8) {
             test_mode = true;
-            tools::spawn(ped, c"sultan", &mut test_car, &mut log);
+            let model = tools::test_car_model();
+            let _ = writeln!(log, "frame {frame}: test car {}", model.to_string_lossy());
+            tools::spawn(ped, &model, &mut test_car, &mut log);
             last_tick = wall_time_ns();
         }
         if keys.pressed(3, VK_F9) && in_vehicle {
@@ -313,14 +319,11 @@ fn run() {
         }
 
         // --- Driver input (from Windows, D5) ---
+        // The core decides cancel and override from the raw inputs (D11); the
+        // adapter only lets the driver's pedals win at once.
         let drv = if ai { input::Driver::default() } else { input::read() };
-        let driver_cancel = drv.cancels();
-        let driver_override = drv.overrides();
-        if engage_req && driver_cancel {
-            engage_req = false;
-            let _ = writeln!(log, "frame {frame}: CANCELLED by driver (brake {:.2}, steer {:.2})", drv.brake, drv.steer);
-        }
-        if driver_override || driver_cancel {
+        let driver_override = drv.on_pedals();
+        if drv.active() {
             ramp.cancel();
         }
 
@@ -394,8 +397,7 @@ fn run() {
         }
         s.flags = if paused { sample_flags::PAUSED } else { 0 }
             | if engage_req { sample_flags::ENGAGE_REQUEST } else { 0 }
-            | if driver_override { sample_flags::DRIVER_OVERRIDE } else { 0 }
-            | if driver_cancel { sample_flags::DRIVER_CANCEL } else { 0 };
+            | if drv.analog { sample_flags::INPUT_ANALOG } else { 0 };
         s.buttons = btn;
         seq = seq.wrapping_add(1);
         s.header = Header { kind: MsgKind::VehicleSample, version: CONTRACT_VERSION, seq, frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() };
@@ -446,7 +448,26 @@ fn run() {
         let age = seq.wrapping_sub(cmd.answers_seq);
         let fresh = cmd.answers_seq != 0 && age <= WATCHDOG_FRAMES && !core_exited;
         let core_engaged = cmd.flags & command_flags::ENGAGED != 0;
+        // The core disengaged (driver cancel, takeover answered, ...): the
+        // engage request resets, as a stalk does.
+        if engage_req && fresh && core_was_engaged && !core_engaged && !paused {
+            engage_req = false;
+            let _ = writeln!(log, "frame {frame}: core disengaged (brake {:.2}, gas {:.2}, steer {:.2})", drv.brake, drv.throttle, drv.steer);
+        }
+        if fresh {
+            core_was_engaged = core_engaged && engage_req;
+        }
         let active = in_vehicle && engage_req && core_engaged && fresh && !paused;
+        // Hazard lights for a controlled stop (D11).
+        let want_hazards = active && cmd.flags & command_flags::HAZARDS != 0;
+        if want_hazards != hazards_on && in_vehicle {
+            unsafe {
+                let () = invoke!(n::SET_VEHICLE_INDICATOR_LIGHTS, veh, 0i32, want_hazards);
+                let () = invoke!(n::SET_VEHICLE_INDICATOR_LIGHTS, veh, 1i32, want_hazards);
+            }
+            hazards_on = want_hazards;
+            let _ = writeln!(log, "frame {frame}: hazards {}", if want_hazards { "ON (controlled stop)" } else { "off" });
+        }
         // AEB acts whether or not anything is engaged, and over the accelerator.
         let aeb = in_vehicle && fresh && !paused && cmd.flags & command_flags::AEB != 0;
         if aeb && engage_req {
@@ -613,6 +634,12 @@ fn run() {
             let () = unsafe { invoke!(n::PLAY_SOUND_FRONTEND, -1i32, c"TIMER_STOP", c"HUD_MINI_GAME_SOUNDSET", true) };
         }
         fcw_last = fcw;
+        // D11: a takeover request shows at once, chimes once escalated.
+        let takeover = hud_live && hud.flags & hud_flags::TAKEOVER != 0;
+        if takeover && hud.flags & hud_flags::TAKEOVER_CHIME != 0 && wall_time_ns().saturating_sub(last_chime) > 1_000_000_000 {
+            let () = unsafe { invoke!(n::PLAY_SOUND_FRONTEND, -1i32, c"5_SEC_WARNING", c"HUD_MINI_GAME_SOUNDSET", true) };
+            last_chime = wall_time_ns();
+        }
         unsafe {
             let () = invoke!(n::DRAW_RECT, 0.25f32, 0.065f32, 0.48f32, 0.11f32, 0i32, 0i32, 0i32, 160i32, false);
             let (label, colour) = if wall_time_ns() < takeover_until {
@@ -659,6 +686,16 @@ fn run() {
                     format!("{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}{aeb_off}", if acc { "ACC" } else { "ACC off" }, hud.set_speed * 3.6, hud.time_gap)
                 };
                 draw_text(0.34, 0.91, &line, colour);
+            }
+            if takeover && !fcw {
+                let stop = hud.flags & hud_flags::CONTROLLED_STOP != 0;
+                // Steady at first, flashing once it chimes.
+                if hud.flags & hud_flags::TAKEOVER_CHIME == 0 || (frame / 9) % 2 == 0 {
+                    let () = invoke!(n::DRAW_RECT, 0.5f32, 0.3f32, 0.42f32, 0.09f32, 200i32, 60i32, 20i32, 210i32, false);
+                }
+                let why = adapter_api::hud_message::text(hud.message);
+                let txt = if stop { format!("CONTROLLED STOP - TAKE OVER ({why})") } else { format!("TAKE OVER: {why}") };
+                draw_text(0.31, 0.283, &txt, (255, 255, 255));
             }
             if fcw {
                 if (frame / 6) % 2 == 0 {

@@ -398,7 +398,12 @@ fn main() {
             Event::Disengaged => Some(format!("disengaged at frame {}", s.header.frame)),
             Event::CancelledByAeb => Some(format!("AEB at frame {}: ACC cancelled", s.header.frame)),
             Event::Impact => Some(format!("IMPACT at frame {} ({:.1} m/s): everything cancelled", s.header.frame, s.speed)),
+            Event::Unavailable(r) if core.takeover().is_some() => {
+                Some(format!("TAKE OVER at frame {}: {} unavailable ({})", s.header.frame, feature.name(), r.text()))
+            }
             Event::Unavailable(r) => Some(format!("{} unavailable at frame {}: {}", feature.name(), s.header.frame, r.text())),
+            Event::TakenOver => Some(format!("driver took over at frame {}", s.header.frame)),
+            Event::ControlledStop => Some(format!("takeover not answered at frame {} ({:.1} m/s): controlled stop, hazards on", s.header.frame, s.speed)),
             Event::None => None,
         };
         if let Some(t) = text {

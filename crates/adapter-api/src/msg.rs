@@ -39,11 +39,15 @@ pub mod sample_flags {
     /// rising edge it has seen itself, so a restarted core never re-engages on
     /// its own; it disengages as soon as the flag drops.
     pub const ENGAGE_REQUEST: u32 = 1 << 1;
-    /// The driver is overriding (pedal or steering input above threshold).
-    /// The adapter has already stopped applying the core's command.
+    /// An explicit override from the host (the core also judges the raw
+    /// driver inputs itself, D11).
     pub const DRIVER_OVERRIDE: u32 = 1 << 2;
-    /// The driver pressed the brake or steered: the core must disengage.
+    /// An explicit cancel from the host, e.g. a cancel button (the core also
+    /// judges the raw driver inputs itself, D11).
     pub const DRIVER_CANCEL: u32 = 1 << 3;
+    /// The driver inputs come from an analogue device (gamepad, wheel), not
+    /// keys: the core debounces steering per device (D11).
+    pub const INPUT_ANALOG: u32 = 1 << 4;
 }
 
 /// adapter → core, every frame.
@@ -98,6 +102,8 @@ pub mod command_flags {
     pub const AEB: u32 = 1 << 3;
     /// Forward collision warning: alert the driver (chime and flash).
     pub const FCW: u32 = 1 << 4;
+    /// Hazard lights on (a controlled stop, D11).
+    pub const HAZARDS: u32 = 1 << 5;
 }
 
 /// core → adapter, once per core step.
@@ -289,6 +295,12 @@ pub mod hud_flags {
     pub const UNAVAILABLE: u32 = 1 << 7;
     /// AEB is unavailable.
     pub const AEB_OFF: u32 = 1 << 8;
+    /// Take over: the engaged feature can't continue (D11). Show it at once.
+    pub const TAKEOVER: u32 = 1 << 9;
+    /// The takeover request has escalated: chime.
+    pub const TAKEOVER_CHIME: u32 = 1 << 10;
+    /// Not answered: the car is making a controlled stop, hazards on.
+    pub const CONTROLLED_STOP: u32 = 1 << 11;
 }
 
 /// core → adapter (latest wins): what the driver should see. The adapter only

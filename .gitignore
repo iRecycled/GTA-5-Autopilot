@@ -1,1 +1,4 @@
 /target
+# Drive recordings stay local, except the small regression set replayed by `cargo xtask test`.
+/recordings/*
+!/recordings/regression/

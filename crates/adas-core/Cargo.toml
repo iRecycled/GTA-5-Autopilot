@@ -9,3 +9,12 @@ publish.workspace = true
 [dependencies]
 adapter-api = { path = "../adapter-api" }
 control = { path = "../control" }
+record = { path = "../record" }
+
+[[bin]]
+name = "adas-core"
+path = "src/main.rs"
+
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"

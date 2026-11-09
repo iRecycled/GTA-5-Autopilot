@@ -1,4 +1,5 @@
-//! Message layouts. Every message starts with [`Header`].
+//! Message layouts. Every message starts with [`Header`]. All positions are
+//! ISO 8855 (x forward, y left, z up) in the ego vehicle frame, SI units.
 
 /// Message type tag.
 #[repr(u16)]
@@ -8,6 +9,9 @@ pub enum MsgKind {
     None = 0,
     VehicleSample = 1,
     Command = 2,
+    ActorList = 3,
+    SensorLayout = 4,
+    AdapterInfo = 5,
 }
 
 /// Common header (layout from `docs/implementation-plan.md`).
@@ -35,10 +39,13 @@ pub mod sample_flags {
     /// its own; it disengages as soon as the flag drops.
     pub const ENGAGE_REQUEST: u32 = 1 << 1;
     /// The driver is overriding (pedal or steering input above threshold).
+    /// The adapter has already stopped applying the core's command.
     pub const DRIVER_OVERRIDE: u32 = 1 << 2;
+    /// The driver pressed the brake or steered: the core must disengage.
+    pub const DRIVER_CANCEL: u32 = 1 << 3;
 }
 
-/// adapter → core, every frame. ISO 8855: x forward, y left, z up.
+/// adapter → core, every frame.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct VehicleSample {
@@ -53,13 +60,20 @@ pub struct VehicleSample {
     pub yaw_rate: f32,
     /// Road-wheel steering angle, positive left (rad).
     pub steer_angle: f32,
-    /// Wheel spin speeds FL, FR, RL, RR, positive rolling forward (rad/s);
+    /// Wheel spin speeds in host order (rad/s, positive rolling forward);
     /// NaN when the host doesn't provide them.
     pub wheel_omega: [f32; 4],
     /// Engine speed as a fraction of the rev range, 0..=1; NaN if unknown.
     pub rev_ratio: f32,
     /// Current gear; 0 = reverse or neutral, as the host reports it.
     pub gear: i32,
+    /// The driver's own inputs, read by the adapter from the OS (D5):
+    /// pedals 0..=1, steering -1..=1 (positive left).
+    pub driver_throttle: f32,
+    pub driver_brake: f32,
+    pub driver_steer: f32,
+    /// Explicit padding to an 8-byte multiple; zero.
+    pub _reserved: u32,
 }
 
 /// Command flags.
@@ -68,6 +82,8 @@ pub mod command_flags {
     pub const ENGAGED: u32 = 1 << 0;
     /// Request the standstill hold.
     pub const HOLD: u32 = 1 << 1;
+    /// The core wants to steer (lateral control engaged).
+    pub const STEER: u32 = 1 << 2;
 }
 
 /// core → adapter, once per core step.
@@ -79,7 +95,7 @@ pub struct Command {
     /// freshness watchdog (D24).
     pub answers_seq: u32,
     pub flags: u32,
-    /// Road-wheel steering angle, positive left (rad).
+    /// Road-wheel steering angle, positive left (rad). Applied only with `STEER`.
     pub steer_angle: f32,
     /// Pedal demands, 0..=1. The adapter maps them onto the host's pedals.
     pub throttle: f32,
@@ -88,6 +104,174 @@ pub struct Command {
     pub diag: [f32; 4],
     /// Explicit padding to an 8-byte multiple; zero.
     pub _reserved: u32,
+}
+
+/// Actor kinds.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ActorKind {
+    #[default]
+    Unknown = 0,
+    Vehicle = 1,
+    Pedestrian = 2,
+}
+
+/// One actor around the ego car: ground truth from the host. The core's
+/// sensor models decide what a sensor would actually report (D18, D25).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Actor {
+    /// Host handle, stable while the actor exists.
+    pub id: u32,
+    pub kind: ActorKind,
+    /// Bit i: sensor i of the current [`SensorLayout`] had a clear line of
+    /// sight to this actor, as of `los_age` frames ago.
+    pub los_mask: u8,
+    /// Frames since `los_mask` was refreshed; `u16::MAX` = never checked.
+    pub los_age: u16,
+    /// Centre of the actor's box relative to the ego reference point (m).
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// Velocity over ground, rotated into the ego frame (m/s).
+    pub vx: f32,
+    pub vy: f32,
+    /// Heading relative to the ego car (rad, positive left).
+    pub yaw: f32,
+    /// Yaw rate (rad/s, positive left).
+    pub yaw_rate: f32,
+    /// Box size (m).
+    pub length: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Actor {
+    pub const ZERO: Actor = Actor {
+        id: 0,
+        kind: ActorKind::Unknown,
+        los_mask: 0,
+        los_age: u16::MAX,
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        vx: 0.0,
+        vy: 0.0,
+        yaw: 0.0,
+        yaw_rate: 0.0,
+        length: 0.0,
+        width: 0.0,
+        height: 0.0,
+    };
+}
+
+pub const MAX_ACTORS: usize = 64;
+
+/// adapter → core, every frame: the nearest actors, nearest first.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActorList {
+    pub header: Header,
+    pub count: u32,
+    /// Actors the host knew about but didn't fit (beyond `MAX_ACTORS`).
+    pub dropped: u32,
+    pub actors: [Actor; MAX_ACTORS],
+}
+
+impl Default for ActorList {
+    fn default() -> Self {
+        Self { header: Header::default(), count: 0, dropped: 0, actors: [Actor::ZERO; MAX_ACTORS] }
+    }
+}
+
+impl ActorList {
+    pub fn as_slice(&self) -> &[Actor] {
+        &self.actors[..(self.count as usize).min(MAX_ACTORS)]
+    }
+}
+
+/// One sensor for which the adapter should run line-of-sight checks.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SensorMount {
+    /// Mount position in the ego frame (m).
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// Boresight, CCW from forward (rad).
+    pub facing: f32,
+    /// Half field of view (rad).
+    pub half_fov: f32,
+    /// Range (m).
+    pub range: f32,
+    /// Desired line-of-sight refresh period per actor (frames).
+    pub refresh_frames: f32,
+    pub _reserved: u32,
+}
+
+pub const MAX_SENSORS: usize = 8;
+
+/// core → adapter (latest wins): the standing line-of-sight queries.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SensorLayout {
+    pub header: Header,
+    pub count: u32,
+    pub _reserved: u32,
+    pub mounts: [SensorMount; MAX_SENSORS],
+}
+
+impl SensorLayout {
+    pub fn as_slice(&self) -> &[SensorMount] {
+        &self.mounts[..(self.count as usize).min(MAX_SENSORS)]
+    }
+}
+
+/// Capability bits in [`AdapterInfo::capabilities`].
+pub mod caps {
+    pub const STEER: u32 = 1 << 0;
+    pub const PEDALS: u32 = 1 << 1;
+    pub const HOLD: u32 = 1 << 2;
+    pub const WHEEL_SPEEDS: u32 = 1 << 3;
+    pub const ACTORS: u32 = 1 << 4;
+    pub const LINE_OF_SIGHT: u32 = 1 << 5;
+    pub const DRIVER_INPUT: u32 = 1 << 6;
+}
+
+/// adapter → core (latest wins): who the adapter is and what it can do.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AdapterInfo {
+    pub header: Header,
+    /// UTF-8, zero-padded.
+    pub host: [u8; 32],
+    pub vehicle: [u8; 32],
+    pub capabilities: u32,
+    pub _reserved: u32,
+    /// The ego vehicle's box relative to its reference point, ISO frame (m).
+    pub box_min: [f32; 3],
+    pub box_max: [f32; 3],
+    /// Road-wheel angle at full lock (rad); NaN if unknown.
+    pub max_steer_angle: f32,
+    /// NaN if unknown.
+    pub wheelbase: f32,
+}
+
+/// Copies `s` into a zero-padded fixed-size field (truncating on a char boundary).
+pub fn fixed_str<const N: usize>(s: &str) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut end = s.len().min(N - 1);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    out[..end].copy_from_slice(&s.as_bytes()[..end]);
+    out
+}
+
+/// Reads a zero-padded fixed-size string field.
+pub fn str_of(b: &[u8]) -> &str {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    core::str::from_utf8(&b[..end]).unwrap_or("?")
 }
 
 #[cfg(test)]
@@ -100,9 +284,23 @@ mod tests {
     fn layouts_are_stable() {
         assert_eq!(size_of::<Header>(), 32);
         assert_eq!(align_of::<Header>(), 8);
-        // header + flags + 5 scalars + wheel_omega + rev_ratio + gear: no padding.
-        assert_eq!(size_of::<VehicleSample>(), 32 + 4 + 5 * 4 + 16 + 4 + 4);
-        // header + answers_seq + flags + 3 scalars + diag + _reserved: no padding.
+        // header + flags + 5 scalars + wheel_omega + rev_ratio + gear + 3 driver + reserved
+        assert_eq!(size_of::<VehicleSample>(), 32 + 4 + 5 * 4 + 16 + 4 + 4 + 3 * 4 + 4);
         assert_eq!(size_of::<Command>(), 32 + 4 + 4 + 3 * 4 + 16 + 4);
+        assert_eq!(size_of::<Actor>(), 4 + 1 + 1 + 2 + 10 * 4);
+        assert_eq!(size_of::<ActorList>(), 32 + 8 + MAX_ACTORS * 48);
+        assert_eq!(size_of::<SensorMount>(), 32);
+        assert_eq!(size_of::<SensorLayout>(), 32 + 8 + MAX_SENSORS * 32);
+        assert_eq!(size_of::<AdapterInfo>(), 32 + 64 + 8 + 24 + 8);
+    }
+
+    #[test]
+    fn fixed_strings() {
+        let b: [u8; 8] = fixed_str("GTA V Enhanced");
+        assert_eq!(str_of(&b), "GTA V E");
+        let b: [u8; 8] = fixed_str("ab");
+        assert_eq!(str_of(&b), "ab");
+        let b: [u8; 4] = fixed_str("éé");
+        assert_eq!(str_of(&b), "é");
     }
 }

@@ -1,9 +1,11 @@
 //! `cargo xtask <command>`
 //!
 //! - `gta-dir`   print the GTA V Enhanced folder that will be used
-//! - `deploy [spike]`  build a spike (`s1` default, `s45`, `s36`) and make it the only
-//!   `adas-*.asi` in the game folder
-//! - `undeploy`  remove every deployed spike `.asi` from the game folder
+//! - `deploy [name]`  build the adapter (`adas`, default) or a spike (`s1`, `s45`,
+//!   `s36`) and make it the only ADAS `.asi` in the game folder
+//! - `undeploy`  remove every deployed ADAS `.asi` from the game folder
+//! - `test`      run every unit test, then replay each recording in
+//!   `recordings/regression/` and require identical commands (D20)
 //! - `launch`    start GTA V Enhanced through Steam
 //! - `log`       print the newest spike log from `<game folder>/adas-logs`
 //!
@@ -17,8 +19,9 @@ use std::process::{Command, ExitCode};
 const STEAM_APP_ID: &str = "3240220";
 const GAME_FOLDER: &str = "Grand Theft Auto V Enhanced";
 const GAME_EXE: &str = "GTA5_Enhanced.exe";
-/// Deployable spikes: (name, cargo package, built DLL, deployed .asi).
+/// Deployable plugins: (name, cargo package, built DLL, deployed .asi).
 const SPIKES: &[(&str, &str, &str, &str)] = &[
+    ("adas", "gta-plugin", "gta_plugin.dll", "adas.asi"),
     ("s1", "s1-asi", "s1_asi.dll", "adas-s1.asi"),
     ("s45", "s45-vehicle", "s45_vehicle.dll", "adas-s45.asi"),
     ("s36", "s36-link", "s36_link.dll", "adas-s36.asi"),
@@ -28,12 +31,13 @@ fn main() -> ExitCode {
     let cmd = env::args().nth(1).unwrap_or_default();
     let result = match cmd.as_str() {
         "gta-dir" => gta_dir().map(|d| println!("{}", d.display())),
-        "deploy" => deploy(&env::args().nth(2).unwrap_or_else(|| "s1".into())),
+        "deploy" => deploy(&env::args().nth(2).unwrap_or_else(|| "adas".into())),
+        "test" => test(),
         "undeploy" => undeploy(),
         "launch" => launch(),
         "log" => show_log(),
         _ => Err(format!(
-            "usage: cargo xtask <gta-dir|deploy|undeploy|launch|log>{}",
+            "usage: cargo xtask <gta-dir|deploy|undeploy|launch|log|test>{}",
             if cmd.is_empty() { String::new() } else { format!(" (unknown command '{cmd}')") }
         )),
     };
@@ -187,4 +191,31 @@ fn show_log() -> Result<(), String> {
     let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     print!("{text}");
     Ok(())
+}
+
+/// Unit tests, then the regression replays (D20).
+fn test() -> Result<(), String> {
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let root = workspace_root();
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        .args(["test", "--workspace", "--quiet"])
+        .status()
+        .map_err(|e| format!("cargo test failed to start: {e}"))?;
+    if !status.success() {
+        return Err("unit tests failed".into());
+    }
+    let dir = root.join("recordings").join("regression");
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "mcap")).collect())
+        .unwrap_or_default();
+    files.sort();
+    if files.is_empty() {
+        println!("no regression recordings in {}", dir.display());
+        return Ok(());
+    }
+    let mut args = vec!["run".to_string(), "--quiet".into(), "--release".into(), "--package".into(), "adas-core".into(), "--bin".into(), "replay".into(), "--".into(), "--check".into()];
+    args.extend(files.iter().map(|p| p.display().to_string()));
+    let status = Command::new(&cargo).current_dir(&root).args(&args).status().map_err(|e| format!("replay failed to start: {e}"))?;
+    if status.success() { Ok(()) } else { Err("a regression replay differs".into()) }
 }

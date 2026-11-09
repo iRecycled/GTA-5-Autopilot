@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::sync::OnceLock;
 
-use crate::{CONTRACT_VERSION, Command, Mailbox, VehicleSample};
+use crate::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, Mailbox, SensorLayout, VehicleSample};
 
 /// Default name of the link for one adapter ↔ core pair.
 pub const DEFAULT_NAME: &str = "Local\\adas-link-v1";
@@ -25,10 +25,22 @@ pub struct Link {
     /// Incremented by the core each time it starts; a new epoch means a fresh,
     /// disengaged core (the adapter drops any engagement).
     pub epoch: AtomicU32,
+    /// The core's process id, written at start-up, so the adapter can notice a
+    /// crashed core at once instead of waiting for the watchdog.
+    pub core_pid: AtomicU32,
+    pub _reserved: u32,
     /// The adapter's frame counter, updated every frame (a heartbeat).
     pub adapter_frame: AtomicU64,
+    /// adapter → core, every frame.
     pub sample: Mailbox<VehicleSample>,
+    /// core → adapter, every step.
     pub command: Mailbox<Command>,
+    /// adapter → core, every frame (nearest actors with line-of-sight bits).
+    pub actors: Mailbox<ActorList>,
+    /// core → adapter: the standing line-of-sight queries.
+    pub layout: Mailbox<SensorLayout>,
+    /// adapter → core: identity and capabilities.
+    pub info: Mailbox<AdapterInfo>,
 }
 
 #[link(name = "kernel32", kind = "raw-dylib")]

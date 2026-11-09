@@ -1,8 +1,9 @@
 //! `cargo xtask <command>`
 //!
 //! - `gta-dir`   print the GTA V Enhanced folder that will be used
-//! - `deploy`    build the S1 spike (release) and copy it into the game as `adas-s1.asi`
-//! - `undeploy`  remove `adas-s1.asi` from the game folder
+//! - `deploy [spike]`  build a spike (`s1` default, `s45`) and make it the only
+//!   `adas-*.asi` in the game folder
+//! - `undeploy`  remove every deployed spike `.asi` from the game folder
 //! - `launch`    start GTA V Enhanced through Steam
 //! - `log`       print the newest spike log from `<game folder>/adas-logs`
 //!
@@ -16,15 +17,17 @@ use std::process::{Command, ExitCode};
 const STEAM_APP_ID: &str = "3240220";
 const GAME_FOLDER: &str = "Grand Theft Auto V Enhanced";
 const GAME_EXE: &str = "GTA5_Enhanced.exe";
-const SPIKE_PACKAGE: &str = "s1-asi";
-const SPIKE_DLL: &str = "s1_asi.dll";
-const DEPLOYED_ASI: &str = "adas-s1.asi";
+/// Deployable spikes: (name, cargo package, built DLL, deployed .asi).
+const SPIKES: &[(&str, &str, &str, &str)] = &[
+    ("s1", "s1-asi", "s1_asi.dll", "adas-s1.asi"),
+    ("s45", "s45-vehicle", "s45_vehicle.dll", "adas-s45.asi"),
+];
 
 fn main() -> ExitCode {
     let cmd = env::args().nth(1).unwrap_or_default();
     let result = match cmd.as_str() {
         "gta-dir" => gta_dir().map(|d| println!("{}", d.display())),
-        "deploy" => deploy(),
+        "deploy" => deploy(&env::args().nth(2).unwrap_or_else(|| "s1".into())),
         "undeploy" => undeploy(),
         "launch" => launch(),
         "log" => show_log(),
@@ -99,7 +102,12 @@ fn game_running() -> bool {
         .unwrap_or(false)
 }
 
-fn deploy() -> Result<(), String> {
+/// Builds one spike and deploys it as the only `adas-*.asi` in the game folder.
+fn deploy(name: &str) -> Result<(), String> {
+    let &(_, package, dll, asi) = SPIKES
+        .iter()
+        .find(|s| s.0 == name)
+        .ok_or_else(|| format!("unknown spike '{name}'; known: {}", SPIKES.iter().map(|s| s.0).collect::<Vec<_>>().join(", ")))?;
     let dir = gta_dir()?;
     if game_running() {
         return Err(format!("{GAME_EXE} is running; close it first (the .asi is locked while loaded)"));
@@ -107,14 +115,21 @@ fn deploy() -> Result<(), String> {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(cargo)
         .current_dir(workspace_root())
-        .args(["build", "--release", "--package", SPIKE_PACKAGE])
+        .args(["build", "--release", "--package", package])
         .status()
         .map_err(|e| format!("cargo build failed to start: {e}"))?;
     if !status.success() {
         return Err("cargo build failed".into());
     }
-    let src = workspace_root().join("target").join("release").join(SPIKE_DLL);
-    let dst = dir.join(DEPLOYED_ASI);
+    for &(_, _, _, other) in SPIKES.iter().filter(|s| s.3 != asi) {
+        let p = dir.join(other);
+        if p.exists() {
+            fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
+            println!("removed {}", p.display());
+        }
+    }
+    let src = workspace_root().join("target").join("release").join(dll);
+    let dst = dir.join(asi);
     fs::copy(&src, &dst).map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
     println!("deployed {}", dst.display());
     if !dir.join("ScriptHookV.dll").exists() {
@@ -123,15 +138,22 @@ fn deploy() -> Result<(), String> {
     Ok(())
 }
 
+/// Removes every deployed spike `.asi` from the game folder.
 fn undeploy() -> Result<(), String> {
-    let dst = gta_dir()?.join(DEPLOYED_ASI);
+    let dir = gta_dir()?;
     if game_running() {
         return Err(format!("{GAME_EXE} is running; close it first"));
     }
-    if dst.exists() {
-        fs::remove_file(&dst).map_err(|e| format!("remove {}: {e}", dst.display()))?;
-        println!("removed {}", dst.display());
-    } else {
+    let mut removed = 0;
+    for &(_, _, _, asi) in SPIKES {
+        let p = dir.join(asi);
+        if p.exists() {
+            fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
+            println!("removed {}", p.display());
+            removed += 1;
+        }
+    }
+    if removed == 0 {
         println!("nothing to remove");
     }
     Ok(())

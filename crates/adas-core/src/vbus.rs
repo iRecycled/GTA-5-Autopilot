@@ -117,6 +117,10 @@ impl Vehicle {
         let kph = (s.speed * 3.6) as f64;
         let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
         for p in &mut self.periodic {
+            // Start-up and long pauses: resync instead of sending the backlog.
+            if p.next < t - 2.0 * p.period {
+                p.next = t;
+            }
             while p.next <= t {
                 let m = msg(&self.chassis_dbc, p.msg);
                 let mut data = match p.msg {
@@ -313,6 +317,14 @@ mod tests {
         let (chassis, _) = v.take_loads();
         // About 360 × 0.24 ms ≈ 8–9 % of a 500 kbit/s bus.
         assert!((0.06..0.12).contains(&chassis), "chassis load {chassis}");
+    }
+
+    #[test]
+    fn a_late_start_does_not_flood_the_bus() {
+        let mut v = Vehicle::new(Delivery::Reactive);
+        // The host's clock is already at 775 s when the core starts.
+        v.step(775.0, 1, &VehicleSample::default(), None);
+        assert!(v.stats.chassis_frames <= 6, "{} frames in the first step", v.stats.chassis_frames);
     }
 
     #[test]

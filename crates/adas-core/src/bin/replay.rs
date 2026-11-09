@@ -1,6 +1,9 @@
 //! Replays a recorded drive through the core, without any game (D20).
 //!
-//! Usage: `replay <file.mcap>... [--check] [--csv OUT]`
+//! Usage: `replay <file.mcap>... [--check] [--csv OUT] [--candump OUT]`
+//!
+//! `--candump` writes the bus traffic the core regenerates, in `candump -L`
+//! format (chassis CAN as `can0`, ADAS CAN FD as `can1`).
 //!
 //! For each recorded step it feeds the core the same sample, actor list and
 //! stick it saw live, and compares the command it computes now with the one it
@@ -33,7 +36,7 @@ fn gt_gap(actors: &adapter_api::ActorList, front: f32) -> f32 {
         .fold(f32::NAN, |m, g| if m.is_nan() || g < m { g } else { m })
 }
 
-fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> {
+fn replay(path: &Path, csv: Option<&PathBuf>, candump: Option<&PathBuf>) -> Result<(usize, usize), String> {
     let rec = Recording::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if rec.truncated {
         eprintln!("{}: the recording ends early (recorder killed); replaying the {} complete steps", path.display(), rec.frames.len());
@@ -48,6 +51,10 @@ fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> 
     if let Some(w) = out.as_mut() {
         let _ = writeln!(w, "frame,t_s,speed,actors,flags,throttle,brake,steer,diag0,diag1,diag2,diag3,hud_flags,lead_gap,lead_speed,ttc,gt_gap,match");
     }
+    let mut dump = match candump {
+        Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p).map_err(|e| e.to_string())?)),
+        None => None,
+    };
     let (mut compared, mut diffs) = (0usize, 0usize);
     let mut front = rec.info.map(|i| i.box_max[0]).unwrap_or(2.3);
     for (i, f) in rec.frames.iter().enumerate() {
@@ -57,6 +64,17 @@ fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> 
         }
         let stick = f.stick.map(|s| Stick { throttle: s.throttle, brake: s.brake, steer: s.steer });
         let (c, _) = core.step(Inputs { sample: &f.sample, actors: &f.actors, stick });
+        if let Some(w) = dump.as_mut() {
+            for (bus, fr) in &core.vehicle().last_frames {
+                let hex: String = fr.data.iter().map(|b| format!("{b:02X}")).collect();
+                let t = fr.delivered;
+                // candump -L: classic `ID#DATA`, CAN FD `ID##<flags>DATA` (flags 1 = BRS).
+                let _ = match *bus {
+                    "adas" => writeln!(w, "({t:.6}) can1 {:03X}##1{hex}", fr.id),
+                    _ => writeln!(w, "({t:.6}) can0 {:03X}#{hex}", fr.id),
+                };
+            }
+        }
         let ok = match &f.command {
             Some(live) => {
                 compared += 1;
@@ -106,21 +124,23 @@ fn main() {
     let mut files = Vec::new();
     let mut check = false;
     let mut csv: Option<PathBuf> = None;
+    let mut candump: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--check" => check = true,
             "--csv" => csv = Some(PathBuf::from(args.next().expect("--csv needs a path"))),
+            "--candump" => candump = Some(PathBuf::from(args.next().expect("--candump needs a path"))),
             _ => files.push(PathBuf::from(a)),
         }
     }
     if files.is_empty() {
-        eprintln!("usage: replay <file.mcap>... [--check] [--csv OUT]");
+        eprintln!("usage: replay <file.mcap>... [--check] [--csv OUT] [--candump OUT]");
         std::process::exit(2);
     }
     let mut failed = false;
     for f in &files {
-        match replay(f, csv.as_ref()) {
+        match replay(f, csv.as_ref(), candump.as_ref()) {
             Ok((n, 0)) => println!("{}: {n} steps, identical", f.display()),
             Ok((n, d)) => {
                 println!("{}: {n} steps, {d} differ", f.display());

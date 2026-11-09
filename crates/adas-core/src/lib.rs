@@ -49,7 +49,14 @@ pub enum Event {
     Disengaged,
     /// Emergency braking took over; ACC is cancelled.
     CancelledByAeb,
+    /// An impact was detected (as an airbag controller's crash signal would
+    /// report it): everything is cancelled.
+    Impact,
 }
+
+/// Deceleration that counts as an impact (m/s², about 1.5 g). Hard braking on
+/// good tyres stays below about 1.1 g.
+const IMPACT_DECEL: f32 = 15.0;
 
 /// Half a lane for in-path decisions (m).
 const HALF_LANE: f32 = 1.8;
@@ -80,6 +87,7 @@ pub struct Core {
     /// braking); this is the D19 vehicle profile, learned rather than tuned.
     brake_gain: f32,
     prev_brake: f32,
+    prev_speed_for_impact: Option<f32>,
 }
 
 /// Starting guess for the brake gain (m/s² per unit of brake demand); learned
@@ -122,6 +130,7 @@ impl Core {
             aeb_i: 0.0,
             brake_gain: BRAKE_GAIN_INIT,
             prev_brake: 0.0,
+            prev_speed_for_impact: None,
         }
     }
 
@@ -183,6 +192,10 @@ impl Core {
             }
         }
 
+        // An impact cancels everything, as a crash signal does on a real car.
+        let impact = dt > 0.0 && !paused && self.prev_speed_for_impact.is_some_and(|p| (p - s.speed) / dt > IMPACT_DECEL);
+        self.prev_speed_for_impact = (!paused).then_some(s.speed);
+
         // --- Perception (always) ---
         let (follow, threat) = self.perceive(s, inp.actors, dt, paused);
 
@@ -196,7 +209,10 @@ impl Core {
 
         // --- Engagement ---
         let mut event = Event::None;
-        if self.state == State::Off {
+        if impact && self.state != State::Off {
+            self.state = State::Off;
+            event = Event::Impact;
+        } else if self.state == State::Off {
             if request && !self.prev_request && !cancel && !aeb_braking {
                 self.state = State::Active;
                 self.speed.reset(s.speed);
@@ -429,6 +445,22 @@ mod tests {
             (1..600).map(|i| step(&mut core, i, sample_flags::ENGAGE_REQUEST, (i as f32 * 0.01).min(8.0)).0).collect::<Vec<_>>()
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn an_impact_cancels_engagement() {
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 13.5);
+        step(&mut core, 2, sample_flags::ENGAGE_REQUEST, 13.5);
+        // 13.5 → 5.3 m/s in one frame: about 490 m/s², an impact.
+        let (c, e) = step(&mut core, 3, sample_flags::ENGAGE_REQUEST, 5.3);
+        assert_eq!(e, Event::Impact);
+        assert_eq!((c.flags, c.throttle), (0, 0.0));
+        // Hard braking (8 m/s²) is not an impact.
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 20.0);
+        let (_, e) = step(&mut core, 2, sample_flags::ENGAGE_REQUEST, 20.0 - 8.0 * 0.016_667);
+        assert_ne!(e, Event::Impact);
     }
 
     #[test]

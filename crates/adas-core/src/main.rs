@@ -279,6 +279,7 @@ fn main() {
             Event::CancelledByDriver => println!("cancelled by driver at frame {}", s.header.frame),
             Event::Disengaged => println!("disengaged at frame {}", s.header.frame),
             Event::CancelledByAeb => println!("AEB at frame {}: ACC cancelled", s.header.frame),
+            Event::Impact => println!("IMPACT at frame {} ({:.1} m/s): everything cancelled", s.header.frame, s.speed),
             Event::None => {}
         }
         if cmd.flags & adapter_api::command_flags::AEB != 0 && cmd.brake > 0.0 && !aeb_logged {

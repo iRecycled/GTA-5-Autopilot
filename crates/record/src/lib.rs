@@ -88,7 +88,12 @@ pub struct Recorder {
     w: mcap::Writer<BufWriter<File>>,
     ch: Channels,
     seq: u32,
+    steps: u32,
 }
+
+/// Steps between flushes. Each flush closes the current chunk, so a crash
+/// loses at most this many steps (about a second at 72 fps).
+const FLUSH_EVERY: u32 = 72;
 
 impl Recorder {
     /// Creates a recording. `meta` goes into the `adas` metadata record.
@@ -111,7 +116,7 @@ impl Recorder {
         let mut meta = meta.clone();
         meta.insert("contract".into(), ver);
         w.write_metadata(&mcap::records::Metadata { name: "adas".into(), metadata: meta }).map_err(err)?;
-        Ok(Self { w, ch, seq: 0 })
+        Ok(Self { w, ch, seq: 0, steps: 0 })
     }
 
     fn put(&mut self, channel: u16, t_ns: u64, data: &[u8]) -> io::Result<()> {
@@ -132,7 +137,12 @@ impl Recorder {
         if let Some(st) = stick {
             self.put(self.ch.stick, t, bytes_of(&st))?;
         }
-        self.put(self.ch.command, c.header.wall_time_ns.max(t), bytes_of(c))
+        self.put(self.ch.command, c.header.wall_time_ns.max(t), bytes_of(c))?;
+        self.steps += 1;
+        if self.steps.is_multiple_of(FLUSH_EVERY) {
+            self.w.flush().map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn finish(mut self) -> io::Result<()> {
@@ -154,6 +164,9 @@ pub struct Recording {
     pub meta: BTreeMap<String, String>,
     pub info: Option<AdapterInfo>,
     pub frames: Vec<Frame>,
+    /// The file ended early (the recorder was killed): `frames` holds every
+    /// complete step before the cut.
+    pub truncated: bool,
 }
 
 impl Recording {
@@ -163,10 +176,14 @@ impl Recording {
         let mut meta = BTreeMap::new();
         // Metadata records are found by scanning; the file is small enough.
         for rec in mcap::read::LinearReader::new(&data).map_err(|e| bad(e.to_string()))? {
-            if let Ok(mcap::records::Record::Metadata(m)) = rec
-                && m.name == "adas"
-            {
-                meta = m.metadata;
+            match rec {
+                Ok(mcap::records::Record::Metadata(m)) if m.name == "adas" => {
+                    meta = m.metadata;
+                    break;
+                }
+                Ok(_) => {}
+                // An error doesn't advance the reader: stop rather than spin.
+                Err(e) => return Err(bad(format!("reading records: {e}"))),
             }
         }
         let ver = CONTRACT_VERSION.to_string();
@@ -175,8 +192,17 @@ impl Recording {
         }
         let mut info = None;
         let mut frames: Vec<Frame> = Vec::new();
+        let mut truncated = false;
         for m in mcap::MessageStream::new(&data).map_err(|e| bad(e.to_string()))? {
-            let m = m.map_err(|e| bad(e.to_string()))?;
+            let m = match m {
+                Ok(m) => m,
+                Err(e) if !frames.is_empty() => {
+                    let _ = e;
+                    truncated = true;
+                    break;
+                }
+                Err(e) => return Err(bad(e.to_string())),
+            };
             match m.channel.topic.as_str() {
                 "sample" => frames.push(Frame {
                     sample: from_bytes(&m.data).ok_or_else(|| bad("bad sample".into()))?,
@@ -203,7 +229,11 @@ impl Recording {
                 _ => {}
             }
         }
-        Ok(Self { meta, info, frames })
+        // A step cut short (no command yet) can't be compared: drop it.
+        if truncated && frames.last().is_some_and(|f| f.command.is_none()) {
+            frames.pop();
+        }
+        Ok(Self { meta, info, frames, truncated })
     }
 }
 
@@ -242,6 +272,30 @@ mod tests {
         assert!(r.frames[0].stick.is_none());
         assert_eq!(r.frames[4].actors.as_slice().len(), 2);
         assert_eq!(r.frames[4].actors.actors[1].kind, ActorKind::Pedestrian);
+        assert!(!r.truncated);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_killed_recorder_leaves_a_readable_file() {
+        let dir = std::env::temp_dir().join(format!("adas-rec-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.mcap");
+        let mut rec = Recorder::create(&path, &BTreeMap::new()).unwrap();
+        let a = ActorList::default();
+        for i in 1..=200u32 {
+            let s = VehicleSample { speed: i as f32, ..Default::default() };
+            rec.step(&s, &a, None, &Command { answers_seq: i, ..Default::default() }).unwrap();
+        }
+        // Simulate a crash: the writer is dropped without `finish`, after the
+        // file is cut mid-way through the last (unflushed) chunk.
+        std::mem::forget(rec);
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len().saturating_sub(10)]).unwrap();
+        let r = Recording::open(&path).unwrap();
+        assert!(r.truncated || r.frames.len() >= 144);
+        assert!(r.frames.len() >= 144, "lost more than the unflushed tail: {} frames", r.frames.len());
+        assert!(r.frames.iter().all(|f| f.command.is_some()));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

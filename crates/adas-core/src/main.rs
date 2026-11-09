@@ -18,13 +18,90 @@ use adapter_api::{CONTRACT_VERSION, Command, Header, MsgKind, VehicleSample, sam
 use adas_core::{Core, Event, Feature, Inputs, Stick, layout};
 use record::{Recorder, Stick3};
 
-#[link(name = "user32", kind = "raw-dylib")]
-unsafe extern "system" {
-    fn GetAsyncKeyState(vkey: i32) -> i16;
+/// Keyboard state from a low-level keyboard hook. `GetAsyncKeyState` doesn't
+/// see keys while GTA has focus (its raw input stops other processes' key
+/// state updating), but a low-level hook sees every key event system-wide.
+mod keyboard {
+    use core::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[repr(C)]
+    struct KbdLl {
+        vk: u32,
+        scan: u32,
+        flags: u32,
+        time: u32,
+        extra: usize,
+    }
+
+    #[repr(C)]
+    struct Msg {
+        hwnd: *mut c_void,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt: [i32; 2],
+        private: u32,
+    }
+
+    type HookProc = unsafe extern "system" fn(i32, usize, isize) -> isize;
+
+    #[link(name = "user32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn SetWindowsHookExW(id: i32, proc_: HookProc, hmod: *mut c_void, thread: u32) -> *mut c_void;
+        fn CallNextHookEx(h: *mut c_void, code: i32, w: usize, l: isize) -> isize;
+        fn GetMessageW(msg: *mut Msg, hwnd: *mut c_void, min: u32, max: u32) -> i32;
+    }
+
+    #[link(name = "kernel32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+
+    const WH_KEYBOARD_LL: i32 = 13;
+    static VK: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+    static SCAN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+
+    unsafe extern "system" fn hook(code: i32, w: usize, l: isize) -> isize {
+        if code >= 0 && l != 0 {
+            let k = unsafe { &*(l as *const KbdLl) };
+            let down = matches!(w, 0x100 | 0x104); // WM_KEYDOWN, WM_SYSKEYDOWN
+            VK[(k.vk & 0xFF) as usize].store(down, Ordering::Relaxed);
+            SCAN[(k.scan & 0xFF) as usize].store(down, Ordering::Relaxed);
+        }
+        unsafe { CallNextHookEx(core::ptr::null_mut(), code, w, l) }
+    }
+
+    /// Installs the hook on its own thread (a low-level hook needs a message loop).
+    pub fn start() {
+        std::thread::spawn(|| unsafe {
+            let h = SetWindowsHookExW(WH_KEYBOARD_LL, hook, GetModuleHandleW(core::ptr::null()), 0);
+            if h.is_null() {
+                eprintln!("keyboard hook failed; the test driver won't see keys");
+                return;
+            }
+            let mut msg: Msg = core::mem::zeroed();
+            while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) > 0 {}
+        });
+    }
+
+    /// A key by virtual-key code or by scan code (injected input may carry only one).
+    pub fn down(vk: u8, scan: u8) -> bool {
+        VK[vk as usize].load(Ordering::Relaxed) || SCAN[scan as usize].load(Ordering::Relaxed)
+    }
 }
 
+/// Test-driver keys: (virtual key, scan code).
 fn key(vk: u8) -> bool {
-    unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0 }
+    let scan = match vk {
+        b'I' => 0x17,
+        b'J' => 0x24,
+        b'K' => 0x25,
+        b'L' => 0x26,
+        _ => 0,
+    };
+    keyboard::down(vk, scan)
 }
 
 /// I/J/K/L, ramped so a key press feels like a pedal, not a switch.
@@ -106,6 +183,9 @@ fn main() {
     let mut core = Core::new(feature.clone(), first.flags & sample_flags::ENGAGE_REQUEST != 0);
     let mut stick_src = KeyStick { s: Stick::default() };
     let test_driver = matches!(feature, Feature::TestDriver(_));
+    if test_driver {
+        keyboard::start();
+    }
 
     let mut last_seq: Option<u32> = None;
     let mut last_game_us = 0u64;
@@ -220,7 +300,7 @@ fn main() {
             one_way.sort_unstable();
             step_ns.sort_unstable();
             println!(
-                "{} samples | sample->command p50 {:.1} us p99 {:.1} us max {:.1} us | core step p50 {:.1} us p99 {:.1} us | gaps {gaps} | actors {} | {:?}",
+                "{} samples | sample->command p50 {:.1} us p99 {:.1} us max {:.1} us | core step p50 {:.1} us p99 {:.1} us | gaps {gaps} | actors {} | {:?}{}",
                 one_way.len(),
                 pct(&one_way, 0.5) as f64 / 1e3,
                 pct(&one_way, 0.99) as f64 / 1e3,
@@ -229,6 +309,7 @@ fn main() {
                 pct(&step_ns, 0.99) as f64 / 1e3,
                 actors.count,
                 core.state(),
+                stick.map(|k| format!(" | stick thr {:.2} brk {:.2} steer {:+.2}", k.throttle, k.brake, k.steer)).unwrap_or_default(),
             );
             let _ = std::io::stdout().flush();
             one_way.clear();

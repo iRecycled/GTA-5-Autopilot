@@ -1,0 +1,10 @@
+[package]
+name = "fusion"
+version = "0.1.0"
+description = "Object tracking and lead-vehicle selection from sensor object lists"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sensors = { path = "../sensors" }

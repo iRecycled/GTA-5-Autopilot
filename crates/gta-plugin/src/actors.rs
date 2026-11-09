@@ -196,19 +196,32 @@ impl Actors {
         // 5. Rays: the stalest first; async within the in-flight limit, then a
         //    synchronous top-up for actors already past their refresh period.
         due.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let async_budget = MAX_IN_FLIGHT.saturating_sub(self.pending.len());
-        for (j, &(score, i, bits, k)) in due.iter().enumerate() {
-            let sync = j >= async_budget;
-            if sync && (st.sync as usize >= SYNC_MAX || score < 1.5) {
-                break;
-            }
+        // GTA's own AI shares the async pool: when a start fails, the rest go
+        // synchronous (within SYNC_MAX).
+        let mut async_left = MAX_IN_FLIGHT.saturating_sub(self.pending.len());
+        for &(score, i, bits, k) in &due {
             let m = mounts[k];
             let from = ego.to_world(V2::new(m.x, m.y));
             let a = out.actors[i];
             let to = ego.to_world(V2::new(a.x, a.y));
             let (fz, tz) = (ego_z + m.z, ego_z + a.z);
             let id = near[i].1;
-            if sync {
+            if async_left > 0 {
+                let h: i32 = unsafe { invoke!(n::START_SHAPE_TEST_LOS_PROBE, from.x, from.y, fz, to.x, to.y, tz, LOS_FLAGS, veh, 7i32) };
+                if h != 0 {
+                    st.started += 1;
+                    async_left -= 1;
+                    self.pending.push((h, id, bits, frame));
+                    continue;
+                }
+                st.failed += 1;
+                async_left = 0;
+            }
+            // Synchronous: overdue items only (or anything after an async failure).
+            if st.sync as usize >= SYNC_MAX || (score < 1.5 && st.failed == 0) {
+                break;
+            }
+            {
                 let h: i32 = unsafe {
                     invoke!(n::START_EXPENSIVE_SYNCHRONOUS_SHAPE_TEST_LOS_PROBE, from.x, from.y, fz, to.x, to.y, tz, LOS_FLAGS, veh, 7i32)
                 };
@@ -222,14 +235,6 @@ impl Actors {
                     out.actors[i].los_age = 0;
                 } else {
                     st.failed += 1;
-                }
-            } else {
-                let h: i32 = unsafe { invoke!(n::START_SHAPE_TEST_LOS_PROBE, from.x, from.y, fz, to.x, to.y, tz, LOS_FLAGS, veh, 7i32) };
-                if h == 0 {
-                    st.failed += 1;
-                } else {
-                    st.started += 1;
-                    self.pending.push((h, id, bits, frame));
                 }
             }
         }

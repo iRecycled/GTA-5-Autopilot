@@ -156,7 +156,7 @@ fn run() {
     let _ = writeln!(
         csv,
         "frame,wall_ms,frame_ms,work_us,seq,rtt_us,cmd_age,state,speed,cmd_flags,thr,brk,steer_cmd,steer_angle,\
-         drv_thr,drv_brk,drv_steer,actors,in_view,los_age_max,rays,sync_rays,diag0,diag1,diag2,diag3"
+         drv_thr,drv_brk,drv_steer,actors,in_view,los_age_max,rays,sync_rays,ray_fails,diag0,diag1,diag2,diag3"
     );
 
     let version = unsafe { shv_sys::getGameVersion() };
@@ -460,7 +460,7 @@ fn run() {
         };
         let _ = writeln!(
             csv,
-            "{frame},{:.3},{:.3},{:.1},{seq},{},{age},{state},{:.3},{},{:.3},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}",
+            "{frame},{:.3},{:.3},{:.1},{seq},{},{age},{state},{:.3},{},{:.3},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}",
             (t_frame - win_start) as f64 / 1e6,
             frame_ns as f64 / 1e6,
             work_ns as f64 / 1e3,
@@ -479,6 +479,7 @@ fn run() {
             los.age_max,
             los.started,
             los.sync,
+            los.failed,
             cmd.diag[0],
             cmd.diag[1],
             cmd.diag[2],

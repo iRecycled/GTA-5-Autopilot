@@ -24,6 +24,9 @@ fn same(a: &Command, b: &Command) -> bool {
 
 fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> {
     let rec = Recording::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if rec.truncated {
+        eprintln!("{}: the recording ends early (recorder killed); replaying the {} complete steps", path.display(), rec.frames.len());
+    }
     let feature = Feature::from_meta(&rec.meta)?;
     let initial = rec.meta.get("initial_request").map(|v| v == "true").unwrap_or(false);
     let mut core = Core::new(feature, initial);

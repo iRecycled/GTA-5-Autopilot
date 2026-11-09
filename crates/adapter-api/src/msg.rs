@@ -12,6 +12,7 @@ pub enum MsgKind {
     ActorList = 3,
     SensorLayout = 4,
     AdapterInfo = 5,
+    Hud = 6,
 }
 
 /// Common header (layout from `docs/implementation-plan.md`).
@@ -72,8 +73,16 @@ pub struct VehicleSample {
     pub driver_throttle: f32,
     pub driver_brake: f32,
     pub driver_steer: f32,
-    /// Explicit padding to an 8-byte multiple; zero.
-    pub _reserved: u32,
+    /// Driver-assistance buttons pressed this frame (edges, see [`buttons`]).
+    pub buttons: u32,
+}
+
+/// Button edges in [`VehicleSample::buttons`]: set on the one frame the button
+/// goes down. The core decides what they mean (set speed, gap).
+pub mod buttons {
+    pub const SPEED_UP: u32 = 1 << 0;
+    pub const SPEED_DOWN: u32 = 1 << 1;
+    pub const GAP: u32 = 1 << 2;
 }
 
 /// Command flags.
@@ -84,6 +93,11 @@ pub mod command_flags {
     pub const HOLD: u32 = 1 << 1;
     /// The core wants to steer (lateral control engaged).
     pub const STEER: u32 = 1 << 2;
+    /// Emergency braking: apply `brake` (and `HOLD` once stopped) even when not
+    /// engaged; it overrides the driver's accelerator.
+    pub const AEB: u32 = 1 << 3;
+    /// Forward collision warning: alert the driver (chime and flash).
+    pub const FCW: u32 = 1 << 4;
 }
 
 /// core → adapter, once per core step.
@@ -257,6 +271,42 @@ pub struct AdapterInfo {
     pub wheelbase: f32,
 }
 
+/// HUD flags.
+pub mod hud_flags {
+    /// ACC is engaged.
+    pub const ACC: u32 = 1 << 0;
+    /// ACC is following a lead (not cruising at the set speed).
+    pub const FOLLOWING: u32 = 1 << 1;
+    /// A lead is detected.
+    pub const LEAD: u32 = 1 << 2;
+    pub const FCW: u32 = 1 << 3;
+    pub const AEB: u32 = 1 << 4;
+    /// Holding the car at a standstill.
+    pub const HOLD: u32 = 1 << 5;
+    /// The driver's accelerator is overriding ACC.
+    pub const OVERRIDE: u32 = 1 << 6;
+}
+
+/// core → adapter (latest wins): what the driver should see. The adapter only
+/// draws it (D8).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Hud {
+    pub header: Header,
+    pub flags: u32,
+    /// ACC set speed (m/s).
+    pub set_speed: f32,
+    /// Selected time gap (s) and its index (0 = shortest).
+    pub time_gap: f32,
+    pub gap_index: u32,
+    /// Gap to the lead (m) and its speed (m/s); NaN without one.
+    pub lead_gap: f32,
+    pub lead_speed: f32,
+    /// Time to collision with the most threatening object (s); infinite if none.
+    pub ttc: f32,
+    pub _reserved: u32,
+}
+
 /// Copies `s` into a zero-padded fixed-size field (truncating on a char boundary).
 pub fn fixed_str<const N: usize>(s: &str) -> [u8; N] {
     let mut out = [0u8; N];
@@ -284,7 +334,7 @@ mod tests {
     fn layouts_are_stable() {
         assert_eq!(size_of::<Header>(), 32);
         assert_eq!(align_of::<Header>(), 8);
-        // header + flags + 5 scalars + wheel_omega + rev_ratio + gear + 3 driver + reserved
+        // header + flags + 5 scalars + wheel_omega + rev_ratio + gear + 3 driver + buttons
         assert_eq!(size_of::<VehicleSample>(), 32 + 4 + 5 * 4 + 16 + 4 + 4 + 3 * 4 + 4);
         assert_eq!(size_of::<Command>(), 32 + 4 + 4 + 3 * 4 + 16 + 4);
         assert_eq!(size_of::<Actor>(), 4 + 1 + 1 + 2 + 10 * 4);
@@ -292,6 +342,7 @@ mod tests {
         assert_eq!(size_of::<SensorMount>(), 32);
         assert_eq!(size_of::<SensorLayout>(), 32 + 8 + MAX_SENSORS * 32);
         assert_eq!(size_of::<AdapterInfo>(), 32 + 64 + 8 + 24 + 8);
+        assert_eq!(size_of::<Hud>(), 32 + 32);
     }
 
     #[test]

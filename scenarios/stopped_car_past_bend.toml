@@ -1,0 +1,27 @@
+# A car stopped just past a left bend. The front radar only sees it once the
+# ego car is in the bend; ACC ignores stationary objects it never saw moving
+# (as production ACC does), so AEB must stop the car.
+name = "Stopped car past a bend at 70 km/h"
+feature = "acc"
+duration = 30.0
+
+[road]
+straight = 80
+radius = 150
+
+[ego]
+speed_kph = 70
+engage_at = 0.5
+set_kph = 70
+
+[[actor]]
+s = 190
+speed_kph = 0
+
+[repeat]
+count = 5
+vary_s = 20
+
+[pass]
+end_speed_below = 0.1
+min_stop_gap = 0.3

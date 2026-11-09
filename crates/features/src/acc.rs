@@ -6,8 +6,13 @@
 //! the motion smooth. At steady state the ego car matches the lead's speed at
 //! the desired gap:
 //!
-//!   target = min(set speed, lead speed + k · (gap − desired gap))
+//!   target = min(set speed, lead speed + clamp(k · (gap − desired gap), −c, ∞))
 //!   desired gap = standstill gap + time gap × ego speed
+//!
+//! The clamp `c` limits how fast ACC falls back when the gap is short: after a
+//! cut-in it opens the gap gently (at most `c` slower than the lead) instead
+//! of braking hard behind a car that isn't closing in. Real danger (closing
+//! fast) is AEB's job.
 
 use fusion::Lead;
 
@@ -19,6 +24,8 @@ pub struct AccConfig {
     pub standstill_gap: f32,
     /// Gap error → speed correction (1/s).
     pub gap_gain: f32,
+    /// Largest speed deficit to the lead used to open a short gap (m/s).
+    pub max_fall_back: f32,
     /// Lead acceleration feed-forward horizon (s).
     pub lead_accel_horizon: f32,
     /// Lowest and highest set speeds (m/s) and the button step (m/s).
@@ -36,6 +43,7 @@ impl Default for AccConfig {
             time_gaps: [1.0, 1.5, 2.0, 2.5],
             standstill_gap: 4.0,
             gap_gain: 0.3,
+            max_fall_back: 3.0,
             lead_accel_horizon: 0.5,
             min_set: 30.0 / 3.6,
             max_set: 160.0 / 3.6,
@@ -100,7 +108,7 @@ impl Acc {
             Some(l) => {
                 let desired = self.cfg.standstill_gap + self.time_gap() * ego_speed.max(0.0);
                 let lead_v = (l.v + l.a.min(0.0) * self.cfg.lead_accel_horizon).max(0.0);
-                let gap_term = self.cfg.gap_gain * (l.gap - desired);
+                let gap_term = (self.cfg.gap_gain * (l.gap - desired)).max(-self.cfg.max_fall_back);
                 let target = (lead_v + gap_term).clamp(0.0, self.set_speed);
                 AccRequest { target, desired_gap: desired, following: target < self.set_speed - 0.05 }
             }
@@ -153,6 +161,16 @@ mod tests {
         assert_eq!(r.target, 0.0);
         // When it pulls away, the target rises again (stop-and-go).
         assert!(a.request(0.0, Some(lead(8.0, 3.0))).target > 0.0);
+    }
+
+    #[test]
+    fn a_cut_in_opens_the_gap_gently() {
+        let mut a = Acc::new(AccConfig::default());
+        a.engage(27.0);
+        // A car cuts in 12 m ahead at 25 m/s; the desired gap is 58 m. Fall
+        // back to at most 3 m/s below the lead, not 11 m/s.
+        let r = a.request(27.0, Some(lead(12.0, 25.0)));
+        assert!((r.target - 22.0).abs() < 1e-4, "target {}", r.target);
     }
 
     #[test]

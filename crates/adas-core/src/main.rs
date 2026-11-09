@@ -1,7 +1,7 @@
 //! The ADAS core process. Connects to the adapter link and runs one
-//! `Core::step` per host frame; records every engagement to MCAP.
+//! `Core::step` per host frame; records the whole run to MCAP.
 //!
-//! Usage: `adas-core [--feature speed-profile|test-driver] [--spin]
+//! Usage: `adas-core [--feature acc|speed-profile|test-driver] [--spin]
 //!                   [--record DIR | --no-record] [--link NAME]`
 //!
 //! - `--spin`: busy-poll for samples (lowest latency, uses a CPU core);
@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use adapter_api::shm::{DEFAULT_NAME, SharedLink};
-use adapter_api::{CONTRACT_VERSION, Command, Header, MsgKind, VehicleSample, sample_flags, str_of, wall_time_ns};
-use adas_core::{Core, Event, Feature, Inputs, Stick, layout};
+use adapter_api::{CONTRACT_VERSION, Header, MsgKind, sample_flags, str_of, wall_time_ns};
+use adas_core::{Core, Event, Feature, Inputs, Stick};
 use record::{Recorder, Stick3};
 
 /// Keyboard state from a low-level keyboard hook. `GetAsyncKeyState` doesn't
@@ -148,6 +148,7 @@ fn main() {
                 feature = match args.next().as_deref() {
                     Some("speed-profile") => Feature::speed_profile(),
                     Some("test-driver") => Feature::TestDriver(Default::default()),
+                    Some("acc") => Feature::Acc(Default::default()),
                     other => {
                         eprintln!("unknown feature {other:?}");
                         std::process::exit(2);
@@ -193,16 +194,31 @@ fn main() {
     let mut seen_writes = link.sample.writes();
     let mut info_writes = 0u32;
     let mut layout_seq = 0u32;
-    let mut info = adapter_api::AdapterInfo::default();
 
-    // Recording: one file per engagement, with one frame of pre-roll.
+    // Recording: the whole core run, from its first sample, so a replay can
+    // rebuild the perception state as well (the tracker's history starts
+    // before any engagement).
     let mut recorder: Option<Recorder> = None;
-    let mut preroll: Option<(VehicleSample, adapter_api::ActorList, Option<Stick3>, Command)> = None;
+    if let Some(dir) = &rec_dir {
+        let _ = std::fs::create_dir_all(dir);
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let path = dir.join(format!("{secs}-{}.mcap", feature.name()));
+        let mut meta = feature.to_meta();
+        meta.insert("initial_request".into(), (first.flags & sample_flags::ENGAGE_REQUEST != 0).to_string());
+        match Recorder::create(&path, &meta) {
+            Ok(r) => {
+                println!("recording {}", path.display());
+                recorder = Some(r);
+            }
+            Err(e) => eprintln!("cannot record to {}: {e}", path.display()),
+        }
+    }
 
     let mut one_way: Vec<u64> = Vec::with_capacity(1024);
     let mut step_ns: Vec<u64> = Vec::with_capacity(1024);
     let mut gaps = 0u32;
     let mut window_start = wall_time_ns();
+    let mut aeb_logged = false;
 
     loop {
         if spin {
@@ -225,14 +241,19 @@ fn main() {
         }
         last_seq = Some(s.header.seq);
 
-        // Adapter info changed (new vehicle): publish the sensor layout for it.
+        // Adapter info changed (new vehicle): the core rebuilds its sensor
+        // layout; publish it, and record the change in order.
         if link.info.writes() != info_writes {
             info_writes = link.info.writes();
-            info = link.info.read().1;
+            let info = link.info.read().1;
+            core.set_info(&info);
             layout_seq += 1;
-            let mut l = layout::default_layout(info.box_min, info.box_max);
+            let mut l = *core.layout();
             l.header = Header { kind: MsgKind::SensorLayout, version: CONTRACT_VERSION, seq: layout_seq, wall_time_ns: wall_time_ns(), ..Default::default() };
             link.layout.write(&l);
+            if let Some(r) = recorder.as_mut() {
+                let _ = r.info(&info);
+            }
             println!("adapter: {} / {}; sensor layout published ({} sensors)", str_of(&info.host), str_of(&info.vehicle), l.count);
         }
 
@@ -249,36 +270,22 @@ fn main() {
         link.command.write(&cmd);
 
         // Everything below is off the critical path (the command is out).
+        let mut hud = *core.hud();
+        hud.header = Header { kind: MsgKind::Hud, version: CONTRACT_VERSION, seq: cmd_seq, frame: s.header.frame, game_time_us: s.header.game_time_us, wall_time_ns: wall_time_ns() };
+        link.hud.write(&hud);
         let stick3 = stick.map(|k| Stick3 { throttle: k.throttle, brake: k.brake, steer: k.steer });
         match event {
-            Event::Engaged => {
-                println!("engaged at frame {} ({:.2} m/s)", s.header.frame, s.speed);
-                if let Some(dir) = &rec_dir {
-                    let _ = std::fs::create_dir_all(dir);
-                    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    let path = dir.join(format!("{secs}-{}.mcap", feature.name()));
-                    let mut meta = feature.to_meta();
-                    let pre_req = preroll.as_ref().map(|p| p.0.flags & sample_flags::ENGAGE_REQUEST != 0).unwrap_or(false);
-                    meta.insert("initial_request".into(), pre_req.to_string());
-                    meta.insert("host".into(), str_of(&info.host).into());
-                    meta.insert("vehicle".into(), str_of(&info.vehicle).into());
-                    match Recorder::create(&path, &meta) {
-                        Ok(mut r) => {
-                            let _ = r.info(&info);
-                            if let Some((ps, pa, pst, pc)) = &preroll {
-                                let _ = r.step(ps, pa, *pst, pc);
-                            }
-                            println!("recording {}", path.display());
-                            recorder = Some(r);
-                        }
-                        Err(e) => eprintln!("cannot record to {}: {e}", path.display()),
-                    }
-                }
-            }
-            Event::CancelledByDriver | Event::Disengaged => {
-                println!("{} at frame {}", if event == Event::Disengaged { "disengaged" } else { "cancelled by driver" }, s.header.frame);
-            }
+            Event::Engaged => println!("engaged at frame {} ({:.2} m/s)", s.header.frame, s.speed),
+            Event::CancelledByDriver => println!("cancelled by driver at frame {}", s.header.frame),
+            Event::Disengaged => println!("disengaged at frame {}", s.header.frame),
+            Event::CancelledByAeb => println!("AEB at frame {}: ACC cancelled", s.header.frame),
             Event::None => {}
+        }
+        if cmd.flags & adapter_api::command_flags::AEB != 0 && cmd.brake > 0.0 && !aeb_logged {
+            println!("AEB braking at frame {} ({:.1} m/s, ttc {:.2} s, brake {:.2})", s.header.frame, s.speed, hud.ttc, cmd.brake);
+            aeb_logged = true;
+        } else if cmd.flags & adapter_api::command_flags::AEB == 0 {
+            aeb_logged = false;
         }
         if let Some(r) = recorder.as_mut()
             && let Err(e) = r.step(&s, &actors, stick3, &cmd)
@@ -286,13 +293,6 @@ fn main() {
             eprintln!("recording failed: {e}");
             recorder = None;
         }
-        if matches!(event, Event::CancelledByDriver | Event::Disengaged)
-            && let Some(r) = recorder.take()
-        {
-            let _ = r.finish();
-            println!("recording closed");
-        }
-        preroll = Some((s, actors, stick3, cmd));
 
         one_way.push(t1.saturating_sub(s.header.wall_time_ns));
         step_ns.push(t1.saturating_sub(t0));

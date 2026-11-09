@@ -1,15 +1,22 @@
 //! The ADAS core: one deterministic `step()` per host frame (D23).
 //!
 //! `Core::step` is a pure function of its inputs and the core's own state: the
-//! vehicle sample, the actor list and (for the test driver) a stick input. Every
-//! input is recorded, so a replay of a drive reproduces the same commands (D20).
-//! Nothing here knows which host game is running.
+//! vehicle sample, the actor list, the adapter info and (for the test driver) a
+//! stick input. Every input is recorded, so a replay of a drive reproduces the
+//! same commands (D20). Nothing here knows which host game is running.
+//!
+//! Every step: perception (front radar model → tracker → lead selection) and
+//! AEB run whether or not anything is engaged; the engaged feature (ACC, the
+//! speed profile or the test driver) runs on top; AEB wins the arbitration.
 
 pub mod features;
 pub mod layout;
 
-use adapter_api::{ActorList, Command, VehicleSample, command_flags, sample_flags};
+use adapter_api::{ActorList, AdapterInfo, Command, Hud, SensorLayout, VehicleSample, buttons, command_flags, hud_flags, sample_flags};
 use control::{Config, SpeedController};
+use features::FeatureState;
+use fusion::{Lead, LeadKind, Tracker, TrackerConfig, select_lead};
+use sensors::{FrontRadar, RadarConfig};
 
 pub use features::{Feature, Stick};
 
@@ -25,9 +32,7 @@ pub struct Inputs<'a> {
 /// Engagement state, as a production ADAS shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// Not engaged.
     Off,
-    /// Engaged and in control.
     Active,
     /// Engaged, but the driver is pressing the accelerator (temporary override).
     Override,
@@ -42,7 +47,12 @@ pub enum Event {
     CancelledByDriver,
     /// The engage request was withdrawn.
     Disengaged,
+    /// Emergency braking took over; ACC is cancelled.
+    CancelledByAeb,
 }
+
+/// Half a lane for in-path decisions (m).
+const HALF_LANE: f32 = 1.8;
 
 pub struct Core {
     feature: Feature,
@@ -50,23 +60,47 @@ pub struct Core {
     state: State,
     prev_request: bool,
     last_game_us: u64,
-    /// Seconds since engaging (game time).
     t_engaged: f32,
-    feature_state: features::FeatureState,
+    feature_state: FeatureState,
+    info: Option<AdapterInfo>,
+    layout: SensorLayout,
+    radar: FrontRadar,
+    tracker: Tracker,
+    since_scan: f32,
+    acc: ::features::Acc,
+    aeb: ::features::Aeb,
+    hud: Hud,
 }
 
 impl Core {
     /// `initial_request`: the engage-request flag as first seen, so a request
     /// that was already set before this core started doesn't engage it.
     pub fn new(feature: Feature, initial_request: bool) -> Self {
+        // ACC may brake harder than the cruise default (up to 3.5 m/s²).
+        let speed_cfg = match feature {
+            Feature::Acc(_) => Config { decel_max: 3.5, ..Config::default() },
+            _ => Config::default(),
+        };
+        let acc_cfg = match &feature {
+            Feature::Acc(c) => *c,
+            _ => Default::default(),
+        };
         Self {
             feature,
-            speed: SpeedController::new(Config::default()),
+            speed: SpeedController::new(speed_cfg),
             state: State::Off,
             prev_request: initial_request,
             last_game_us: 0,
             t_engaged: 0.0,
-            feature_state: features::FeatureState::default(),
+            feature_state: FeatureState::default(),
+            info: None,
+            layout: SensorLayout::default(),
+            radar: FrontRadar::new(RadarConfig::default(), layout::FRONT_RADAR),
+            tracker: Tracker::new(TrackerConfig::default()),
+            since_scan: 0.0,
+            acc: ::features::Acc::new(acc_cfg),
+            aeb: ::features::Aeb::new(Default::default()),
+            hud: Hud::default(),
         }
     }
 
@@ -76,6 +110,30 @@ impl Core {
 
     pub fn feature(&self) -> &Feature {
         &self.feature
+    }
+
+    /// The adapter's identity and ego geometry. Rebuilds the sensor layout.
+    pub fn set_info(&mut self, info: &AdapterInfo) {
+        self.info = Some(*info);
+        self.layout = layout::default_layout(info.box_min, info.box_max);
+    }
+
+    /// The standing line-of-sight queries for the adapter.
+    pub fn layout(&self) -> &SensorLayout {
+        &self.layout
+    }
+
+    /// What the HUD should show after the last step.
+    pub fn hud(&self) -> &Hud {
+        &self.hud
+    }
+
+    pub fn tracker(&self) -> &Tracker {
+        &self.tracker
+    }
+
+    pub fn aeb_activations(&self) -> u32 {
+        self.aeb.activations
     }
 
     /// One step. Returns the command payload (the caller fills the header and
@@ -90,13 +148,28 @@ impl Core {
         let dt = if self.last_game_us == 0 { 0.0 } else { s.header.game_time_us.saturating_sub(self.last_game_us) as f32 / 1e6 };
         self.last_game_us = s.header.game_time_us;
 
+        // --- Perception (always) ---
+        let (follow, threat) = self.perceive(s, inp.actors, dt, paused);
+
+        // --- AEB (always) ---
+        let aeb = if paused || dt <= 0.0 || self.info.is_none() {
+            None
+        } else {
+            Some(self.aeb.step(dt, s.speed, threat, s.driver_throttle))
+        };
+        let aeb_braking = aeb.is_some_and(|a| a.brake > 0.0 || a.hold);
+
+        // --- Engagement ---
         let mut event = Event::None;
         if self.state == State::Off {
-            if request && !self.prev_request && !cancel {
+            if request && !self.prev_request && !cancel && !aeb_braking {
                 self.state = State::Active;
                 self.speed.reset(s.speed);
                 self.t_engaged = 0.0;
-                self.feature_state = features::FeatureState::default();
+                self.feature_state = FeatureState::default();
+                if matches!(self.feature, Feature::Acc(_)) {
+                    self.acc.engage(s.speed);
+                }
                 event = Event::Engaged;
             }
         } else if cancel {
@@ -105,43 +178,137 @@ impl Core {
         } else if !request {
             self.state = State::Off;
             event = Event::Disengaged;
+        } else if aeb_braking && matches!(self.feature, Feature::Acc(_)) {
+            self.state = State::Off;
+            event = Event::CancelledByAeb;
         } else {
             self.state = if override_ { State::Override } else { State::Active };
         }
         self.prev_request = request;
 
-        let mut cmd = Command::default();
-        if self.state == State::Off {
-            return (cmd, event);
+        // Buttons work while ACC is engaged.
+        if self.state != State::Off && matches!(self.feature, Feature::Acc(_)) {
+            if s.buttons & buttons::SPEED_UP != 0 {
+                self.acc.speed_up();
+            }
+            if s.buttons & buttons::SPEED_DOWN != 0 {
+                self.acc.speed_down();
+            }
+            if s.buttons & buttons::GAP != 0 {
+                self.acc.cycle_gap();
+            }
         }
-        cmd.flags = command_flags::ENGAGED;
-        if paused || dt <= 0.0 {
-            return (cmd, event);
-        }
-        self.t_engaged += dt;
 
-        let out = features::run(
-            &self.feature,
-            &mut self.feature_state,
-            &mut self.speed,
-            features::Ctx { sample: s, actors: inp.actors, stick: inp.stick, dt, t: self.t_engaged },
-        );
+        // --- The engaged feature ---
+        let mut cmd = Command::default();
+        let mut following = false;
+        if self.state != State::Off {
+            cmd.flags = command_flags::ENGAGED;
+            if !paused && dt > 0.0 {
+                self.t_engaged += dt;
+                let out = features::run(
+                    &self.feature,
+                    &mut self.feature_state,
+                    &mut self.speed,
+                    &self.acc,
+                    features::Ctx { sample: s, actors: inp.actors, stick: inp.stick, dt, t: self.t_engaged, follow },
+                );
+                if self.state == State::Override {
+                    // The driver's foot wins. Restart the reference from the
+                    // current speed, so letting go eases back to the target.
+                    self.speed.reset(s.speed);
+                }
+                following = out.following;
+                cmd.throttle = out.throttle;
+                cmd.brake = out.brake;
+                if out.hold {
+                    cmd.flags |= command_flags::HOLD;
+                }
+                if let Some(a) = out.steer {
+                    cmd.flags |= command_flags::STEER;
+                    cmd.steer_angle = a;
+                }
+                cmd.diag = out.diag;
+            }
+        }
+
+        // --- Arbitration: AEB wins ---
+        if let Some(a) = aeb {
+            if a.warn {
+                cmd.flags |= command_flags::FCW;
+            }
+            if a.brake > 0.0 {
+                cmd.flags |= command_flags::AEB;
+                cmd.throttle = 0.0;
+                cmd.brake = cmd.brake.max(a.brake);
+                cmd.flags &= !command_flags::HOLD;
+            }
+            if a.hold {
+                cmd.flags |= command_flags::AEB | command_flags::HOLD;
+                cmd.throttle = 0.0;
+                cmd.brake = 0.0;
+            }
+        }
+
+        // --- HUD ---
+        let acc_on = self.state != State::Off && matches!(self.feature, Feature::Acc(_));
+        let mut f = 0;
+        if acc_on {
+            f |= hud_flags::ACC;
+        }
+        if acc_on && following {
+            f |= hud_flags::FOLLOWING;
+        }
+        if follow.is_some() {
+            f |= hud_flags::LEAD;
+        }
+        if cmd.flags & command_flags::FCW != 0 {
+            f |= hud_flags::FCW;
+        }
+        if cmd.flags & command_flags::AEB != 0 {
+            f |= hud_flags::AEB;
+        }
+        if cmd.flags & command_flags::HOLD != 0 {
+            f |= hud_flags::HOLD;
+        }
         if self.state == State::Override {
-            // The driver's foot wins. Restart the reference from the current
-            // speed, so letting go eases back to the target instead of braking.
-            self.speed.reset(s.speed);
+            f |= hud_flags::OVERRIDE;
         }
-        cmd.throttle = out.throttle;
-        cmd.brake = out.brake;
-        if out.hold {
-            cmd.flags |= command_flags::HOLD;
-        }
-        if let Some(a) = out.steer {
-            cmd.flags |= command_flags::STEER;
-            cmd.steer_angle = a;
-        }
-        cmd.diag = out.diag;
+        self.hud = Hud {
+            header: Default::default(),
+            flags: f,
+            set_speed: self.acc.set_speed,
+            time_gap: self.acc.time_gap(),
+            gap_index: self.acc.gap_index as u32,
+            lead_gap: follow.map(|l| l.gap).unwrap_or(f32::NAN),
+            lead_speed: follow.map(|l| l.v).unwrap_or(f32::NAN),
+            ttc: aeb.map(|a| a.ttc).unwrap_or(f32::INFINITY),
+            _reserved: 0,
+        };
         (cmd, event)
+    }
+
+    /// Front radar → tracker → leads. Without adapter info (no ego geometry,
+    /// no sensor layout yet) there is no perception.
+    fn perceive(&mut self, s: &VehicleSample, actors: &ActorList, dt: f32, paused: bool) -> (Option<Lead>, Option<Lead>) {
+        let Some(info) = self.info else { return (None, None) };
+        if paused || dt <= 0.0 {
+            return (None, None);
+        }
+        self.tracker.predict(dt, s.vx, s.yaw_rate);
+        self.since_scan += dt;
+        if let Some(mount) = self.layout.as_slice().get(layout::FRONT_RADAR)
+            && let Some(scan) = self.radar.step(dt, mount, actors, s.header.frame)
+        {
+            self.tracker.update(&scan, self.since_scan);
+            self.since_scan = 0.0;
+        }
+        let front = info.box_max[0];
+        let tracks = self.tracker.tracks();
+        (
+            select_lead(tracks, s.speed, s.yaw_rate, front, HALF_LANE, LeadKind::Follow),
+            select_lead(tracks, s.speed, s.yaw_rate, front, HALF_LANE, LeadKind::Collision),
+        )
     }
 }
 
@@ -155,6 +322,7 @@ mod tests {
             header: Header { seq, frame: seq as u64, game_time_us: seq as u64 * 16_667, ..Default::default() },
             flags,
             speed,
+            vx: speed,
             ..Default::default()
         }
     }
@@ -189,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn override_keeps_engagement_and_releases_pedals_to_driver() {
+    fn override_keeps_engagement() {
         let mut core = Core::new(Feature::speed_profile(), false);
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 0.0);
         let (c, _) = step(&mut core, 2, sample_flags::ENGAGE_REQUEST | sample_flags::DRIVER_OVERRIDE, 3.0);
@@ -214,5 +382,16 @@ mod tests {
             (1..600).map(|i| step(&mut core, i, sample_flags::ENGAGE_REQUEST, (i as f32 * 0.01).min(8.0)).0).collect::<Vec<_>>()
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn acc_buttons_change_the_set_speed() {
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 20.0);
+        let set0 = core.hud().set_speed;
+        let mut s = sample(2, sample_flags::ENGAGE_REQUEST, 20.0);
+        s.buttons = buttons::SPEED_UP;
+        core.step(Inputs { sample: &s, actors: &ActorList::default(), stick: None });
+        assert!((core.hud().set_speed - set0 - 5.0 / 3.6).abs() < 1e-4);
     }
 }

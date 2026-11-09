@@ -40,7 +40,7 @@ impl Default for RadarConfig {
             p_miss: 0.01,
             clutter_per_scan: 0.02,
             min_range: 0.5,
-            seed: 0x5EED_0F_FAD,
+            seed: 0x0005_EED0_FFAD,
         }
     }
 }

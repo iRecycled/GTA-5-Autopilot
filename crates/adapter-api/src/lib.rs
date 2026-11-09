@@ -6,9 +6,10 @@
 //! written in any language. Positions are ISO 8855 vehicle coordinates and SI
 //! units (D16); each adapter converts from its game once.
 //!
-//! Version 2 carries `sample`, `command`, `actors`, `layout` (the standing
-//! line-of-sight queries) and `info`; the scenario and HUD channels in
-//! `docs/implementation-plan.md` follow.
+//! Version 3 carries `sample` (with driver inputs and button edges),
+//! `command` (with AEB and FCW), `actors`, `layout` (the standing
+//! line-of-sight queries), `info` and `hud`; the scenario channel in
+//! `docs/implementation-plan.md` follows.
 
 pub mod mailbox;
 pub mod msg;
@@ -19,7 +20,7 @@ pub use mailbox::Mailbox;
 pub use msg::*;
 
 /// Bumped on any change to a message layout or meaning.
-pub const CONTRACT_VERSION: u16 = 2;
+pub const CONTRACT_VERSION: u16 = 3;
 
 /// Monotonic wall clock in ns (QueryPerformanceCounter on Windows). Both sides
 /// of the link read the same clock, so timestamps compare across processes.

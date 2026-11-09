@@ -10,6 +10,9 @@ publish.workspace = true
 adapter-api = { path = "../adapter-api" }
 control = { path = "../control" }
 record = { path = "../record" }
+sensors = { path = "../sensors" }
+fusion = { path = "../fusion" }
+features = { path = "../features" }
 
 [[bin]]
 name = "adas-core"

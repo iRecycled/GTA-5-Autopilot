@@ -35,10 +35,13 @@ fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> 
         None => None,
     };
     if let Some(w) = out.as_mut() {
-        let _ = writeln!(w, "frame,speed,actors,flags,throttle,brake,steer,diag0,diag1,diag2,diag3,match");
+        let _ = writeln!(w, "frame,t_s,speed,actors,flags,throttle,brake,steer,diag0,diag1,diag2,diag3,hud_flags,lead_gap,lead_speed,ttc,match");
     }
     let (mut compared, mut diffs) = (0usize, 0usize);
     for (i, f) in rec.frames.iter().enumerate() {
+        if let Some(info) = &f.info {
+            core.set_info(info);
+        }
         let stick = f.stick.map(|s| Stick { throttle: s.throttle, brake: s.brake, steer: s.steer });
         let (c, _) = core.step(Inputs { sample: &f.sample, actors: &f.actors, stick });
         let ok = match &f.command {
@@ -61,8 +64,24 @@ fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> 
         if let Some(w) = out.as_mut() {
             let _ = writeln!(
                 w,
-                "{},{:.3},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{}",
-                f.sample.header.frame, f.sample.speed, f.actors.count, c.flags, c.throttle, c.brake, c.steer_angle, c.diag[0], c.diag[1], c.diag[2], c.diag[3], ok as u8
+                "{},{:.3},{:.3},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.2},{:.2},{:.2},{}",
+                f.sample.header.frame,
+                f.sample.header.game_time_us as f64 / 1e6,
+                f.sample.speed,
+                f.actors.count,
+                c.flags,
+                c.throttle,
+                c.brake,
+                c.steer_angle,
+                c.diag[0],
+                c.diag[1],
+                c.diag[2],
+                c.diag[3],
+                core.hud().flags,
+                core.hud().lead_gap,
+                core.hud().lead_speed,
+                core.hud().ttc,
+                ok as u8
             );
         }
     }

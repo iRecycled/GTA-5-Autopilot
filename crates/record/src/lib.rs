@@ -153,6 +153,9 @@ impl Recorder {
 /// One recorded core step.
 #[derive(Clone, Debug)]
 pub struct Frame {
+    /// Adapter info that arrived just before this step (the core applies it
+    /// before stepping).
+    pub info: Option<AdapterInfo>,
     pub sample: VehicleSample,
     pub actors: ActorList,
     pub stick: Option<Stick3>,
@@ -193,6 +196,7 @@ impl Recording {
         let mut info = None;
         let mut frames: Vec<Frame> = Vec::new();
         let mut truncated = false;
+        let mut pending_info: Option<AdapterInfo> = None;
         for m in mcap::MessageStream::new(&data).map_err(|e| bad(e.to_string()))? {
             let m = match m {
                 Ok(m) => m,
@@ -205,6 +209,7 @@ impl Recording {
             };
             match m.channel.topic.as_str() {
                 "sample" => frames.push(Frame {
+                    info: pending_info.take(),
                     sample: from_bytes(&m.data).ok_or_else(|| bad("bad sample".into()))?,
                     actors: ActorList::default(),
                     stick: None,
@@ -225,7 +230,13 @@ impl Recording {
                         f.command = from_bytes(&m.data);
                     }
                 }
-                "info" => info = from_bytes(&m.data),
+                "info" => {
+                    let i: Option<AdapterInfo> = from_bytes(&m.data);
+                    if info.is_none() {
+                        info = i;
+                    }
+                    pending_info = i;
+                }
                 _ => {}
             }
         }

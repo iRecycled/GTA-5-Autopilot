@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::sync::OnceLock;
 
-use crate::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, Mailbox, SensorLayout, VehicleSample};
+use crate::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, Hud, Mailbox, SensorLayout, VehicleSample};
 
 /// Default name of the link for one adapter ↔ core pair.
 pub const DEFAULT_NAME: &str = "Local\\adas-link-v1";
@@ -41,6 +41,8 @@ pub struct Link {
     pub layout: Mailbox<SensorLayout>,
     /// adapter → core: identity and capabilities.
     pub info: Mailbox<AdapterInfo>,
+    /// core → adapter: what the HUD shows.
+    pub hud: Mailbox<Hud>,
 }
 
 #[link(name = "kernel32", kind = "raw-dylib")]

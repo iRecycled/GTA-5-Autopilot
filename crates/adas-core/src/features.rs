@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 
 use adapter_api::{ActorList, VehicleSample};
 use control::SpeedController;
+use features::{Acc, AccConfig};
+use fusion::Lead;
 
 /// A stick input for the test driver: pedals 0..=1, steering -1..=1 (left +).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -21,6 +23,8 @@ pub enum Feature {
     SpeedProfile(Vec<(f32, f32)>),
     /// The driver's stick drives the car through the core (drive-by-wire).
     TestDriver(TestDriverConfig),
+    /// Adaptive cruise (F1).
+    Acc(AccConfig),
 }
 
 impl Feature {
@@ -33,6 +37,7 @@ impl Feature {
         match self {
             Feature::SpeedProfile(_) => "speed-profile",
             Feature::TestDriver(_) => "test-driver",
+            Feature::Acc(_) => "acc",
         }
     }
 
@@ -50,6 +55,7 @@ impl Feature {
                 m.insert("steer_fade_speed".into(), c.steer_fade_speed.to_string());
                 m.insert("steer_rate".into(), c.steer_rate.to_string());
             }
+            Feature::Acc(_) => {}
         }
         m
     }
@@ -74,6 +80,7 @@ impl Feature {
                 steer_fade_speed: f("steer_fade_speed")?,
                 steer_rate: f("steer_rate")?,
             })),
+            Some("acc") => Ok(Feature::Acc(AccConfig::default())),
             other => Err(format!("unknown feature {other:?}")),
         }
     }
@@ -109,6 +116,8 @@ pub struct Ctx<'a> {
     pub dt: f32,
     /// Seconds since engaging.
     pub t: f32,
+    /// The lead ACC would follow, if any.
+    pub follow: Option<Lead>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -119,14 +128,16 @@ pub struct Out {
     /// Some = steer to this road-wheel angle (rad).
     pub steer: Option<f32>,
     pub diag: [f32; 4],
+    /// ACC is following a lead rather than cruising at the set speed.
+    pub following: bool,
 }
 
-pub fn run(feature: &Feature, st: &mut FeatureState, speed: &mut SpeedController, c: Ctx) -> Out {
+pub fn run(feature: &Feature, st: &mut FeatureState, speed: &mut SpeedController, acc: &Acc, c: Ctx) -> Out {
     match feature {
         Feature::SpeedProfile(segments) => {
             let target = target_at(segments, c.t);
             let o = speed.step(target, c.sample.speed, c.dt);
-            Out { throttle: o.throttle, brake: o.brake, hold: o.hold, steer: Some(0.0), diag: [target, o.reference, o.ref_accel, o.demand] }
+            Out { throttle: o.throttle, brake: o.brake, hold: o.hold, steer: Some(0.0), diag: [target, o.reference, o.ref_accel, o.demand], following: false }
         }
         Feature::TestDriver(cfg) => {
             let stick = c.stick.unwrap_or_default();
@@ -142,6 +153,20 @@ pub fn run(feature: &Feature, st: &mut FeatureState, speed: &mut SpeedController
                 hold,
                 steer: Some(st.steer),
                 diag: [stick.throttle, stick.brake, stick.steer, st.steer],
+                following: false,
+            }
+        }
+        Feature::Acc(_) => {
+            let r = acc.request(c.sample.speed, c.follow);
+            let o = speed.step(r.target, c.sample.speed, c.dt);
+            // Longitudinal only: no steering request (the driver steers).
+            Out {
+                throttle: o.throttle,
+                brake: o.brake,
+                hold: o.hold,
+                steer: None,
+                diag: [r.target, o.reference, c.follow.map(|l| l.gap).unwrap_or(f32::NAN), r.desired_gap],
+                following: r.following,
             }
         }
     }

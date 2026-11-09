@@ -1,12 +1,20 @@
-//! The front radar (D25): actor list → field of view and line of sight →
-//! error model → an object list at the radar's update rate.
+//! The radars (D25): actor list → field of view and line of sight → error
+//! model → an object list at the radar's update rate.
 //!
-//! Parameters follow a typical 77 GHz long-range automotive radar: 20 Hz
-//! updates, about 160 m range, ±10° (long-range beam), range noise of about
-//! 0.1 m + 0.5 %, range-rate noise of about 0.1 m/s, azimuth noise of about
-//! 0.3°, around 1 % missed detections per object per scan and occasional
-//! clutter. Stationary objects are reported, flagged as such: whether to act
-//! on them is the feature's decision, as on a real car.
+//! The front radar's parameters follow a typical 77 GHz long-range automotive
+//! radar: 20 Hz updates, about 160 m range, ±10° (long-range beam), range
+//! noise of about 0.1 m + 0.5 %, range-rate noise of about 0.1 m/s, azimuth
+//! noise of about 0.3°, around 1 % missed detections per object per scan and
+//! occasional clutter. Stationary objects are reported, flagged as such:
+//! whether to act on them is the feature's decision, as on a real car.
+//!
+//! The corner radars ([`RadarConfig::corner`]) are short-range units with a
+//! wide beam (about 80 m, ±75°): noisier, with more misses and clutter. They
+//! see an object where its box is nearest to them (a car alongside is seen by
+//! its side, even when its centre is out of the beam), and report it as
+//! object-level radars do: its centre and size, with the measurement's noise.
+//! Each corner radar numbers its objects itself: fusion must associate them
+//! across radars.
 
 use adapter_api::{ActorList, SensorMount};
 
@@ -27,6 +35,48 @@ pub struct RadarConfig {
     /// Objects closer than this along the boresight are not resolved (m).
     pub min_range: f32,
     pub seed: u64,
+    /// Corner radars: see the nearest point of the object's box, and report
+    /// its centre (not the near face along the line to its centre).
+    pub nearest_point: bool,
+    /// Number objects with the radar's own 16-bit ids instead of the host's.
+    pub own_ids: bool,
+}
+
+impl RadarConfig {
+    /// A short-range corner radar.
+    pub fn corner() -> Self {
+        Self {
+            period: 0.05,
+            range_noise_m: 0.15,
+            range_noise_frac: 0.01,
+            rate_noise: 0.15,
+            azimuth_noise_rad: 1.0_f32.to_radians(),
+            p_miss: 0.03,
+            clutter_per_scan: 0.05,
+            min_range: 0.3,
+            seed: 0x00C0_4E12_ADA2,
+            nearest_point: true,
+            own_ids: true,
+        }
+    }
+}
+
+/// The point of an actor's box nearest to `(mx, my)`, in the ego frame.
+pub fn nearest_box_point(a: &adapter_api::Actor, mx: f32, my: f32) -> (f32, f32) {
+    let (s, c) = a.yaw.sin_cos();
+    let (dx, dy) = (mx - a.x, my - a.y);
+    // Into the actor's frame, clamp to the box, back out.
+    let (lx, ly) = (c * dx + s * dy, -s * dx + c * dy);
+    let (hl, hw) = (0.5 * a.length.max(0.1), 0.5 * a.width.max(0.1));
+    let (cx, cy) = (lx.clamp(-hl, hl), ly.clamp(-hw, hw));
+    (a.x + c * cx - s * cy, a.y + s * cx + c * cy)
+}
+
+/// A radar's own 16-bit object id for a host actor (never 0, below the
+/// clutter range).
+fn own_id(actor: u32, radar: usize) -> u32 {
+    let h = crate::unit(0x0001_D50F_0B1E, actor as u64, radar as u64, 0);
+    1 + (h * 0x7FFE as f32) as u32
 }
 
 impl Default for RadarConfig {
@@ -41,13 +91,16 @@ impl Default for RadarConfig {
             clutter_per_scan: 0.02,
             min_range: 0.5,
             seed: 0x0005_EED0_FFAD,
+            nearest_point: false,
+            own_ids: false,
         }
     }
 }
 
 /// One reported object, in the ego vehicle frame (ISO 8855, m and m/s),
-/// relative to the ego reference point. `x`, `y` is the nearest face (where a
-/// radar's reflection comes from), not the object's centre.
+/// relative to the ego reference point. For the front radar `x`, `y` is the
+/// nearest face (where its reflection comes from); corner radars report the
+/// object's centre.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RadarObject {
     /// The radar's own track id (stable while it keeps seeing the object).
@@ -76,7 +129,10 @@ pub struct RadarScan {
     pub objects: Vec<RadarObject>,
 }
 
-pub struct FrontRadar {
+/// The front radar's name from Phase 1; every radar is a [`Radar`].
+pub type FrontRadar = Radar;
+
+pub struct Radar {
     cfg: RadarConfig,
     /// The host gives no line-of-sight bits (D21: degraded): treat everything
     /// in the beam as visible.
@@ -87,9 +143,13 @@ pub struct FrontRadar {
     scan: u32,
 }
 
-impl FrontRadar {
+impl Radar {
     pub fn new(cfg: RadarConfig, index: usize) -> Self {
         Self { cfg, ignore_los: false, index, since: f32::INFINITY, scan: 0 }
+    }
+
+    pub fn config(&self) -> &RadarConfig {
+        &self.cfg
     }
 
     /// Advances by `dt`. Returns a scan when one is due. `ego_vx` is the ego
@@ -109,6 +169,12 @@ impl FrontRadar {
         let mut objects = Vec::new();
 
         for a in actors.as_slice() {
+            if c.nearest_point {
+                if let Some(o) = self.nearest_point_object(a, mount, frame, seed, bit) {
+                    objects.push(o);
+                }
+                continue;
+            }
             let (dx, dy) = (a.x - mount.x, a.y - mount.y);
             let range = dx.hypot(dy);
             let az = dy.atan2(dx) - mount.facing;
@@ -148,10 +214,11 @@ impl FrontRadar {
 
         // Clutter: a stationary return somewhere in the beam now and then.
         if unit(seed, frame, 0, 5) < c.clutter_per_scan {
-            let r = 10.0 + unit(seed, frame, 0, 6) * (mount.range - 10.0);
+            let near = if c.nearest_point { 1.0 } else { 10.0 };
+            let r = near + unit(seed, frame, 0, 6) * (mount.range - near);
             let az = (unit(seed, frame, 0, 7) * 2.0 - 1.0) * mount.half_fov + mount.facing;
             objects.push(RadarObject {
-                id: 0x8000_0000 | (self.scan & 0xFFFF),
+                id: if c.own_ids { 0x8000 | (self.scan & 0x7FFF) } else { 0x8000_0000 | (self.scan & 0xFFFF) },
                 x: mount.x + r * az.cos(),
                 y: mount.y + r * az.sin(),
                 vx: 0.0,
@@ -163,6 +230,44 @@ impl FrontRadar {
             });
         }
         Some(RadarScan { scan: self.scan, objects })
+    }
+
+    /// A corner radar's view of one actor: seen if the nearest point of its
+    /// box is in the beam, in range and in sight; the error model perturbs
+    /// that measurement, and the object's centre is reported with the same
+    /// error.
+    fn nearest_point_object(&self, a: &adapter_api::Actor, mount: &SensorMount, frame: u64, seed: u64, bit: u8) -> Option<RadarObject> {
+        let c = &self.cfg;
+        let (px, py) = nearest_box_point(a, mount.x, mount.y);
+        let (dx, dy) = (px - mount.x, py - mount.y);
+        let range = dx.hypot(dy);
+        let az = geom::wrap_pi(dy.atan2(dx) - mount.facing);
+        if range > mount.range || range < c.min_range || az.abs() > mount.half_fov {
+            return None;
+        }
+        if !self.ignore_los && (a.los_mask & bit == 0 || a.los_age as f32 > 4.0 * mount.refresh_frames.max(1.0)) {
+            return None;
+        }
+        let id = a.id as u64;
+        if unit(seed, frame, id, 1) < c.p_miss {
+            return None;
+        }
+        let r_n = (range + normal(seed, frame, id, 2) * (c.range_noise_m + c.range_noise_frac * range)).max(c.min_range);
+        let az_n = az + normal(seed, frame, id, 3) * c.azimuth_noise_rad + mount.facing;
+        let (ux, uy) = (az_n.cos(), az_n.sin());
+        let v_noise = normal(seed, frame, id, 4) * c.rate_noise;
+        let (ex, ey) = (mount.x + r_n * ux - px, mount.y + r_n * uy - py);
+        Some(RadarObject {
+            id: if c.own_ids { own_id(a.id, self.index) } else { a.id },
+            x: a.x + ex,
+            y: a.y + ey,
+            vx: a.vx + v_noise * ux,
+            vy: a.vy + v_noise * uy,
+            width: a.width.max(0.5),
+            half_length: (a.length * 0.5).max(0.25),
+            stationary: a.vx.hypot(a.vy) < 0.5,
+            clutter: false,
+        })
     }
 }
 
@@ -220,6 +325,37 @@ mod tests {
         // The reported point is the near face: centre minus half the 4.5 m length.
         assert!((mean - (80.0 - 2.25)).abs() < 0.05, "mean {mean}");
         assert!((sd - (0.1 + 0.005 * 78.0)).abs() < 0.08, "sd {sd}");
+    }
+
+    #[test]
+    fn a_corner_radar_sees_the_side_of_a_car_alongside() {
+        // Rear-left corner radar; a car alongside in the next lane, its
+        // centre level with the ego centre (behind the beam's boresight).
+        let m = SensorMount { x: -2.3, y: 0.9, z: 0.5, facing: 135f32.to_radians(), half_fov: 75f32.to_radians(), range: 80.0, refresh_frames: 3.6, _reserved: 0 };
+        let cfg = RadarConfig { p_miss: 0.0, clutter_per_scan: 0.0, range_noise_m: 0.0, range_noise_frac: 0.0, azimuth_noise_rad: 0.0, ..RadarConfig::corner() };
+        let mut r = Radar::new(cfg, 3);
+        let mut alongside = car(7, 0.0, 3.6, 20.0);
+        alongside.los_mask = 1 << 3;
+        let s = r.step(0.05, &m, &list(&[alongside]), 1).expect("scan");
+        assert_eq!(s.objects.len(), 1, "the centre is outside the beam, the box isn't");
+        let o = s.objects[0];
+        // Reported by its centre (noise off).
+        assert!(o.x.abs() < 1e-3 && (o.y - 3.6).abs() < 1e-3, "{o:?}");
+        // Out of the beam entirely: a car well ahead on the left.
+        assert!(r.step(0.05, &m, &list(&[Actor { los_mask: 1 << 3, ..car(8, 20.0, 3.6, 20.0) }]), 2).unwrap().objects.is_empty());
+        assert!(o.id != 7 && o.id < 0x8000, "the radar's own id: {}", o.id);
+        // The front radar reports the same car exactly as in Phase 1.
+        let mut f = FrontRadar::new(RadarConfig { p_miss: 0.0, clutter_per_scan: 0.0, ..Default::default() }, 0);
+        let ahead = f.step(0.05, &mount(), &list(&[car(1, 50.0, 0.0, 10.0)]), 1).unwrap();
+        assert_eq!(ahead.objects[0].id, 1);
+    }
+
+    #[test]
+    fn nearest_point_of_a_turned_box() {
+        // A crossing car (turned 90°) 10 m behind: its nearest face is 0.95 m closer.
+        let a = Actor { x: -10.0, y: 0.0, yaw: core::f32::consts::FRAC_PI_2, length: 4.5, width: 1.9, ..Actor::ZERO };
+        let (x, y) = nearest_box_point(&a, -2.3, 0.0);
+        assert!((x + 9.05).abs() < 1e-4 && y.abs() < 1e-4, "({x}, {y})");
     }
 
     #[test]

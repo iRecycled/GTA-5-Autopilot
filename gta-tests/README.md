@@ -49,10 +49,15 @@ stop_gap_max = 15.0
 | `stopped DIST` | spawn a stopped car DIST m ahead |
 | `lead_brake` | the lead brakes hard |
 | `clear` | remove the test car ahead |
-| `drive THR BRK STEER SECS` | the driver's inputs: 0–1 pedals, steering −1 to 1 (left positive). Fractional values count as a gamepad |
+| `drive THR BRK STEER SECS` | the driver's keys: W and S 0–1, steering −1 to 1 (left positive). Fractional values count as a gamepad. In GTA, S drives backwards from a standstill |
+| `creep back\|forward M/S SECS` | the driver holds a parking speed (m/s), backwards or forwards; any `drive` ends it |
+| `signal left\|right\|off` | the turn signal |
+| `overtake left\|right DIST KPH` | a car DIST m behind in the next lane, driving straight at KPH (a fixed profile, no AI driver) |
+| `cross left\|right DIST KPH` | a car from 25 m to that side, crossing DIST m behind the rear bumper at KPH |
+| `obstacle behind\|ahead GAP` | a van parked broadside, its near side GAP m from the bumper |
 | `fault adas\|chassis drop\|crc\|delay SECS` | a bus fault, as the engineering panel injects it |
 | `sleep SECS` | wait a fixed time |
-| `wait COND [TIMEOUT]` | wait until `speed>=KPH`, `speed<=KPH`, `stopped`, `engaged`, `off` or `event:TEXT` (default 30 s) |
+| `wait COND [TIMEOUT]` | wait until `speed>=KPH`, `speed<=KPH`, `stopped`, `engaged`, `off`, `reverse` or `event:TEXT` (default 30 s) |
 | `check_gap SECS` | measure the time-gap error to the lead for SECS |
 
 **Pass criteria:**
@@ -61,6 +66,10 @@ stop_gap_max = 15.0
 - `stop_gap_min`, `stop_gap_max`: the ground-truth gap to the car ahead at the end;
 - `end_kph_below`: the car must end slower than this;
 - `events` / `no_events`: text that must or must not appear in the core's events;
-- `max_gap_error_s`: the largest time-gap error `check_gap` may measure.
+- `max_gap_error_s`: the largest time-gap error `check_gap` may measure;
+- `min_rcta`, `max_rcta`, `min_park`, `max_park`: limits on RCTA and park assist brake activations;
+- `min_room`: the ground-truth room at the end from the bumper (rear when reversing) to the nearest actor in the car's path (m).
+
+The core reports the surround features as events: "BSD: vehicle in the left blind spot", "BSD warning: signalling left into an occupied lane", "RCTA: cross traffic from the right", "RCTA braking", "park assist braking".
 
 A failed step fails the test and the runner moves on to the next one. Each run's core log and recording are in `recordings/gta-tests/`; `replay` and `adas-viz --replay` open the recording.

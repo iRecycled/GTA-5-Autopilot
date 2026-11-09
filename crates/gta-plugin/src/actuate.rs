@@ -60,15 +60,61 @@ impl Steering {
     }
 }
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// The direction the pedals act in this frame: 0 forward, 1 reversing and
+/// moving backwards, 2 reversing but (nearly) stopped.
+static DIRECTION: AtomicU8 = AtomicU8::new(0);
+
+/// Sets the direction for this frame's pedals, from reverse being selected
+/// and the car's forward speed (m/s).
+pub fn set_direction(reverse: bool, vx: f32) {
+    DIRECTION.store(if !reverse { 0 } else if vx < -0.2 { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// The core's pedals in GTA's controls. GTA's brake control drives the car
+/// backwards once it is stopped, and its accelerator brakes it while it rolls
+/// backwards: in reverse the two swap. Stopped in reverse, a brake demand
+/// applies nothing (the accelerator would drive forwards); the standstill
+/// hold follows within a frame or two.
 pub fn pedals(throttle: f32, brake: f32) {
+    let (go, stop) = match DIRECTION.load(Ordering::Relaxed) {
+        0 => (Some(n::INPUT_VEH_ACCELERATE), Some(n::INPUT_VEH_BRAKE)),
+        1 => (Some(n::INPUT_VEH_BRAKE), Some(n::INPUT_VEH_ACCELERATE)),
+        _ => (Some(n::INPUT_VEH_BRAKE), None),
+    };
     unsafe {
-        if throttle > 0.0 {
-            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, n::PLAYER_CONTROL, n::INPUT_VEH_ACCELERATE, pedal_inject(throttle));
+        if let Some(c) = go
+            && throttle > 0.0
+        {
+            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, n::PLAYER_CONTROL, c, pedal_inject(throttle));
         }
-        if brake > 0.0 {
-            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, n::PLAYER_CONTROL, n::INPUT_VEH_BRAKE, pedal_inject(brake));
+        if let Some(c) = stop
+            && brake > 0.0
+        {
+            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, n::PLAYER_CONTROL, c, pedal_inject(brake));
         }
     }
+}
+
+/// A driver's raw keys (a test's scripted driver): W and S as pressed,
+/// whichever way the car moves.
+pub fn keys(w: f32, s: f32) {
+    unsafe {
+        if w > 0.0 {
+            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, n::PLAYER_CONTROL, n::INPUT_VEH_ACCELERATE, pedal_inject(w));
+        }
+        if s > 0.0 {
+            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, n::PLAYER_CONTROL, n::INPUT_VEH_BRAKE, pedal_inject(s));
+        }
+    }
+}
+
+/// While automatic braking in reverse: the driver's own reverse "throttle"
+/// (GTA's brake control) is ignored, as a real brake ECU overrides the
+/// accelerator.
+pub fn block_driver_reverse() {
+    let () = unsafe { invoke!(n::DISABLE_CONTROL_ACTION, n::PLAYER_CONTROL, n::INPUT_VEH_BRAKE, true) };
 }
 
 pub fn hold(veh: i32, on: bool) {

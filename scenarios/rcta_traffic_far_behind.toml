@@ -1,0 +1,22 @@
+# Traffic crossing well behind (about 13 m back from the bumper): no braking.
+name = "RCTA: no braking for traffic passing far behind"
+feature = "none"
+duration = 4.0
+
+[ego]
+speed_kph = 5
+gear = "reverse"
+
+[[actor]]
+s = -16
+d = -20
+heading = 90
+speed_kph = 20
+
+[repeat]
+count = 5
+vary_d = 10
+
+[pass]
+max_rcta = 0
+max_park = 0

@@ -1,7 +1,8 @@
 //! Drive recordings (D20).
 //!
 //! One MCAP file per drive. Each core step writes, in order: `sample`,
-//! `actors`, `stick` (if the test driver is running) and `command`. The bytes
+//! `actors`, `ranges` (while the range fans are answered), `stick` (if the
+//! test driver is running) and `command`. The bytes
 //! are the contract's `#[repr(C)]` layouts (encoding `adas-raw`, schema data =
 //! contract version), so a recording is tied to the contract version it was
 //! made with, and a replay can feed the core exactly what it saw live.
@@ -17,7 +18,7 @@ use std::fs::File;
 use std::io::{self, BufWriter};
 use std::path::Path;
 
-use adapter_api::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, Header, MAX_ACTORS, VehicleSample};
+use adapter_api::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, Header, MAX_ACTORS, RangeReport, VehicleSample};
 
 pub const ENCODING: &str = "adas-raw";
 
@@ -35,6 +36,7 @@ unsafe impl Raw for AdapterInfo {}
 unsafe impl Raw for Stick3 {}
 unsafe impl Raw for Profile {}
 unsafe impl Raw for FaultRec {}
+unsafe impl Raw for RangeReport {}
 
 /// A bus fault injected (or faults cleared) between steps.
 #[repr(C)]
@@ -124,6 +126,7 @@ struct Channels {
     command: u16,
     info: u16,
     fault: u16,
+    ranges: u16,
 }
 
 pub struct Recorder {
@@ -156,6 +159,7 @@ impl Recorder {
             command: chan("command", "adas.Command")?,
             info: chan("info", "adas.AdapterInfo")?,
             fault: chan("fault", "adas.Fault")?,
+            ranges: chan("ranges", "adas.RangeReport")?,
         };
         let mut meta = meta.clone();
         meta.insert("contract".into(), ver);
@@ -183,10 +187,13 @@ impl Recorder {
     }
 
     /// Records one core step.
-    pub fn step(&mut self, s: &VehicleSample, a: &ActorList, stick: Option<Stick3>, c: &Command) -> io::Result<()> {
+    pub fn step(&mut self, s: &VehicleSample, a: &ActorList, ranges: Option<&RangeReport>, stick: Option<Stick3>, c: &Command) -> io::Result<()> {
         let t = s.header.wall_time_ns;
         self.put(self.ch.sample, t, bytes_of(s))?;
         self.put(self.ch.actors, t, &actors_bytes(a))?;
+        if let Some(r) = ranges.filter(|r| r.count > 0) {
+            self.put(self.ch.ranges, t, bytes_of(r))?;
+        }
         if let Some(st) = stick {
             self.put(self.ch.stick, t, bytes_of(&st))?;
         }
@@ -215,6 +222,8 @@ pub struct Frame {
     pub faults: Vec<FaultRec>,
     pub sample: VehicleSample,
     pub actors: ActorList,
+    /// The range fans' answers, while they were active.
+    pub ranges: Option<RangeReport>,
     pub stick: Option<Stick3>,
     pub command: Option<Command>,
 }
@@ -246,9 +255,9 @@ impl Recording {
                 Err(e) => return Err(bad(format!("reading records: {e}"))),
             }
         }
-        let ver = CONTRACT_VERSION.to_string();
-        if meta.get("contract") != Some(&ver) {
-            return Err(bad(format!("recording is contract {:?}, this build is {ver}", meta.get("contract"))));
+        let theirs = meta.get("contract").and_then(|v| v.parse::<u16>().ok());
+        if !theirs.is_some_and(|v| adapter_api::RECORDING_COMPATIBLE.contains(&v)) {
+            return Err(bad(format!("recording is contract {:?}, this build is {CONTRACT_VERSION}", meta.get("contract"))));
         }
         let mut info = None;
         let mut frames: Vec<Frame> = Vec::new();
@@ -273,6 +282,7 @@ impl Recording {
                     faults: std::mem::take(&mut pending_faults),
                     sample: from_bytes(&m.data).ok_or_else(|| bad("bad sample".into()))?,
                     actors: ActorList::default(),
+                    ranges: None,
                     stick: None,
                     command: None,
                 }),
@@ -284,6 +294,11 @@ impl Recording {
                 "stick" => {
                     if let Some(f) = frames.last_mut() {
                         f.stick = from_bytes(&m.data);
+                    }
+                }
+                "ranges" => {
+                    if let Some(f) = frames.last_mut() {
+                        f.ranges = from_bytes(&m.data);
                     }
                 }
                 "command" => {
@@ -338,7 +353,9 @@ mod tests {
                 rec.fault(&f, 2500).unwrap();
                 rec.fault(&FaultRec { op: FaultRec::CLEAR, bus: u32::MAX, ..Default::default() }, 2600).unwrap();
             }
-            rec.step(&s, &actors, stick, &c).unwrap();
+            let mut ranges = RangeReport { count: 2, ..Default::default() };
+            ranges.fans[1].hits[0] = i as f32;
+            rec.step(&s, &actors, (i == 4).then_some(&ranges), stick, &c).unwrap();
         }
         rec.finish().unwrap();
 
@@ -355,6 +372,8 @@ mod tests {
         assert!(r.frames[1].faults.is_empty() && r.frames[3].faults.is_empty());
         assert_eq!(r.frames[4].actors.as_slice().len(), 2);
         assert_eq!(r.frames[4].actors.actors[1].kind, ActorKind::Pedestrian);
+        assert_eq!(r.frames[3].ranges.map(|g| g.fans[1].hits[0]), Some(4.0));
+        assert!(r.frames[2].ranges.is_none() && r.frames[4].ranges.is_none());
         assert!(!r.truncated);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -368,7 +387,7 @@ mod tests {
         let a = ActorList::default();
         for i in 1..=200u32 {
             let s = VehicleSample { speed: i as f32, ..Default::default() };
-            rec.step(&s, &a, None, &Command { answers_seq: i, ..Default::default() }).unwrap();
+            rec.step(&s, &a, None, None, &Command { answers_seq: i, ..Default::default() }).unwrap();
         }
         // Simulate a crash: the writer is dropped without `finish`, after the
         // file is cut mid-way through the last (unflushed) chunk.

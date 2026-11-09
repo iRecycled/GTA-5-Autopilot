@@ -16,6 +16,11 @@
 //! | `engage` / `cancel` | the engage request on / off |
 //! | `button up\|down\|gap` | one ACC button press |
 //! | `drive THR BRK STEER SECS` | the driver's inputs for SECS s (steer +left); fractional values count as an analogue device |
+//! | `creep back\|forward SPEED SECS` | the driver holds SPEED m/s (parking speeds) for SECS s; any `drive` ends it |
+//! | `signal left\|right\|off` | the turn signal |
+//! | `overtake left\|right DIST SPEED` | a car DIST m behind in the next lane, driving straight at SPEED m/s |
+//! | `cross left\|right DIST SPEED` | a car from 25 m to that side, crossing DIST m behind the rear bumper at SPEED m/s |
+//! | `obstacle behind\|ahead GAP` | a parked van broadside, GAP m from the bumper |
 //!
 //! Test tooling only: nothing here is part of the adapter contract.
 
@@ -36,6 +41,23 @@ pub enum Cmd {
     Cancel,
     Button(u32),
     Drive { throttle: f32, brake: f32, steer: f32, secs: f32 },
+    /// backwards?, speed (m/s), seconds.
+    Creep(bool, f32, f32),
+    /// 1 left, −1 right, 0 off.
+    Signal(i8),
+    /// side (1 left, −1 right), distance behind (m), speed (m/s).
+    Overtake(f32, f32, f32),
+    Cross(f32, f32, f32),
+    /// behind?, gap (m).
+    Obstacle(bool, f32),
+}
+
+fn side(w: Option<&str>, line: &str) -> Result<f32, String> {
+    match w {
+        Some("left") => Ok(1.0),
+        Some("right") => Ok(-1.0),
+        _ => Err(format!("{line}: left|right")),
+    }
 }
 
 pub fn parse(line: &str) -> Result<Cmd, String> {
@@ -59,6 +81,31 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
             _ => return Err(format!("{line}: button up|down|gap")),
         }),
         "drive" => Cmd::Drive { throttle: num(1)?.clamp(0.0, 1.0), brake: num(2)?.clamp(0.0, 1.0), steer: num(3)?.clamp(-1.0, 1.0), secs: num(4)?.max(0.0) },
+        "creep" => Cmd::Creep(
+            match w.get(1).copied() {
+                Some("back") => true,
+                Some("forward") => false,
+                _ => return Err(format!("{line}: creep back|forward SPEED SECS")),
+            },
+            num(2)?.clamp(0.0, 5.0),
+            num(3)?.max(0.0),
+        ),
+        "signal" => Cmd::Signal(match w.get(1).copied() {
+            Some("left") => 1,
+            Some("right") => -1,
+            Some("off") => 0,
+            _ => return Err(format!("{line}: signal left|right|off")),
+        }),
+        "overtake" => Cmd::Overtake(side(w.get(1).copied(), line)?, num(2)?, num(3)?),
+        "cross" => Cmd::Cross(side(w.get(1).copied(), line)?, num(2)?, num(3)?),
+        "obstacle" => Cmd::Obstacle(
+            match w.get(1).copied() {
+                Some("behind") => true,
+                Some("ahead") => false,
+                _ => return Err(format!("{line}: obstacle behind|ahead GAP")),
+            },
+            num(2)?,
+        ),
         _ => return Err(format!("unknown command: {line}")),
     })
 }

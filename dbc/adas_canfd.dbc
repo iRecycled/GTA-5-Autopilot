@@ -4,9 +4,9 @@ NS_ :
 
 BS_:
 
-BU_: FRONT_RADAR ADAS
+BU_: FRONT_RADAR CORNER_RADAR_FL CORNER_RADAR_FR CORNER_RADAR_RL CORNER_RADAR_RR PARK_ECU ADAS
 
-CM_ "ADAS CAN FD (D9). Our own layout, modelled on production radar object lists: a status frame per scan, then one 16-byte frame per object, front radar objects at 0x300 + slot.";
+CM_ "ADAS CAN FD (D9). Our own layout, modelled on production radar object lists: a status frame per scan, then one 16-byte frame per object, front radar 0x300-0x301, corner radars 0x310-0x317 (each its own status and object ids, as separate ECUs must), park sensors 0x340-0x341.";
 
 BO_ 768 RADAR_STATUS: 8 FRONT_RADAR
  SG_ SCAN_COUNTER : 0|16@1+ (1,0) [0|65535] "" ADAS
@@ -30,7 +30,118 @@ BO_ 769 RADAR_OBJECT: 16 FRONT_RADAR
  SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
  SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
 
+BO_ 784 CRADAR_FL_STATUS: 8 CORNER_RADAR_FL
+ SG_ SCAN_COUNTER : 0|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ NUM_OBJECTS : 16|8@1+ (1,0) [0|32] "" ADAS
+ SG_ BLOCKED : 28|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 48|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 785 CRADAR_FL_OBJECT: 16 CORNER_RADAR_FL
+ SG_ SLOT : 0|8@1+ (1,0) [0|31] "" ADAS
+ SG_ TRACK_ID : 8|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ DIST_X : 24|14@1- (0.02,0) [-163.84|163.82] "m" ADAS
+ SG_ DIST_Y : 38|12@1- (0.02,0) [-40.96|40.94] "m" ADAS
+ SG_ VEL_X : 50|12@1- (0.05,0) [-102.4|102.35] "m/s" ADAS
+ SG_ VEL_Y : 62|11@1- (0.05,0) [-51.2|51.15] "m/s" ADAS
+ SG_ WIDTH : 73|7@1+ (0.05,0) [0|6.35] "m" ADAS
+ SG_ HALF_LENGTH : 80|8@1+ (0.05,0) [0|12.75] "m" ADAS
+ SG_ STATIONARY : 88|1@1+ (1,0) [0|1] "" ADAS
+ SG_ EXIST_PROB : 89|7@1+ (0.01,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 786 CRADAR_FR_STATUS: 8 CORNER_RADAR_FR
+ SG_ SCAN_COUNTER : 0|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ NUM_OBJECTS : 16|8@1+ (1,0) [0|32] "" ADAS
+ SG_ BLOCKED : 28|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 48|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 787 CRADAR_FR_OBJECT: 16 CORNER_RADAR_FR
+ SG_ SLOT : 0|8@1+ (1,0) [0|31] "" ADAS
+ SG_ TRACK_ID : 8|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ DIST_X : 24|14@1- (0.02,0) [-163.84|163.82] "m" ADAS
+ SG_ DIST_Y : 38|12@1- (0.02,0) [-40.96|40.94] "m" ADAS
+ SG_ VEL_X : 50|12@1- (0.05,0) [-102.4|102.35] "m/s" ADAS
+ SG_ VEL_Y : 62|11@1- (0.05,0) [-51.2|51.15] "m/s" ADAS
+ SG_ WIDTH : 73|7@1+ (0.05,0) [0|6.35] "m" ADAS
+ SG_ HALF_LENGTH : 80|8@1+ (0.05,0) [0|12.75] "m" ADAS
+ SG_ STATIONARY : 88|1@1+ (1,0) [0|1] "" ADAS
+ SG_ EXIST_PROB : 89|7@1+ (0.01,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 788 CRADAR_RL_STATUS: 8 CORNER_RADAR_RL
+ SG_ SCAN_COUNTER : 0|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ NUM_OBJECTS : 16|8@1+ (1,0) [0|32] "" ADAS
+ SG_ BLOCKED : 28|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 48|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 789 CRADAR_RL_OBJECT: 16 CORNER_RADAR_RL
+ SG_ SLOT : 0|8@1+ (1,0) [0|31] "" ADAS
+ SG_ TRACK_ID : 8|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ DIST_X : 24|14@1- (0.02,0) [-163.84|163.82] "m" ADAS
+ SG_ DIST_Y : 38|12@1- (0.02,0) [-40.96|40.94] "m" ADAS
+ SG_ VEL_X : 50|12@1- (0.05,0) [-102.4|102.35] "m/s" ADAS
+ SG_ VEL_Y : 62|11@1- (0.05,0) [-51.2|51.15] "m/s" ADAS
+ SG_ WIDTH : 73|7@1+ (0.05,0) [0|6.35] "m" ADAS
+ SG_ HALF_LENGTH : 80|8@1+ (0.05,0) [0|12.75] "m" ADAS
+ SG_ STATIONARY : 88|1@1+ (1,0) [0|1] "" ADAS
+ SG_ EXIST_PROB : 89|7@1+ (0.01,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 790 CRADAR_RR_STATUS: 8 CORNER_RADAR_RR
+ SG_ SCAN_COUNTER : 0|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ NUM_OBJECTS : 16|8@1+ (1,0) [0|32] "" ADAS
+ SG_ BLOCKED : 28|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 48|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 791 CRADAR_RR_OBJECT: 16 CORNER_RADAR_RR
+ SG_ SLOT : 0|8@1+ (1,0) [0|31] "" ADAS
+ SG_ TRACK_ID : 8|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ DIST_X : 24|14@1- (0.02,0) [-163.84|163.82] "m" ADAS
+ SG_ DIST_Y : 38|12@1- (0.02,0) [-40.96|40.94] "m" ADAS
+ SG_ VEL_X : 50|12@1- (0.05,0) [-102.4|102.35] "m/s" ADAS
+ SG_ VEL_Y : 62|11@1- (0.05,0) [-51.2|51.15] "m/s" ADAS
+ SG_ WIDTH : 73|7@1+ (0.05,0) [0|6.35] "m" ADAS
+ SG_ HALF_LENGTH : 80|8@1+ (0.05,0) [0|12.75] "m" ADAS
+ SG_ STATIONARY : 88|1@1+ (1,0) [0|1] "" ADAS
+ SG_ EXIST_PROB : 89|7@1+ (0.01,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 832 PARK_SENSORS_FRONT: 16 PARK_ECU
+ SG_ DIST_1 : 0|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_2 : 10|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_3 : 20|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_4 : 30|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_5 : 40|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_6 : 50|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ CYCLE : 64|8@1+ (1,0) [0|255] "" ADAS
+ SG_ ACTIVE : 72|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 833 PARK_SENSORS_REAR: 16 PARK_ECU
+ SG_ DIST_1 : 0|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_2 : 10|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_3 : 20|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_4 : 30|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_5 : 40|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ DIST_6 : 50|10@1+ (0.01,0) [0|10.23] "m" ADAS
+ SG_ CYCLE : 64|8@1+ (1,0) [0|255] "" ADAS
+ SG_ ACTIVE : 72|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
 CM_ BO_ 769 "One object; sent once per object per scan. SLOT orders the frames within a scan.";
 CM_ SG_ 769 DIST_X "Nearest face of the object, from the ego reference point (ISO 8855, forward).";
 CM_ SG_ 769 DIST_Y "ISO 8855, positive left.";
 CM_ SG_ 769 VEL_X "Over-ground velocity rotated into the ego frame.";
+CM_ BO_ 785 "Corner radar objects: DIST_X is signed (rear radars see objects behind). The reported point is the object centre (the radar sees the nearest point of its box).";
+CM_ BO_ 832 "Park sensors, front bumper, left corner to right corner. 10.23 m = no echo, 10.22 m = no data (sensor fault).";
+CM_ BO_ 833 "Park sensors, rear bumper, left corner to right corner. 10.23 m = no echo, 10.22 m = no data (sensor fault).";

@@ -1,0 +1,26 @@
+# Phase 2 gate: park assist stops at least 0.3 m from the obstacle in 10 of
+# 10 runs. The driver reverses at 7 km/h toward a wall 2.5 to 5.5 m behind the
+# bumper and doesn't brake.
+name = "Park assist: reversing toward a wall"
+feature = "none"
+duration = 10.0
+
+[ego]
+speed_kph = 7
+gear = "reverse"
+
+[[obstacle]]
+# Wall face 4 m behind the bumper (centre 0.2 m further).
+s = -6.55
+length = 0.4
+width = 8.0
+
+[repeat]
+count = 10
+vary_obstacle = 3
+
+[pass]
+min_park = 1
+min_clearance = 0.3
+end_speed_below = 0.1
+max_aeb = 0

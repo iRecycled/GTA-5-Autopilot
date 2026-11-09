@@ -1,10 +1,11 @@
 [package]
 name = "features"
 version = "0.1.0"
-description = "Driver-assistance features: ACC, FCW, AEB (more in later phases)"
+description = "Driver-assistance features: ACC, FCW, AEB, BSD, RCTA, park assist"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
 fusion = { path = "../fusion" }
+sensors = { path = "../sensors" }

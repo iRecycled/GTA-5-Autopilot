@@ -230,6 +230,97 @@ pub fn spawn_lead(ego: i32, distance: f32, speed: f32, lead: &mut Option<Lead>, 
     }
 }
 
+/// A car on a fixed profile (a scenario primitive): no driver, its forward
+/// speed set every frame, on the heading it was spawned with.
+pub struct ProfileCar {
+    pub veh: i32,
+    pub speed: f32,
+}
+
+/// Cars and obstacles spawned for surround tests (Phase 2).
+#[derive(Default)]
+pub struct Extras {
+    pub cars: Vec<ProfileCar>,
+    /// Frozen obstacles.
+    pub parked: Vec<i32>,
+}
+
+pub fn clear_extras(x: &mut Extras) {
+    for mut v in x.cars.drain(..).map(|c| c.veh).chain(x.parked.drain(..)) {
+        unsafe {
+            let () = invoke!(n::SET_ENTITY_AS_MISSION_ENTITY, v, true, true);
+            let () = invoke!(n::DELETE_VEHICLE, &mut v as *mut i32);
+        }
+    }
+}
+
+/// Keeps the profile cars at their speeds (call every frame).
+pub fn drive_profiles(x: &Extras) {
+    for c in &x.cars {
+        let () = unsafe { invoke!(n::SET_VEHICLE_FORWARD_SPEED, c.veh, c.speed) };
+    }
+}
+
+/// A point `forward` m ahead of and `left` m to the left of the ego car, and
+/// the ego heading (deg).
+fn ego_offset(ego: i32, forward: f32, left: f32) -> (f32, f32, f32, f32) {
+    unsafe {
+        let pos: Vector3 = invoke!(n::GET_ENTITY_COORDS, ego, true);
+        let f: Vector3 = invoke!(n::GET_ENTITY_FORWARD_VECTOR, ego);
+        let heading: f32 = invoke!(n::GET_ENTITY_HEADING, ego);
+        let l = (f.x * f.x + f.y * f.y).sqrt().max(1e-6);
+        let (fx, fy) = (f.x / l, f.y / l);
+        // Left of forward, in GTA's world (x east, y north): rotate +90°.
+        (pos.x + fx * forward - fy * left, pos.y + fy * forward + fx * left, pos.z, heading)
+    }
+}
+
+/// Spawns a profile car at (`forward`, `left`) from the ego car, turned
+/// `turn` degrees from the ego heading (CCW), at `speed` m/s.
+pub fn spawn_profile_car(ego: i32, forward: f32, left: f32, turn: f32, speed: f32, x: &mut Extras, log: &mut impl Write) {
+    let Some(car) = load_model(c"blista") else {
+        let _ = writeln!(log, "PROFILE CAR: model did not load");
+        return;
+    };
+    let (px, py, pz, h) = ego_offset(ego, forward, left);
+    unsafe {
+        let veh: i32 = invoke!(n::CREATE_VEHICLE, car, px, py, pz + 0.5, h + turn, false, false, false);
+        let _: bool = invoke!(n::SET_VEHICLE_ON_GROUND_PROPERLY, veh, 5.0f32);
+        let () = invoke!(n::SET_VEHICLE_ENGINE_ON, veh, true, true, false);
+        let () = invoke!(n::SET_VEHICLE_FORWARD_SPEED, veh, speed);
+        let () = invoke!(n::SET_MODEL_AS_NO_LONGER_NEEDED, car);
+        let _ = writeln!(log, "PROFILE CAR {forward:.1} m ahead, {left:.1} m left, turned {turn:.0} deg, {speed:.1} m/s (veh {veh})");
+        x.cars.push(ProfileCar { veh, speed });
+    }
+}
+
+/// A van parked broadside with its near side `gap` m behind (`behind`) or
+/// ahead of the ego car's bumper (`bumper`: the bumper's x from the ego
+/// reference point, ISO), frozen in place: an obstacle for park assist.
+pub fn spawn_obstacle(ego: i32, bumper: f32, gap: f32, behind: bool, x: &mut Extras, log: &mut impl Write) {
+    let Some(model) = load_model(c"speedo") else {
+        let _ = writeln!(log, "OBSTACLE: model did not load");
+        return;
+    };
+    let (lo, hi) = {
+        let (mut lo, mut hi) = (Vector3::default(), Vector3::default());
+        let () = unsafe { invoke!(n::GET_MODEL_DIMENSIONS, model, &mut lo as *mut Vector3, &mut hi as *mut Vector3) };
+        (lo, hi)
+    };
+    // Broadside: its width runs along the ego car's x.
+    let half = 0.5 * (hi.x - lo.x);
+    let forward = if behind { bumper - gap - half } else { bumper + gap + half };
+    let (px, py, pz, h) = ego_offset(ego, forward, 0.0);
+    unsafe {
+        let veh: i32 = invoke!(n::CREATE_VEHICLE, model, px, py, pz + 0.5, h + 90.0, false, false, false);
+        let _: bool = invoke!(n::SET_VEHICLE_ON_GROUND_PROPERLY, veh, 5.0f32);
+        let () = invoke!(n::FREEZE_ENTITY_POSITION, veh, true);
+        let () = invoke!(n::SET_MODEL_AS_NO_LONGER_NEEDED, model);
+        let _ = writeln!(log, "OBSTACLE van broadside, near side {gap:.1} m {} the bumper (veh {veh})", if behind { "behind" } else { "ahead of" });
+        x.parked.push(veh);
+    }
+}
+
 /// The lead brakes until it stops (TASK_VEHICLE_TEMP_ACTION 27).
 pub fn lead_brake(lead: &Option<Lead>, log: &mut impl Write) {
     if let Some(l) = lead

@@ -83,11 +83,34 @@ struct Pass {
     no_events: Vec<String>,
     /// Max time-gap error measured by `check_gap` (s).
     max_gap_error_s: Option<f32>,
+    /// Rear cross-traffic and park assist brake activations.
+    min_rcta: Option<u32>,
+    max_rcta: Option<u32>,
+    min_park: Option<u32>,
+    max_park: Option<u32>,
+    /// Ground truth at the end: room (m) from the bumper in the direction of
+    /// travel to the nearest actor in the car's path.
+    min_room: Option<f32>,
 }
 
 impl Default for Pass {
     fn default() -> Self {
-        Self { min_aeb: None, max_aeb: None, no_impact: true, stop_gap_min: None, stop_gap_max: None, end_kph_below: None, events: vec![], no_events: vec![], max_gap_error_s: None }
+        Self {
+            min_aeb: None,
+            max_aeb: None,
+            no_impact: true,
+            stop_gap_min: None,
+            stop_gap_max: None,
+            end_kph_below: None,
+            events: vec![],
+            no_events: vec![],
+            max_gap_error_s: None,
+            min_rcta: None,
+            max_rcta: None,
+            min_park: None,
+            max_park: None,
+            min_room: None,
+        }
     }
 }
 
@@ -100,6 +123,11 @@ struct Snap {
     time_gap: f32,
     gt_gap: f32,
     aeb: u32,
+    rcta: u32,
+    park: u32,
+    reverse: bool,
+    /// Ground truth: room behind (reversing) or ahead to the nearest actor in the path.
+    room: f32,
 }
 
 #[derive(Default)]
@@ -123,6 +151,24 @@ fn gt_gap(s: &telemetry::Step) -> f32 {
         .fold(f32::NAN, |m, g| if m.is_nan() || g < m { g } else { m })
 }
 
+/// Ground truth: room from the bumper (rear when `behind`) to the nearest
+/// actor's box within 0.3 m of the car's sides.
+fn gt_room(s: &telemetry::Step, behind: bool) -> f32 {
+    let half_w = 0.5 * (s.ego_left - s.ego_right);
+    s.actors
+        .iter()
+        .filter_map(|a| {
+            let (c, sn) = (a.yaw.cos().abs(), a.yaw.sin().abs());
+            let (hx, hy) = (0.5 * (a.length * c + a.width * sn), 0.5 * (a.length * sn + a.width * c));
+            if a.y.abs() - hy > half_w + 0.3 {
+                return None;
+            }
+            let room = if behind { s.ego_rear - (a.x + hx) } else { a.x - hx - s.ego_front };
+            (room >= -0.5).then_some(room.max(0.0))
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
 fn listen(live: Arc<Mutex<Live>>) {
     let mut rx = telemetry::Receiver::bind(RUNNER_PORT).unwrap_or_else(|e| panic!("cannot listen for telemetry on UDP {RUNNER_PORT}: {e}"));
     std::thread::spawn(move || {
@@ -136,6 +182,10 @@ fn listen(live: Arc<Mutex<Live>>) {
                         time_gap: s.time_gap,
                         gt_gap: gt_gap(&s),
                         aeb: s.aeb_activations,
+                        rcta: s.rcta_activations,
+                        park: s.park_activations,
+                        reverse: s.sample_flags & adapter_api::sample_flags::REVERSE != 0,
+                        room: gt_room(&s, s.sample_flags & adapter_api::sample_flags::REVERSE != 0),
                     };
                     live.lock().expect("live").snaps.push(snap);
                 }
@@ -237,8 +287,13 @@ impl Run<'_> {
         let w: Vec<&str> = line.split_whitespace().collect();
         let num = |i: usize| -> Result<f32, String> { w.get(i).and_then(|v| v.parse().ok()).ok_or(format!("{line}: expected a number at {i}")) };
         match w.first().copied().unwrap_or("") {
-            "engage" | "cancel" | "lead_brake" | "clear" | "stopped" | "drive" | "car" | "tp" => self.game.cmd(line).map(|_| ()),
+            "engage" | "cancel" | "lead_brake" | "clear" | "stopped" | "drive" | "car" | "tp" | "signal" | "obstacle" | "creep" => self.game.cmd(line).map(|_| ()),
             "lead" => self.game.cmd(&format!("lead {} {}", num(1)?, num(2)? / 3.6)).map(|_| ()),
+            // `overtake|cross SIDE DIST KPH`: the adapter takes m/s.
+            "overtake" | "cross" => {
+                let side = w.get(1).copied().unwrap_or("");
+                self.game.cmd(&format!("{} {side} {} {}", w[0], num(2)?, num(3)? / 3.6)).map(|_| ())
+            }
             "set" => {
                 let want = num(1)?;
                 for _ in 0..60 {
@@ -306,6 +361,7 @@ impl Run<'_> {
                     "stopped" => self.wait_for(&cond, timeout, |l| l.last().is_some_and(|s| s.speed < 0.3)),
                     "engaged" => self.wait_for(&cond, timeout, |l| l.last().is_some_and(|s| s.state != 0)),
                     "off" => self.wait_for(&cond, timeout, |l| l.last().is_some_and(|s| s.state == 0)),
+                    "reverse" => self.wait_for(&cond, timeout, |l| l.last().is_some_and(|s| s.reverse)),
                     _ => Err(format!("{line}: unknown condition {cond:?}")),
                 }
             }
@@ -449,7 +505,23 @@ fn run_test(game: &Game, live: &Arc<Mutex<Live>>, t: &Test, car: &str) -> Row {
     {
         fail(format!("time-gap error {:.2} s (want ≤ {g})", run.gap_error));
     }
+    let (rcta, park) = last.map(|s| (s.rcta, s.park)).unwrap_or((0, 0));
+    let room = last.map(|s| s.room).unwrap_or(f32::NAN);
+    if p.min_rcta.is_some_and(|m| rcta < m) || p.max_rcta.is_some_and(|m| rcta > m) {
+        fail(format!("{rcta} RCTA brake activations (want {:?}..={:?})", p.min_rcta, p.max_rcta));
+    }
+    if p.min_park.is_some_and(|m| park < m) || p.max_park.is_some_and(|m| park > m) {
+        fail(format!("{park} park assist brake activations (want {:?}..={:?})", p.min_park, p.max_park));
+    }
+    if let Some(r) = p.min_room
+        && room.partial_cmp(&r) == Some(std::cmp::Ordering::Less)
+    {
+        fail(format!("ended {room:.2} m from the obstacle (want ≥ {r})"));
+    }
     let mut summary = format!("AEB {aeb}");
+    if rcta + park > 0 || p.min_room.is_some() {
+        summary += &format!(", RCTA {rcta}, park {park}, room {room:.2} m");
+    }
     if end_gap.is_finite() {
         summary += &format!(", gap at end {end_gap:.1} m");
     }

@@ -95,7 +95,7 @@ fn replay(path: &Path, csv: Option<&PathBuf>, candump: Option<&PathBuf>, out_t: 
             events.push(format!("fault at frame {}: {fault:?}", f.sample.header.frame));
         }
         let stick = f.stick.map(|s| Stick { throttle: s.throttle, brake: s.brake, steer: s.steer });
-        let (c, event) = core.step(Inputs { sample: &f.sample, actors: &f.actors, stick });
+        let (c, event) = core.step(Inputs { sample: &f.sample, actors: &f.actors, ranges: f.ranges.as_ref(), stick });
         if let Some(tx) = out_t.tx.as_mut() {
             if let Some(speed) = out_t.pace {
                 let due = (f.sample.header.game_time_us.saturating_sub(game0)) as f64 / 1e6 / speed.max(0.01);

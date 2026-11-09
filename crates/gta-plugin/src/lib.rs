@@ -10,7 +10,14 @@
 //!   fades out over about a second; TAKE OVER shows on the HUD.
 //!
 //! Driver keys: F10 engage / cancel ACC · F3 cancel · Page Up / Page Down set speed ±5 km/h
-//! · End cycle the time gap (Home opens the Rockstar overlay). AEB is always armed.
+//! · End cycle the time gap (Home opens the Rockstar overlay) · `,` / `.` turn
+//! signal left / right (press again to cancel). AEB, BSD, RCTA and park assist
+//! are always armed.
+//!
+//! Reverse is "selected" while the car rolls backwards (GTA has no gear
+//! lever): it latches below 0.3 m/s backwards and clears above 0.3 m/s
+//! forwards. In reverse GTA's brake key drives backwards, so the driver's
+//! pedals are reported swapped, as the accelerator and brake they are.
 //! Test keys: F6 60 fps cap · F7 teleport to the next test spot · F8 spawn a
 //! Sultan · F9 GTA AI drives · F11 spawn a lead car ahead (12 m/s) · F5 the
 //! lead brakes hard · F4 spawn a stopped car ahead.
@@ -19,6 +26,8 @@
 
 mod actors;
 mod actuate;
+mod fans;
+mod hud;
 mod input;
 mod n;
 mod remote;
@@ -55,6 +64,10 @@ const VK_F11: i32 = 0x7A;
 const VK_PRIOR: i32 = 0x21;
 const VK_NEXT: i32 = 0x22;
 const VK_END: i32 = 0x23;
+const VK_OEM_COMMA: i32 = 0xBC;
+const VK_OEM_PERIOD: i32 = 0xBE;
+/// The turn signal cancels itself after this long (s), as a stalk does after a turn.
+const SIGNAL_TIMEOUT_NS: u64 = 20_000_000_000;
 
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -107,7 +120,7 @@ fn run_stem() -> String {
 }
 
 struct Keys {
-    prev: [bool; 12],
+    prev: [bool; 16],
 }
 
 impl Keys {
@@ -186,7 +199,18 @@ fn run() {
     };
     let _ = log.flush();
 
-    let mut keys = Keys { prev: [false; 12] };
+    let mut keys = Keys { prev: [false; 16] };
+    // Phase 2: the surround's test cars, the range fans, the turn signal, reverse.
+    let mut extras = tools::Extras::default();
+    let mut fans_sys = fans::Fans::new();
+    let mut signal: i8 = 0;
+    let mut signal_since = 0u64;
+    let mut signal_lights: i8 = 0;
+    let mut reverse = false;
+    let mut reverse_for = 0i32;
+    let mut hud_sounds = hud::Sounds::default();
+    // A test's creeping driver: (backwards, speed m/s, until).
+    let mut creep: Option<(bool, f32, u64)> = None;
     // Test commands over UDP (`remote`): scripted driver inputs until a time.
     let mut remote = remote::Remote::new();
     let _ = writeln!(log, "test commands on UDP {}: {}", remote::PORT, if remote.listening() { "listening" } else { "unavailable" });
@@ -274,7 +298,9 @@ fn run() {
             test_mode = true;
             // Test cars from an earlier test stay behind otherwise.
             tools::clear_lead(&mut lead);
+            tools::clear_extras(&mut extras);
             tools::teleport(ped, veh, spot, &mut log);
+            reverse = false;
             spot = (spot + 1) % tools::spot_count().max(1);
             last_tick = wall_time_ns();
         }
@@ -323,6 +349,17 @@ fn run() {
         if keys.pressed(10, VK_F5) {
             tools::lead_brake(&lead, &mut log);
         }
+        // The turn signal: a stalk that latches; the same side again cancels.
+        for (slot, vk, side) in [(12, VK_OEM_COMMA, 1i8), (13, VK_OEM_PERIOD, -1i8)] {
+            if keys.pressed(slot, vk) {
+                signal = if signal == side { 0 } else { side };
+                signal_since = wall_time_ns();
+            }
+        }
+        if signal != 0 && wall_time_ns().saturating_sub(signal_since) > SIGNAL_TIMEOUT_NS {
+            signal = 0;
+        }
+        tools::drive_profiles(&extras);
         // --- Test commands (UDP, `remote`) ---
         for (cmd, from) in remote.poll() {
             let reply = match cmd {
@@ -339,6 +376,7 @@ fn run() {
                         remote::Cmd::Car(m) => {
                             test_mode = true;
                             tools::clear_lead(&mut lead);
+                            tools::clear_extras(&mut extras);
                             let model = CString::new(m.clone()).unwrap_or_default();
                             tools::spawn(ped, &model, &mut test_car, &mut log);
                             last_tick = wall_time_ns();
@@ -348,8 +386,10 @@ fn run() {
                             Some(i) => {
                                 test_mode = true;
                                 tools::clear_lead(&mut lead);
+                                tools::clear_extras(&mut extras);
                                 let v: i32 = if unsafe { invoke!(n::IS_PED_IN_ANY_VEHICLE, ped, false) } { unsafe { invoke!(n::GET_VEHICLE_PED_IS_IN, ped, false) } } else { 0 };
                                 tools::teleport(ped, v, i, &mut log);
+                                reverse = false;
                                 spot = (i + 1) % tools::spot_count().max(1);
                                 spot_name = name.clone();
                                 last_tick = wall_time_ns();
@@ -373,7 +413,33 @@ fn run() {
                         }
                         remote::Cmd::Clear => {
                             tools::clear_lead(&mut lead);
+                            tools::clear_extras(&mut extras);
+                            signal = 0;
                             "ok clear".into()
+                        }
+                        remote::Cmd::Signal(sd) => {
+                            signal = sd;
+                            signal_since = wall_time_ns();
+                            "ok signal".into()
+                        }
+                        remote::Cmd::Overtake(sd, dist, speed) if in_vehicle => {
+                            tools::spawn_profile_car(veh, -dist, sd * 3.6, 0.0, speed, &mut extras, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok overtake".into()
+                        }
+                        remote::Cmd::Cross(sd, dist, speed) if in_vehicle => {
+                            // From 25 m to that side, heading across toward the other.
+                            let rear = link.info.read().1.box_min[0];
+                            tools::spawn_profile_car(veh, rear - dist - 1.0, sd * 25.0, -sd * 90.0, speed, &mut extras, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok cross".into()
+                        }
+                        remote::Cmd::Obstacle(behind, gap) if in_vehicle => {
+                            let info = link.info.read().1;
+                            let bumper = if behind { info.box_min[0] } else { info.box_max[0] };
+                            tools::spawn_obstacle(veh, bumper, gap, behind, &mut extras, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok obstacle".into()
                         }
                         remote::Cmd::Engage if in_vehicle => {
                             if !engage_req {
@@ -390,7 +456,12 @@ fn run() {
                             btn |= b;
                             "ok button".into()
                         }
+                        remote::Cmd::Creep(back, speed, secs) => {
+                            creep = Some((back, speed, wall_time_ns() + (secs as f64 * 1e9) as u64));
+                            "ok creep".into()
+                        }
                         remote::Cmd::Drive { throttle, brake, steer, secs } => {
+                            creep = None;
                             let analog = [throttle, brake, steer.abs()].iter().any(|v| *v > 0.0 && *v < 1.0);
                             scripted = Some((input::Driver { throttle, brake, steer, analog }, wall_time_ns() + (secs as f64 * 1e9) as u64));
                             "ok drive".into()
@@ -411,6 +482,18 @@ fn run() {
         // adapter only lets the driver's pedals win at once.
         if scripted.is_some_and(|(_, until)| wall_time_ns() >= until) {
             scripted = None;
+        }
+        // A creeping test driver: a little key, more when below the speed,
+        // none above it (keys as pressed: S drives backwards).
+        if let Some((back, target, until)) = creep {
+            if wall_time_ns() >= until {
+                creep = None;
+                scripted = None;
+            } else {
+                let k = (0.05 + 0.25 * (target - last_speed)).clamp(0.0, 0.4);
+                let d = input::Driver { throttle: if back { 0.0 } else { k }, brake: if back { k } else { 0.0 }, steer: 0.0, analog: true };
+                scripted = Some((d, until));
+            }
         }
         let drv = if ai {
             input::Driver::default()
@@ -448,7 +531,16 @@ fn run() {
                 header: Header { kind: MsgKind::AdapterInfo, version: CONTRACT_VERSION, seq: info_seq, frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() },
                 host: fixed_str(&format!("GTA V {}", edition.name)),
                 vehicle: fixed_str(&name),
-                capabilities: caps::STEER | caps::PEDALS | caps::HOLD | caps::WHEEL_SPEEDS | caps::ACTORS | caps::LINE_OF_SIGHT | caps::DRIVER_INPUT,
+                capabilities: caps::STEER
+                    | caps::PEDALS
+                    | caps::HOLD
+                    | caps::WHEEL_SPEEDS
+                    | caps::ACTORS
+                    | caps::LINE_OF_SIGHT
+                    | caps::DRIVER_INPUT
+                    | caps::RANGE_FANS
+                    | caps::TURN_SIGNALS
+                    | caps::GEAR,
                 _reserved: 0,
                 box_min: min_iso,
                 box_max: max_iso,
@@ -470,6 +562,11 @@ fn run() {
         } else {
             actors::LosStats::default()
         };
+        // The range fans, while the core asks for them (parking speeds).
+        let (_, fan_layout) = link.fans.read();
+        let mut ranges = if in_vehicle && !paused { fans_sys.step(veh, &fan_layout) } else { adapter_api::RangeReport::default() };
+        ranges.header = Header { kind: MsgKind::RangeReport, version: CONTRACT_VERSION, seq: seq.wrapping_add(1), frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() };
+        link.ranges.write(&ranges);
 
         let mut s = VehicleSample::default();
         let mut measured_angle = f32::NAN;
@@ -489,13 +586,40 @@ fn run() {
             s.wheel_omega = wheel_omegas(base, &off);
             s.rev_ratio = unsafe { invoke!(n::GET_VEHICLE_CURRENT_REV_RATIO, veh) };
             s.gear = unsafe { invoke!(n::GET_VEHICLE_CURRENT_DRIVE_GEAR, veh) };
-            s.driver_throttle = drv.throttle;
-            s.driver_brake = drv.brake;
+            // Reverse "selected": latched while rolling backwards; at a
+            // standstill the key the driver presses picks the direction, as
+            // in GTA (W forwards, S backwards), like moving a gear lever.
+            if vx < -0.3 {
+                reverse = true;
+            } else if vx > 0.3 {
+                reverse = false;
+            } else if drv.throttle > 0.05 && drv.brake <= 0.05 {
+                reverse = false;
+            } else if drv.brake > 0.05 && drv.throttle <= 0.05 && speed < 0.3 {
+                reverse = true;
+            }
+            if veh != reverse_for {
+                reverse = false;
+                reverse_for = veh;
+            }
+            // In reverse GTA's brake key is the accelerator and its
+            // accelerator the brake: report them as what they are.
+            (s.driver_throttle, s.driver_brake) = if reverse { (drv.brake, drv.throttle) } else { (drv.throttle, drv.brake) };
             s.driver_steer = drv.steer;
+            actuate::set_direction(reverse, vx);
+        } else {
+            reverse = false;
+            actuate::set_direction(false, 0.0);
         }
         s.flags = if paused { sample_flags::PAUSED } else { 0 }
             | if engage_req { sample_flags::ENGAGE_REQUEST } else { 0 }
-            | if drv.analog { sample_flags::INPUT_ANALOG } else { 0 };
+            | if drv.analog { sample_flags::INPUT_ANALOG } else { 0 }
+            | if reverse { sample_flags::REVERSE } else { 0 }
+            | match signal {
+                1 => sample_flags::TURN_LEFT,
+                -1 => sample_flags::TURN_RIGHT,
+                _ => 0,
+            };
         s.buttons = btn;
         last_speed = s.speed;
         seq = seq.wrapping_add(1);
@@ -565,7 +689,18 @@ fn run() {
                 let () = invoke!(n::SET_VEHICLE_INDICATOR_LIGHTS, veh, 1i32, want_hazards);
             }
             hazards_on = want_hazards;
+            signal_lights = if want_hazards { 2 } else { 0 };
             let _ = writeln!(log, "frame {frame}: hazards {}", if want_hazards { "ON (controlled stop)" } else { "off" });
+        }
+        // The turn signal's lamps (hazards take precedence). GTA's indicator
+        // index 0 is the right side, 1 the left.
+        if !hazards_on && in_vehicle && signal != signal_lights {
+            unsafe {
+                let () = invoke!(n::SET_VEHICLE_INDICATOR_LIGHTS, veh, 0i32, signal == -1);
+                let () = invoke!(n::SET_VEHICLE_INDICATOR_LIGHTS, veh, 1i32, signal == 1);
+            }
+            signal_lights = signal;
+            let _ = writeln!(log, "frame {frame}: turn signal {}", match signal { 1 => "left", -1 => "right", _ => "off" });
         }
         // AEB acts whether or not anything is engaged, and over the accelerator.
         let aeb = in_vehicle && fresh && !paused && cmd.flags & command_flags::AEB != 0;
@@ -610,6 +745,9 @@ fn run() {
             } else {
                 steering.reset();
             }
+            if aeb && reverse {
+                actuate::block_driver_reverse();
+            }
             let want_hold = cmd.flags & command_flags::HOLD != 0 && (!driver_override || aeb);
             if !driver_override || aeb {
                 actuate::pedals(cmd.throttle, cmd.brake);
@@ -640,8 +778,11 @@ fn run() {
             && in_vehicle
             && !paused
         {
-            if d.throttle > 0.0 || d.brake > 0.0 {
-                actuate::pedals(d.throttle, d.brake);
+            // Its reverse key is blocked during automatic braking in reverse,
+            // as a real driver's is (`block_driver_reverse`).
+            let s_key = if aeb && reverse { 0.0 } else { d.brake };
+            if d.throttle > 0.0 || s_key > 0.0 {
+                actuate::keys(d.throttle, s_key);
             }
             if d.steer != 0.0 {
                 steering.apply(base, &off, d.steer * steering.max_angle(), measured_angle);
@@ -829,7 +970,11 @@ fn run() {
                 let txt = if hud.flags & hud_flags::AEB != 0 { "EMERGENCY BRAKING" } else { "BRAKE!" };
                 draw_text(0.42, 0.385, txt, (255, 255, 255));
             }
+            if signal != 0 && (frame / 18) % 2 == 0 {
+                draw_text(if signal > 0 { 0.30 } else { 0.66 }, 0.91, if signal > 0 { "<-" } else { "->" }, (80, 220, 120));
+            }
         }
+        hud::draw(&hud, hud_live, frame, &mut hud_sounds);
 
         unsafe { shv_sys::scriptWait(0) };
     }

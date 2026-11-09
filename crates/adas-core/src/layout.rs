@@ -1,8 +1,44 @@
-//! The sensor layout the core asks the adapter to run line-of-sight checks for
-//! (the "standing queries"). Ranges and fields of view follow the PRD's sensor
-//! table (D25); the `sensors` crate takes this over in Phase 1.
+//! The sensor layout the core asks the adapter to run line-of-sight checks
+//! for, and the range fans for the ultrasonics (the "standing queries").
+//! Ranges and fields of view follow the PRD's sensor table (D25).
 
-use adapter_api::{MAX_SENSORS, SensorLayout, SensorMount};
+use adapter_api::{FanLayout, MAX_FANS, MAX_SENSORS, RangeFan, SensorLayout, SensorMount};
+
+/// The corner radars' indices, in the order of `vbus::CORNER_IDS`.
+pub const CORNERS: [usize; 4] = [CORNER_FL, CORNER_FR, CORNER_RL, CORNER_RR];
+
+/// Twelve ultrasonic sensors, six per bumper (left corner → right corner,
+/// front then rear): 3 rays each over ±25° (±30° at the corners), 4.5 m
+/// (2.5 m at the corners), every 5 frames, at bumper height (0.5 m above the
+/// bottom of the box).
+pub fn default_fans(box_min: [f32; 3], box_max: [f32; 3]) -> FanLayout {
+    let (front, rear, left, right) = (box_max[0], box_min[0], box_max[1], box_min[1]);
+    let z = box_min[2] + 0.5;
+    let deg = |d: f32| d.to_radians();
+    let fan = |x: f32, y: f32, facing: f32, corner: bool| RangeFan {
+        x,
+        y,
+        z,
+        facing: deg(facing),
+        half_spread: deg(if corner { 30.0 } else { 25.0 }),
+        range: if corner { 2.5 } else { 4.5 },
+        rays: 3,
+        refresh_frames: 5.0,
+    };
+    // Lateral positions across a bumper, left to right, and their facings.
+    let ys = [left - 0.1, 0.6 * left, 0.2 * left, 0.2 * right, 0.6 * right, right + 0.1];
+    let front_facing = [75.0, 25.0, 5.0, -5.0, -25.0, -75.0];
+    let mut l = FanLayout { count: 12, ..Default::default() };
+    for i in 0..6 {
+        let corner = i == 0 || i == 5;
+        l.fans[i] = fan(front, ys[i], front_facing[i], corner);
+        // Rear: mirrored about the y axis (facing 180° − front facing).
+        let f = front_facing[i];
+        l.fans[6 + i] = fan(rear, ys[i], if f > 0.0 { 180.0 - f } else { -180.0 - f }, corner);
+    }
+    debug_assert!(l.count as usize <= MAX_FANS);
+    l
+}
 
 /// Sensor indices in the default layout (bit positions in `Actor::los_mask`).
 pub const FRONT_RADAR: usize = 0;

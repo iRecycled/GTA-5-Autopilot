@@ -174,13 +174,13 @@ Goal: the first phase that feels like a modern car. It follows traffic smoothly 
 
 Goal: 360° awareness at short range, reusing Phase 1's sensor framework and tracker.
 
-- [ ] Four corner radar ECUs per D25, on ADAS CAN FD (our own object-list DBC layout)
-- [ ] Blind spot detection: zones, spotter ring and mirror icons, a chime when signaling into an occupied lane
-- [ ] Rear cross-traffic alert: predicts crossing traffic while reversing; warns, then brakes
-- [ ] Twelve ultrasonics on ray fans: park-assist distance arcs and tone; low-speed auto-brake
-- [ ] Scenarios in the sim and in GTA: a car overtaking in the blind spot; reversing out of a parking space into traffic; parking against a wall
+- [x] Four corner radar ECUs per D25, on ADAS CAN FD (our own object-list DBC layout)
+- [x] Blind spot detection: zones, mirror icons, a chime when signaling into an occupied lane (the spotter ring is not drawn yet)
+- [x] Rear cross-traffic alert: predicts crossing traffic while reversing; warns, then brakes
+- [x] Twelve ultrasonics on ray fans: park-assist distance arcs and tone; low-speed auto-brake
+- [x] Scenarios in the sim and in GTA: a car overtaking in the blind spot; reversing out of a parking space into traffic; parking against a wall
 
-**Gate:** BSD detects 10 of 10 overtakes with ≤ 1 false alert per 30 min; RCTA brakes for crossing traffic in 10 of 10 runs; park assist stops ≥ 0.3 m from the obstacle in 10 of 10 runs. Then decide on a public release (D14).
+**Gate:** BSD detects 10 of 10 overtakes with ≤ 1 false alert per 30 min; RCTA brakes for crossing traffic in 10 of 10 runs; park assist stops ≥ 0.3 m from the obstacle in 10 of 10 runs. Then decide on a public release (D14): decided 2026-11-09, stays private for now.
 
 ## Phase 3 · Camera ECU and lanes: LKA, lane centering
 

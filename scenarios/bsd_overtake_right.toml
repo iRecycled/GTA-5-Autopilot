@@ -1,0 +1,21 @@
+# A car passes on the right (undertakes) at 100 km/h while the ego car does 80.
+name = "BSD: a car passes on the right"
+feature = "none"
+duration = 15.0
+
+[ego]
+speed_kph = 80
+
+[[actor]]
+s = -30
+lane = -1
+speed_kph = 100
+
+[repeat]
+count = 5
+vary_s = 20
+
+[pass]
+bsd_detect = "right"
+max_bsd_false = 0
+max_aeb = 0

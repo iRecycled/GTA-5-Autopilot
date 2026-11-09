@@ -8,5 +8,6 @@ publish.workspace = true
 
 [dependencies]
 telemetry = { path = "../telemetry" }
+adapter-api = { path = "../adapter-api" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

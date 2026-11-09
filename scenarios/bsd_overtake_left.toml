@@ -1,0 +1,30 @@
+# Phase 2 gate: BSD detects 10 of 10 overtakes. At 90 km/h, a car in the
+# left lane comes up from behind at 110 km/h and passes. The driver signals
+# left while it is alongside: BSD must warn (flash and chime).
+name = "BSD: a car overtakes on the left"
+feature = "none"
+duration = 15.0
+
+[ego]
+speed_kph = 90
+[[ego.signal]]
+t = 3.5
+side = "left"
+[[ego.signal]]
+t = 9.0
+side = "off"
+
+[[actor]]
+s = -35
+lane = 1
+speed_kph = 110
+
+[repeat]
+count = 10
+vary_s = 20
+
+[pass]
+bsd_detect = "left"
+bsd_warn = "left"
+max_bsd_false = 0
+max_aeb = 0

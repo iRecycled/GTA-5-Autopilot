@@ -1,5 +1,5 @@
 # Bus topology (D17): every bus, every ECU and the buses it sits on.
-# Phase 1 has two buses (D9); body CAN and a gateway arrive in Phase 4.
+# Two buses since Phase 1 (D9); body CAN and a gateway arrive in Phase 4.
 
 [[bus]]
 name = "chassis"
@@ -31,6 +31,28 @@ buses = ["chassis"]
 
 [[ecu]]
 name = "front_radar"      # object list (D25)
+buses = ["adas"]
+
+# Phase 2: four corner radars (object lists, D25) and the park ECU, which
+# runs the twelve ultrasonic sensors and sends their distances.
+[[ecu]]
+name = "corner_radar_fl"
+buses = ["adas"]
+
+[[ecu]]
+name = "corner_radar_fr"
+buses = ["adas"]
+
+[[ecu]]
+name = "corner_radar_rl"
+buses = ["adas"]
+
+[[ecu]]
+name = "corner_radar_rr"
+buses = ["adas"]
+
+[[ecu]]
+name = "park"             # ultrasonic sensors
 buses = ["adas"]
 
 [[ecu]]

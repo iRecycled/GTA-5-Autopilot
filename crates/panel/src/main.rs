@@ -376,9 +376,28 @@ impl App {
             ui.label("brake gain / AEBs");
             ui.monospace(format!("{:.1} / {}", s.brake_gain, s.aeb_activations));
             ui.end_row();
-            ui.label("tracks");
-            ui.monospace(format!("{} ({} actors)", s.tracks.len(), s.actors.len()));
+            let surround = s.tracks.iter().filter(|t| t.flags & telemetry::track_flags::SURROUND != 0).count();
+            ui.label("tracks front / surround");
+            ui.monospace(format!("{} / {surround} ({} actors)", s.tracks.len() - surround, s.actors.len()));
             ui.end_row();
+            ui.label("surround");
+            ui.monospace(surround_text(s.surround_flags));
+            ui.end_row();
+            ui.label("RCTA / park brakes");
+            ui.monospace(format!("{} / {}", s.rcta_activations, s.park_activations));
+            ui.end_row();
+            if s.park.iter().any(|d| !d.is_nan()) {
+                let d = |i: usize| if s.park[i].is_finite() { format!("{:4.2}", s.park[i]) } else { "  - ".into() };
+                ui.label("park front (m)");
+                ui.monospace((0..6).map(d).collect::<Vec<_>>().join(" "));
+                ui.end_row();
+                ui.label("park rear (m)");
+                ui.monospace((6..12).map(d).collect::<Vec<_>>().join(" "));
+                ui.end_row();
+                ui.label("park tone");
+                ui.monospace(if s.park_tone.is_infinite() { "continuous".into() } else if s.park_tone > 0.0 { format!("{:.1} Hz", s.park_tone) } else { "off".into() });
+                ui.end_row();
+            }
         });
     }
 
@@ -663,6 +682,28 @@ fn hud_text(f: u32) -> String {
     ];
     let s: Vec<&str> = names.iter().filter(|(b, _)| f & b != 0).map(|(_, n)| *n).collect();
     if s.is_empty() { "-".into() } else { s.join(" ") }
+}
+
+fn surround_text(f: u32) -> String {
+    use adapter_api::surround_flags as s;
+    let names = [
+        (s::BSD_ACTIVE, "BSD"),
+        (s::BSD_LEFT, "BSD-L"),
+        (s::BSD_RIGHT, "BSD-R"),
+        (s::BSD_WARN_LEFT, "WARN-L"),
+        (s::BSD_WARN_RIGHT, "WARN-R"),
+        (s::RCTA_ACTIVE, "RCTA"),
+        (s::RCTA_LEFT, "CROSS-L"),
+        (s::RCTA_RIGHT, "CROSS-R"),
+        (s::RCTA_BRAKE, "RCTA-BRAKE"),
+        (s::PARK_ACTIVE, "PARK"),
+        (s::PARK_BRAKE, "PARK-BRAKE"),
+        (s::BSD_OFF, "BSD-OFF"),
+        (s::RCTA_OFF, "RCTA-OFF"),
+        (s::PARK_OFF, "PARK-OFF"),
+    ];
+    let v: Vec<&str> = names.iter().filter(|(b, _)| f & b != 0).map(|(_, n)| *n).collect();
+    if v.is_empty() { "-".into() } else { v.join(" ") }
 }
 
 fn adapter_text(code: u32) -> &'static str {

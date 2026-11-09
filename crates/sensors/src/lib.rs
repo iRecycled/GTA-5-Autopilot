@@ -10,8 +10,10 @@
 //! running random generator, so replaying a recording reproduces it exactly.
 
 pub mod radar;
+pub mod ultrasonic;
 
-pub use radar::{FrontRadar, RadarConfig, RadarObject, RadarScan};
+pub use radar::{FrontRadar, Radar, RadarConfig, RadarObject, RadarScan, nearest_box_point};
+pub use ultrasonic::{ULTRASONIC_COUNT, UltrasonicConfig, UltrasonicScan, Ultrasonics};
 
 /// A deterministic hash → uniform in [0, 1).
 pub fn unit(seed: u64, a: u64, b: u64, c: u64) -> f32 {

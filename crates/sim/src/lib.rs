@@ -5,16 +5,110 @@
 //! `Command`, so the core is tested end to end without a game. Being a second
 //! "host" also keeps the contract honest: nothing in it may be GTA-shaped.
 //!
-//! Version 1 is longitudinal: the road is straight and then bends at a
-//! constant radius; the ego car keeps its lane perfectly (the simulated driver
-//! steers), and its speed comes from the core's pedal commands through a
-//! simple powertrain and brake model with actuator lag.
+//! The road is straight and then bends at a constant radius; the ego car
+//! keeps its lane perfectly (the simulated driver steers), and its speed comes
+//! from the core's pedal commands through a simple powertrain and brake model
+//! with actuator lag. It can reverse along the road and signal.
+//!
+//! Actors either follow the road (a lane offset, lane changes) or drive in a
+//! fixed world direction (`heading`: crossing traffic in a car park). Static
+//! obstacles (walls) block the range fans and can be hit, but aren't in the
+//! actor list: the radars only see actors (D25). A traffic generator keeps
+//! cars in chosen lanes around the ego car for long drives.
 
 use adapter_api::{
-    Actor, ActorKind, ActorList, AdapterInfo, CONTRACT_VERSION, Command, Header, MAX_ACTORS, MsgKind, SensorLayout, VehicleSample,
-    caps, command_flags, fixed_str,
+    Actor, ActorKind, ActorList, AdapterInfo, CONTRACT_VERSION, Command, FanLayout, FanResult, Header, MAX_ACTORS, MAX_FAN_RAYS, MsgKind,
+    RangeReport, SensorLayout, VehicleSample, caps, command_flags, fixed_str, sample_flags,
 };
 use geom::{EgoPose, V2, wrap_pi};
+
+/// An oriented box in some 2-D frame: centre, heading, length, width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Obb {
+    pub c: V2,
+    pub yaw: f32,
+    pub length: f32,
+    pub width: f32,
+}
+
+impl Obb {
+    fn axes(&self) -> (V2, V2) {
+        let (s, c) = self.yaw.sin_cos();
+        (V2::new(c, s), V2::new(-s, c))
+    }
+
+    /// Distance along a ray (origin `o`, unit direction `d`) to the box; 0 if
+    /// `o` is inside; `None` if missed.
+    pub fn ray(&self, o: V2, d: V2) -> Option<f32> {
+        let (ax, ay) = self.axes();
+        let rel = o - self.c;
+        let (po, pd) = ([rel.dot(ax), rel.dot(ay)], [d.dot(ax), d.dot(ay)]);
+        let half = [0.5 * self.length, 0.5 * self.width];
+        let (mut t0, mut t1) = (0.0f32, f32::INFINITY);
+        for i in 0..2 {
+            if pd[i].abs() < 1e-9 {
+                if po[i].abs() > half[i] {
+                    return None;
+                }
+            } else {
+                let (a, b) = ((-half[i] - po[i]) / pd[i], (half[i] - po[i]) / pd[i]);
+                t0 = t0.max(a.min(b));
+                t1 = t1.min(a.max(b));
+            }
+        }
+        (t0 <= t1).then_some(t0)
+    }
+
+    /// Whether two boxes overlap (separating axis test).
+    pub fn overlaps(&self, o: &Obb) -> bool {
+        let (a1, a2) = self.axes();
+        let (b1, b2) = o.axes();
+        let d = o.c - self.c;
+        let r = |axis: V2, x: &Obb, u: V2, v: V2| 0.5 * x.length * u.dot(axis).abs() + 0.5 * x.width * v.dot(axis).abs();
+        [a1, a2, b1, b2].iter().all(|&ax| d.dot(ax).abs() <= r(ax, self, a1, a2) + r(ax, o, b1, b2))
+    }
+}
+
+/// A static obstacle (a wall, a pillar), axis-aligned with the road at `s`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Obstacle {
+    pub s: f32,
+    pub d: f32,
+    pub length: f32,
+    pub width: f32,
+}
+
+/// Generated traffic in one lane, kept within `range` of the ego car.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrafficLane {
+    /// Lateral offset (m, left +).
+    pub d: f32,
+    /// Mean speed and its ± spread (m/s).
+    pub speed: f32,
+    pub spread: f32,
+    /// Mean gap between cars (m).
+    pub gap: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Traffic {
+    pub lanes: Vec<TrafficLane>,
+    /// Cars farther than this from the ego car are replaced at the other end (m).
+    pub range: f32,
+    pub seed: u64,
+}
+
+/// The point of an actor's box nearest to `(mx, my)` (ego frame).
+fn nearest_box_point(a: &Actor, mx: f32, my: f32) -> (f32, f32) {
+    let (s, c) = a.yaw.sin_cos();
+    let (dx, dy) = (mx - a.x, my - a.y);
+    let (lx, ly) = (c * dx + s * dy, -s * dx + c * dy);
+    let (cx, cy) = (lx.clamp(-0.5 * a.length, 0.5 * a.length), ly.clamp(-0.5 * a.width, 0.5 * a.width));
+    (a.x + c * cx - s * cy, a.y + s * cx + c * cy)
+}
+
+/// Obstacle ids in [`Collision::actor`] start here.
+pub const OBSTACLE_ID_BASE: u32 = 1_000_000;
 
 /// The road: straight for `straight` metres, then a left bend of `radius`
 /// (infinite = straight forever). Lane 0 is the ego lane; +1 is to its left.
@@ -89,10 +183,22 @@ pub struct ActorSpec {
     pub width: f32,
     /// (time, event), in time order.
     pub events: Vec<(f32, Event)>,
+    /// `Some`: drive in this fixed direction instead of along the road (rad,
+    /// relative to the road's direction at `s`; π/2 = toward +d). Lane events
+    /// don't apply.
+    pub heading: Option<f32>,
+}
+
+impl ActorSpec {
+    /// A car following the road.
+    pub fn car(s: f32, d: f32, v: f32) -> Self {
+        Self { s, d, v, length: 4.5, width: 1.9, events: vec![], heading: None }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct ActorState {
+    id: u32,
     spec: ActorSpec,
     s: f32,
     d: f32,
@@ -101,6 +207,23 @@ struct ActorState {
     accel: f32,
     lane: Option<(f32, f32, f32, f32)>, // from, to, start time, duration
     next_event: usize,
+    /// Free-moving actors: world position and heading.
+    free: Option<(V2, f32)>,
+    /// Generated traffic: the lane it belongs to.
+    traffic_lane: Option<usize>,
+}
+
+/// A small deterministic generator (xorshift64*).
+#[derive(Clone, Debug)]
+struct Rng(u64);
+
+impl Rng {
+    fn unit(&mut self) -> f32 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32
+    }
 }
 
 /// What happened, for scoring.
@@ -125,6 +248,13 @@ pub struct World {
     actors: Vec<ActorState>,
     pub collision: Option<Collision>,
     held: bool,
+    /// Reverse is selected: the car moves backwards along the road.
+    pub reverse: bool,
+    /// The turn signal: 1 left, −1 right, 0 off.
+    pub turn: i8,
+    pub obstacles: Vec<Obstacle>,
+    traffic: Option<(Traffic, Rng)>,
+    next_id: u32,
 }
 
 /// Actor ids start here, so they never look like zero.
@@ -132,16 +262,131 @@ const ID_BASE: u32 = 100;
 
 impl World {
     pub fn new(road: Road, ego_params: EgoParams, ego_speed: f32, actors: Vec<ActorSpec>, fps: f32) -> Self {
-        let actors = actors
-            .into_iter()
-            .map(|spec| ActorState { s: spec.s, d: spec.d, v: spec.v, v_target: spec.v, accel: 0.0, lane: None, next_event: 0, spec })
-            .collect();
-        Self { road, ego_params, dt: 1.0 / fps, t: 0.0, frame: 1, s: 0.0, v: ego_speed, a: 0.0, actors, collision: None, held: false }
+        let mut w = Self {
+            road,
+            ego_params,
+            dt: 1.0 / fps,
+            t: 0.0,
+            frame: 1,
+            s: 0.0,
+            v: ego_speed,
+            a: 0.0,
+            actors: Vec::new(),
+            collision: None,
+            held: false,
+            reverse: false,
+            turn: 0,
+            obstacles: Vec::new(),
+            traffic: None,
+            next_id: ID_BASE,
+        };
+        for spec in actors {
+            w.push_actor(spec, None);
+        }
+        w
+    }
+
+    fn push_actor(&mut self, spec: ActorSpec, traffic_lane: Option<usize>) {
+        let free = spec.heading.map(|h| {
+            let (p, road_h) = self.road.pose(spec.s, spec.d);
+            (p, road_h + h)
+        });
+        let id = self.next_id;
+        self.next_id += 1;
+        self.actors.push(ActorState { id, s: spec.s, d: spec.d, v: spec.v, v_target: spec.v, accel: 0.0, lane: None, next_event: 0, free, traffic_lane, spec });
+    }
+
+    /// Fills the traffic lanes from `range` behind to `range` ahead of the
+    /// ego car; from then on, cars that drift out of range are replaced at
+    /// the other end.
+    pub fn set_traffic(&mut self, traffic: Traffic) {
+        let mut rng = Rng(traffic.seed | 1);
+        for (li, l) in traffic.lanes.iter().enumerate() {
+            let mut s = self.s - traffic.range + l.gap * rng.unit();
+            while s < self.s + traffic.range {
+                let v = (l.speed + l.spread * (2.0 * rng.unit() - 1.0)).max(0.0);
+                self.push_actor(ActorSpec::car(s, l.d, v), Some(li));
+                s += l.gap * (0.5 + rng.unit());
+            }
+        }
+        self.traffic = Some((traffic, rng));
     }
 
     fn ego_pose(&self) -> EgoPose {
         let (p, h) = self.road.pose(self.s, 0.0);
         EgoPose::new(p, V2::new(h.cos(), h.sin()))
+    }
+
+    /// An actor's world position and heading.
+    fn actor_pose(&self, a: &ActorState) -> (V2, f32) {
+        match a.free {
+            Some(p) => p,
+            None => self.road.pose(a.s, a.d),
+        }
+    }
+
+    /// Every box the world holds, in the ego frame: (id, box, is an actor).
+    fn boxes(&self) -> Vec<(u32, Obb, bool)> {
+        let ego = self.ego_pose();
+        let (_, ego_h) = self.road.pose(self.s, 0.0);
+        let mut out = Vec::with_capacity(self.actors.len() + self.obstacles.len());
+        for a in &self.actors {
+            let (p, h) = self.actor_pose(a);
+            out.push((a.id, Obb { c: ego.to_vehicle(p), yaw: wrap_pi(h - ego_h), length: a.spec.length, width: a.spec.width }, true));
+        }
+        for (i, o) in self.obstacles.iter().enumerate() {
+            let (p, h) = self.road.pose(o.s, o.d);
+            out.push((OBSTACLE_ID_BASE + i as u32, Obb { c: ego.to_vehicle(p), yaw: wrap_pi(h - ego_h), length: o.length, width: o.width }, false));
+        }
+        out
+    }
+
+    /// The ego car's box in its own frame.
+    fn ego_obb(&self) -> Obb {
+        Obb { c: V2::new(0.0, 0.0), yaw: 0.0, length: self.ego_params.length, width: self.ego_params.width }
+    }
+
+    /// Answers the range fans: per ray, the distance to the first box.
+    pub fn ranges(&self, fans: &FanLayout) -> RangeReport {
+        let boxes = self.boxes();
+        let mut r = RangeReport { header: self.header(MsgKind::RangeReport), count: fans.count.min(adapter_api::MAX_FANS as u32), ..Default::default() };
+        for (i, f) in fans.as_slice().iter().enumerate() {
+            let mut res = FanResult { age: 0, ..Default::default() };
+            for k in 0..(f.rays as usize).clamp(1, MAX_FAN_RAYS) {
+                let a = FanLayout::ray_angle(f, k);
+                let (o, d) = (V2::new(f.x, f.y), V2::new(a.cos(), a.sin()));
+                let hit = boxes.iter().filter_map(|(_, b, _)| b.ray(o, d)).filter(|&t| t <= f.range).fold(f32::INFINITY, f32::min);
+                res.hits[k] = hit;
+            }
+            r.fans[i] = res;
+        }
+        r
+    }
+
+    /// Ground truth for scoring: the nearest gap (m) from the ego car's
+    /// bumper to any box behind it (`behind`) or ahead of it, in its path
+    /// (within 0.3 m of its sides).
+    pub fn clearance(&self, behind: bool) -> f32 {
+        let (l, w) = (self.ego_params.length, self.ego_params.width);
+        let mut best = f32::INFINITY;
+        for (_, b, _) in self.boxes() {
+            // Sample the box's outline against the ego's bumper line.
+            let (s, c) = b.yaw.sin_cos();
+            for i in 0..=8 {
+                for j in 0..=8 {
+                    let (u, v) = ((i as f32 / 8.0 - 0.5) * b.length, (j as f32 / 8.0 - 0.5) * b.width);
+                    let p = V2::new(b.c.x + c * u - s * v, b.c.y + s * u + c * v);
+                    if p.y.abs() > 0.5 * w + 0.3 {
+                        continue;
+                    }
+                    let gap = if behind { -0.5 * l - p.x } else { p.x - 0.5 * l };
+                    if gap >= -0.05 {
+                        best = best.min(gap.max(0.0));
+                    }
+                }
+            }
+        }
+        best
     }
 
     /// The ego car's box relative to its reference point (its centre).
@@ -154,9 +399,9 @@ impl World {
         let (box_min, box_max) = self.ego_box();
         AdapterInfo {
             header: Header { kind: MsgKind::AdapterInfo, version: CONTRACT_VERSION, seq: 1, ..Default::default() },
-            host: fixed_str("adas sim v1"),
+            host: fixed_str("adas sim v2"),
             vehicle: fixed_str("sim sedan"),
-            capabilities: caps::PEDALS | caps::HOLD | caps::ACTORS | caps::LINE_OF_SIGHT,
+            capabilities: caps::PEDALS | caps::HOLD | caps::ACTORS | caps::LINE_OF_SIGHT | caps::RANGE_FANS | caps::GEAR | caps::TURN_SIGNALS,
             _reserved: 0,
             box_min,
             box_max,
@@ -177,11 +422,20 @@ impl World {
     }
 
     pub fn sample(&self, flags: u32, buttons: u32) -> VehicleSample {
+        let mut flags = flags;
+        if self.reverse {
+            flags |= sample_flags::REVERSE;
+        }
+        flags |= match self.turn {
+            1 => sample_flags::TURN_LEFT,
+            -1 => sample_flags::TURN_RIGHT,
+            _ => 0,
+        };
         VehicleSample {
             header: self.header(MsgKind::VehicleSample),
             flags,
             speed: self.v,
-            vx: self.v,
+            vx: if self.reverse { -self.v } else { self.v },
             vy: 0.0,
             yaw_rate: self.v * self.road.curvature(self.s),
             steer_angle: f32::NAN,
@@ -203,13 +457,12 @@ impl World {
         let mut v: Vec<Actor> = self
             .actors
             .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let (p, h) = self.road.pose(a.s, a.d);
+            .map(|a| {
+                let (p, h) = self.actor_pose(a);
                 let rel = ego.to_vehicle(p);
                 let dv = ego.rotate_to_vehicle(V2::new(a.v * h.cos(), a.v * h.sin()));
                 Actor {
-                    id: ID_BASE + i as u32,
+                    id: a.id,
                     kind: ActorKind::Vehicle,
                     los_mask: 0,
                     los_age: 0,
@@ -219,7 +472,7 @@ impl World {
                     vx: dv.x,
                     vy: dv.y,
                     yaw: wrap_pi(h - ego_h),
-                    yaw_rate: a.v * self.road.curvature(a.s),
+                    yaw_rate: if a.free.is_some() { 0.0 } else { a.v * self.road.curvature(a.s) },
                     length: a.spec.length,
                     width: a.spec.width,
                     height: 1.5,
@@ -232,8 +485,17 @@ impl World {
         for a in &mut v {
             let mut mask = 0u8;
             for (k, m) in mounts.iter().enumerate() {
-                let (dx, dy) = (a.x - m.x, a.y - m.y);
-                let range = dx.hypot(dy);
+                // Seen where its box is nearest the sensor (a car alongside a
+                // corner radar is in its beam even when its centre isn't).
+                // The front radar keeps the centre, as in Phase 1.
+                let (tx, ty, short) = if m.half_fov > 0.5 {
+                    let (px, py) = nearest_box_point(a, m.x, m.y);
+                    (px, py, 0.2)
+                } else {
+                    (a.x, a.y, 0.5 * a.length.max(1.0))
+                };
+                let (dx, dy) = (tx - m.x, ty - m.y);
+                let range = dx.hypot(dy).max(1e-3);
                 if range > m.range || wrap_pi(dy.atan2(dx) - m.facing).abs() > m.half_fov {
                     continue;
                 }
@@ -244,7 +506,7 @@ impl World {
                     }
                     let (bx, by) = (b.x - m.x, b.y - m.y);
                     let along = (bx * dx + by * dy) / range;
-                    if along <= 0.0 || along >= range - 0.5 * a.length.max(1.0) {
+                    if along <= 0.0 || along >= range - short {
                         return false;
                     }
                     let across = (bx * dy - by * dx).abs() / range;
@@ -284,7 +546,12 @@ impl World {
         if self.v == 0.0 && self.a < 0.0 {
             self.a = 0.0;
         }
-        self.s += 0.5 * (v0 + self.v) * dt;
+        let ds = 0.5 * (v0 + self.v) * dt;
+        self.s += if self.reverse { -ds } else { ds };
+
+        // Generated traffic follows the car ahead in its lane, and cars out
+        // of range are replaced at the other end.
+        self.traffic_step();
 
         // Actors.
         let t = self.t + dt;
@@ -305,6 +572,11 @@ impl World {
             let dv = a.v_target - a.v;
             let step = a.accel * dt;
             a.v += if a.accel > 0.0 { dv.clamp(-step, step) } else { dv };
+            if let Some((p, h)) = a.free.as_mut() {
+                *p = *p + V2::new(a.v * dt * h.cos(), a.v * dt * h.sin());
+                a.lane = None;
+                continue;
+            }
             a.s += a.v * dt;
             if let Some((from, to, start, dur)) = a.lane {
                 let f = ((t - start) / dur).clamp(0.0, 1.0);
@@ -320,16 +592,52 @@ impl World {
 
         // Collision: box overlap in the ego frame.
         if self.collision.is_none() {
-            let ego = self.ego_pose();
-            for (i, a) in self.actors.iter().enumerate() {
-                let (pw, _) = self.road.pose(a.s, a.d);
-                let rel = ego.to_vehicle(pw);
-                if rel.x.abs() < 0.5 * (p.length + a.spec.length) && rel.y.abs() < 0.5 * (p.width + a.spec.width) {
-                    self.collision = Some(Collision { t, actor: ID_BASE + i as u32, speed: self.v });
-                    break;
-                }
+            let ego = self.ego_obb();
+            if let Some((id, _, _)) = self.boxes().into_iter().find(|(_, b, _)| ego.overlaps(b)) {
+                self.collision = Some(Collision { t, actor: id, speed: self.v });
             }
         }
+    }
+
+    fn traffic_step(&mut self) {
+        let Some((tr, mut rng)) = self.traffic.take() else { return };
+        let ego_s = self.s;
+        // Car following: no faster than the car ahead when close.
+        let n = self.actors.len();
+        for i in 0..n {
+            let Some(li) = self.actors[i].traffic_lane else { continue };
+            let (s, want) = (self.actors[i].s, self.actors[i].spec.v);
+            let ahead = (0..n)
+                .filter(|&j| j != i && self.actors[j].traffic_lane == Some(li) && self.actors[j].s > s)
+                .map(|j| (self.actors[j].s - s, self.actors[j].v))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let v = match ahead {
+                Some((gap, v_lead)) if gap < 30.0 => want.min(v_lead * (gap / 20.0).clamp(0.5, 1.0)),
+                _ => want,
+            };
+            (self.actors[i].v_target, self.actors[i].accel) = (v, 3.0);
+        }
+        // Out of range: a new car at the other end, if there is room.
+        for i in 0..n {
+            let Some(li) = self.actors[i].traffic_lane else { continue };
+            let rel = self.actors[i].s - ego_s;
+            if rel.abs() <= tr.range {
+                continue;
+            }
+            let lane = tr.lanes[li];
+            // The far end, or the first clear slot moving in from it.
+            let (end, inward) = if rel > 0.0 { (ego_s - tr.range + 1.0, 1.0) } else { (ego_s + tr.range - 1.0, -1.0) };
+            let slot = (0..12).map(|k| end + inward * k as f32 * 0.6 * lane.gap).find(|&s| {
+                !self.actors.iter().enumerate().any(|(j, a)| j != i && a.traffic_lane == Some(li) && (a.s - s).abs() < 0.6 * lane.gap)
+            });
+            let Some(new_s) = slot else { continue };
+            let v = (lane.speed + lane.spread * (2.0 * rng.unit() - 1.0)).max(0.0);
+            let a = &mut self.actors[i];
+            a.id = self.next_id;
+            self.next_id += 1;
+            (a.s, a.v, a.v_target, a.spec.v) = (new_s, v, v, v);
+        }
+        self.traffic = Some((tr, rng));
     }
 
     /// Bumper-to-bumper gap to the nearest actor ahead in the ego lane (m).
@@ -337,7 +645,7 @@ impl World {
         let p = self.ego_params;
         self.actors
             .iter()
-            .filter(|a| a.d.abs() < 0.5 * self.road.lane_width && a.s > self.s)
+            .filter(|a| a.free.is_none() && a.d.abs() < 0.5 * self.road.lane_width && a.s > self.s)
             .map(|a| (a.s - self.s - 0.5 * (p.length + a.spec.length), a.v))
             .min_by(|x, y| x.0.total_cmp(&y.0))
     }
@@ -354,7 +662,7 @@ mod tests {
     }
 
     fn car(s: f32, d: f32, v: f32) -> ActorSpec {
-        ActorSpec { s, d, v, length: 4.5, width: 1.9, events: vec![] }
+        ActorSpec::car(s, d, v)
     }
 
     #[test]
@@ -393,6 +701,75 @@ mod tests {
         let (p, h) = r.pose(100.0 + 200.0 * core::f32::consts::FRAC_PI_2, 0.0);
         assert!((p.x - 300.0).abs() < 1e-2 && (p.y - 200.0).abs() < 1e-2);
         assert!((h - core::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rays_and_overlaps() {
+        let b = Obb { c: V2::new(-6.0, 0.0), yaw: core::f32::consts::FRAC_PI_2, length: 4.5, width: 1.9 };
+        // From the rear bumper straight back: hits the near side at x = -5.05.
+        let t = b.ray(V2::new(-2.35, 0.0), V2::new(-1.0, 0.0)).unwrap();
+        assert!((t - 2.7).abs() < 1e-4, "{t}");
+        assert!(b.ray(V2::new(-2.35, 0.0), V2::new(1.0, 0.0)).is_none(), "pointing away");
+        assert!(b.ray(V2::new(-2.35, 3.0), V2::new(-1.0, 0.0)).is_none(), "beside it (it's 4.5 m long across y: ±2.25)");
+        let ego = Obb { c: V2::new(0.0, 0.0), yaw: 0.0, length: 4.7, width: 1.9 };
+        assert!(!ego.overlaps(&b));
+        assert!(ego.overlaps(&Obb { c: V2::new(-3.0, 0.0), ..b }));
+        // Diagonal boxes clear of each other's corners.
+        let d = Obb { c: V2::new(3.9, 2.2), yaw: 0.785, length: 2.0, width: 2.0 };
+        assert!(!ego.overlaps(&d));
+    }
+
+    #[test]
+    fn reversing_toward_a_wall_the_fans_see_it_and_hit_it() {
+        let mut w = World::new(Road::default(), EgoParams::default(), 0.0, vec![], 72.0);
+        w.reverse = true;
+        w.obstacles.push(Obstacle { s: -6.0, d: 0.0, length: 0.4, width: 6.0 });
+        let mut fans = FanLayout { count: 1, ..Default::default() };
+        fans.fans[0] = adapter_api::RangeFan { x: -2.35, y: 0.0, z: 0.5, facing: core::f32::consts::PI, half_spread: 0.4, range: 4.5, rays: 3, refresh_frames: 5.0 };
+        let r = w.ranges(&fans);
+        // 6 − 0.2 − 2.35 = 3.45 m to the wall; the slanted rays are longer.
+        assert!((r.fans[0].hits[1] - 3.45).abs() < 1e-3 && r.fans[0].hits[0] > 3.45, "{:?}", r.fans[0]);
+        assert!((w.clearance(true) - 3.45).abs() < 0.01 && w.clearance(false).is_infinite());
+        assert!(w.sample(0, 0).flags & sample_flags::REVERSE != 0);
+        let back = Command { flags: command_flags::ENGAGED, throttle: 0.3, ..Default::default() };
+        for _ in 0..72 * 10 {
+            w.step(&back);
+        }
+        assert!(w.s < -1.0, "moved backwards: s {}", w.s);
+        assert_eq!(w.collision.map(|c| c.actor), Some(OBSTACLE_ID_BASE));
+        // Walls aren't actors: the radars don't see them.
+        assert_eq!(w.actors(&layout()).count, 0);
+    }
+
+    #[test]
+    fn a_crossing_car_drives_across_the_road() {
+        let mut spec = car(-8.0, -15.0, 8.0);
+        spec.heading = Some(core::f32::consts::FRAC_PI_2);
+        let mut w = World::new(Road::default(), EgoParams::default(), 0.0, vec![spec], 72.0);
+        for _ in 0..72 {
+            w.step(&Command::default());
+        }
+        let a = w.actors(&layout()).actors[0];
+        assert!((a.y + 7.0).abs() < 0.2 && (a.x + 8.0).abs() < 1e-3, "({}, {})", a.x, a.y);
+        assert!((a.vy - 8.0).abs() < 1e-3 && (a.yaw - core::f32::consts::FRAC_PI_2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn traffic_stays_around_the_ego_car() {
+        let mut w = World::new(Road::default(), EgoParams::default(), 30.0, vec![], 72.0);
+        let lane = |d, speed| TrafficLane { d, speed, spread: 3.0, gap: 40.0 };
+        w.set_traffic(Traffic { lanes: vec![lane(3.6, 33.0), lane(-3.6, 25.0)], range: 150.0, seed: 7 });
+        let n0 = w.actors(&layout()).count;
+        let ids0: Vec<u32> = w.actors(&layout()).as_slice().iter().map(|a| a.id).collect();
+        let keep = Command { flags: command_flags::ENGAGED, throttle: 0.42, ..Default::default() };
+        for _ in 0..72 * 120 {
+            w.step(&keep);
+        }
+        let l = w.actors(&layout());
+        assert!(l.as_slice().iter().all(|a| a.x.abs() <= 152.0), "all within range");
+        assert!((l.count as i32 - n0 as i32).abs() <= 2, "{} cars, started with {n0}", l.count);
+        assert!(l.as_slice().iter().any(|a| !ids0.contains(&a.id)), "replaced cars get new ids");
+        assert!(w.collision.is_none());
     }
 
     #[test]

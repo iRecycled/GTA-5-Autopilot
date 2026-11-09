@@ -217,6 +217,8 @@ fn run() {
     let mut win_rtt: Vec<u64> = Vec::new();
     let mut win_work: Vec<u64> = Vec::new();
     let mut win_miss = 0u32;
+    let mut win_steer_ns = 0u64;
+    let mut win_steer_n = 0u64;
     let mut hud2 = String::new();
 
     loop {
@@ -474,7 +476,10 @@ fn run() {
         }
         if active || aeb {
             if active && cmd.flags & command_flags::STEER != 0 {
+                let t = wall_time_ns();
                 steering.apply(base, &off, cmd.steer_angle, measured_angle);
+                win_steer_ns += wall_time_ns() - t;
+                win_steer_n += 1;
             } else {
                 steering.reset();
             }
@@ -569,6 +574,20 @@ fn run() {
                 los.in_view,
                 los.age_max
             );
+            if win_steer_n > 0 {
+                let w = win::take_write_stats();
+                let _ = writeln!(
+                    log,
+                    "[frame {frame}] steering: {win_steer_n} applies, {:.1} us each | write_f32: {} writes, {} region checks, check {:.1} us, write {:.1} us each",
+                    win_steer_ns as f64 / 1e3 / win_steer_n as f64,
+                    w[3],
+                    w[2],
+                    w[0] as f64 / 1e3 / w[3].max(1) as f64,
+                    w[1] as f64 / 1e3 / w[3].max(1) as f64
+                );
+                win_steer_ns = 0;
+                win_steer_n = 0;
+            }
             hud2 = format!("{rtt} | {work} | actors {} in view {}", actor_list.count, los.in_view);
             win_start = t_frame;
             win_frames = 0;

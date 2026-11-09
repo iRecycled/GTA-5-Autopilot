@@ -104,22 +104,48 @@ const WRITABLE: u32 = 0x04 | 0x08 | 0x40 | 0x80; // RW, WRITECOPY, EXECUTE_RW, E
 /// so check with `VirtualQuery` that the page is committed and writable, then
 /// write directly.
 pub fn write_f32(addr: usize, v: f32) -> bool {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    // The last region found committed and writable: checked again only when
+    // the address leaves it (in practice once per vehicle).
+    static OK_START: AtomicUsize = AtomicUsize::new(0);
+    static OK_END: AtomicUsize = AtomicUsize::new(0);
     if addr == 0 || !addr.is_multiple_of(4) {
         return false;
     }
-    let mut mbi = core::mem::MaybeUninit::<MemoryBasicInformation>::zeroed();
-    let n = unsafe { VirtualQuery(addr as *const c_void, mbi.as_mut_ptr(), core::mem::size_of::<MemoryBasicInformation>()) };
-    if n == 0 {
-        return false;
+    let t0 = adapter_api::wall_time_ns();
+    if !(addr >= OK_START.load(Relaxed) && addr + 4 <= OK_END.load(Relaxed)) {
+        let mut mbi = core::mem::MaybeUninit::<MemoryBasicInformation>::zeroed();
+        let n = unsafe { VirtualQuery(addr as *const c_void, mbi.as_mut_ptr(), core::mem::size_of::<MemoryBasicInformation>()) };
+        if n == 0 {
+            return false;
+        }
+        let mbi = unsafe { mbi.assume_init() };
+        let end = mbi.base as usize + mbi.region_size;
+        if mbi.state != MEM_COMMIT || mbi.protect & PAGE_GUARD != 0 || mbi.protect & WRITABLE == 0 || addr + 4 > end {
+            return false;
+        }
+        OK_START.store(mbi.base as usize, Relaxed);
+        OK_END.store(end, Relaxed);
+        WRITE_STATS[2].fetch_add(1, Relaxed);
     }
-    let mbi = unsafe { mbi.assume_init() };
-    let end = mbi.base as usize + mbi.region_size;
-    if mbi.state != MEM_COMMIT || mbi.protect & PAGE_GUARD != 0 || mbi.protect & WRITABLE == 0 || addr + 4 > end {
-        return false;
-    }
+    let t1 = adapter_api::wall_time_ns();
     // SAFETY: the page is committed, writable and the write stays inside it.
     unsafe { core::ptr::write_volatile(addr as *mut f32, v) };
+    let t2 = adapter_api::wall_time_ns();
+    WRITE_STATS[0].fetch_add(t1 - t0, Relaxed);
+    WRITE_STATS[1].fetch_add(t2 - t1, Relaxed);
+    WRITE_STATS[3].fetch_add(1, Relaxed);
+    let _: &AtomicU64 = &WRITE_STATS[0];
     true
+}
+
+/// Diagnostics for `write_f32`: [check ns, write ns, region checks, writes].
+pub static WRITE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Takes and resets the write statistics.
+pub fn take_write_stats() -> [u64; 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [WRITE_STATS[0].swap(0, Relaxed), WRITE_STATS[1].swap(0, Relaxed), WRITE_STATS[2].swap(0, Relaxed), WRITE_STATS[3].swap(0, Relaxed)]
 }
 
 /// The old path, kept for comparison in diagnostics.

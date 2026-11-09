@@ -257,6 +257,9 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
         let jerk = (world.a - prev_a) * sc.fps;
         prev_a = world.a;
         let acc_in_control = cmd.flags & command_flags::ENGAGED != 0 && !aeb_on;
+        if trace && jerk.abs() > 2.0 && acc_in_control {
+            println!("JERK {jerk:+.2} at t {:.2}: v {:.2} a {:+.3} | thr {:.3} brk {:.3} hold {} | ref {:.2}", world.t, world.v, world.a, cmd.throttle, cmd.brake, cmd.flags & command_flags::HOLD != 0, cmd.diag[1]);
+        }
         if acc_in_control && world.t > sc.ego.engage_at + 0.5 {
             rep.max_jerk = rep.max_jerk.max(jerk.abs());
         }

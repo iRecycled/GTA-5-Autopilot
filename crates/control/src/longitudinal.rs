@@ -17,7 +17,8 @@ pub struct Config {
     pub accel_max: f32,
     /// Comfort limit on the reference's deceleration (m/s², positive).
     pub decel_max: f32,
-    /// Comfort limit on the reference's jerk (m/s³).
+    /// Comfort limit on the reference's jerk (m/s³). Kept below the 2.5 m/s³
+    /// gate on the car itself: the controller and the plant add a little.
     pub jerk_max: f32,
     /// How hard the reference closes on the target before the limits apply (1/s).
     pub ref_gain: f32,
@@ -43,6 +44,11 @@ pub struct Config {
     pub stop_speed: f32,
     /// While finishing a stop, brake demand is at least this.
     pub stop_brake: f32,
+    /// Jerk limit on the command itself (m/s³): the pedal command is turned
+    /// into the acceleration it implies (through the plant gains) and that
+    /// may change only this fast. Below the 2.5 m/s³ gate: the gains are
+    /// estimates (the learned brake gain reads ~15 % low while ramping).
+    pub jerk_out: f32,
 }
 
 impl Default for Config {
@@ -50,7 +56,7 @@ impl Default for Config {
         Self {
             accel_max: 2.0,
             decel_max: 3.0,
-            jerk_max: 2.5,
+            jerk_max: 2.2,
             ref_gain: 0.8,
             ref_min_accel: 0.5,
             ref_snap: 0.05,
@@ -62,6 +68,7 @@ impl Default for Config {
             pedal_off: 0.005,
             stop_speed: 0.1,
             stop_brake: 0.12,
+            jerk_out: 2.2,
         }
     }
 }
@@ -99,11 +106,30 @@ pub struct SpeedController {
     ref_accel: f32,
     integ: f32,
     pedal: Pedal,
+    /// Plant gains: acceleration per unit of throttle and of brake (m/s²).
+    gain_throttle: f32,
+    gain_brake: f32,
+    /// The acceleration the last command implied (for the jerk limit).
+    a_cmd: f32,
 }
+
+/// Default plant gains until the host's are known.
+const GAIN_THROTTLE: f32 = 4.0;
+const GAIN_BRAKE: f32 = 8.0;
 
 impl SpeedController {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, reference: 0.0, ref_accel: 0.0, integ: 0.0, pedal: Pedal::Coast }
+        Self { cfg, reference: 0.0, ref_accel: 0.0, integ: 0.0, pedal: Pedal::Coast, gain_throttle: GAIN_THROTTLE, gain_brake: GAIN_BRAKE, a_cmd: 0.0 }
+    }
+
+    /// The host's plant gains (m/s² per unit of pedal), when known.
+    pub fn set_gains(&mut self, throttle: f32, brake: f32) {
+        if throttle.is_finite() && throttle > 0.1 {
+            self.gain_throttle = throttle;
+        }
+        if brake.is_finite() && brake > 0.1 {
+            self.gain_brake = brake;
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -116,6 +142,7 @@ impl SpeedController {
         self.ref_accel = 0.0;
         self.integ = 0.0;
         self.pedal = Pedal::Coast;
+        self.a_cmd = 0.0;
     }
 
     /// Advances by `dt` seconds toward `target` (m/s) given the measured `speed`.
@@ -160,12 +187,16 @@ impl SpeedController {
             self.pedal = Pedal::Brake;
             if speed < c.stop_speed {
                 self.integ = 0.0;
+                self.a_cmd = 0.0;
                 return self.output(0.0, 0.0, demand, true);
             }
-            return self.output(0.0, (-demand).clamp(c.stop_brake, 1.0), demand, false);
+            let brk = (-demand).clamp(c.stop_brake, 1.0);
+            self.a_cmd = -brk * self.gain_brake;
+            return self.output(0.0, brk, demand, false);
         }
 
         // 4. Pedal split with hysteresis, so the demand doesn't chatter around zero.
+        let band = c.pedal_on - c.pedal_off;
         self.pedal = match self.pedal {
             Pedal::Coast if demand > c.pedal_on => Pedal::Throttle,
             Pedal::Coast if demand < -c.pedal_on => Pedal::Brake,
@@ -177,11 +208,20 @@ impl SpeedController {
             }
             p => p,
         };
-        match self.pedal {
-            Pedal::Throttle => self.output(demand.max(0.0), 0.0, demand, false),
-            Pedal::Brake => self.output(0.0, (-demand).max(0.0), demand, false),
-            Pedal::Coast => self.output(0.0, 0.0, demand, false),
-        }
+        // Each pedal starts from (almost) zero when it engages: subtract the
+        // band, so crossing it is not a step (the integral absorbs the offset).
+        let (thr, brk) = match self.pedal {
+            Pedal::Throttle => ((demand - band).max(0.0), 0.0),
+            Pedal::Brake => (0.0, (-demand - band).max(0.0)),
+            Pedal::Coast => (0.0, 0.0),
+        };
+        // 5. Jerk limit on the command, in acceleration terms.
+        let want = thr * self.gain_throttle - brk * self.gain_brake;
+        let step = c.jerk_out * dt;
+        let a = self.a_cmd + (want - self.a_cmd).clamp(-step, step);
+        self.a_cmd = a;
+        let (thr, brk) = if a >= 0.0 { ((a / self.gain_throttle).min(1.0), 0.0) } else { (0.0, (-a / self.gain_brake).min(1.0)) };
+        self.output(thr, brk, demand, false)
     }
 
     fn output(&self, throttle: f32, brake: f32, demand: f32, hold: bool) -> Output {

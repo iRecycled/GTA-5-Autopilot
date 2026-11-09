@@ -5,12 +5,16 @@
 //! stick input. Every input is recorded, so a replay of a drive reproduces the
 //! same commands (D20). Nothing here knows which host game is running.
 //!
-//! Every step: perception (front radar model → tracker → lead selection) and
-//! AEB run whether or not anything is engaged; the engaged feature (ACC, the
-//! speed profile or the test driver) runs on top; AEB wins the arbitration.
+//! Every step, through the virtual vehicle's buses (`vbus`): the chassis ECUs
+//! publish speed, yaw rate and pedals on chassis CAN and the front radar ECU
+//! its object list on ADAS CAN FD; the ADAS ECU reads both back, so the
+//! features see what a real ADAS ECU sees. Then perception (tracker → lead
+//! selection) and AEB run whether or not anything is engaged; the engaged
+//! feature (ACC, the speed profile or the test driver) runs on top; AEB wins.
 
 pub mod features;
 pub mod layout;
+pub mod vbus;
 
 use adapter_api::{ActorList, AdapterInfo, Command, Hud, SensorLayout, VehicleSample, buttons, command_flags, hud_flags, sample_flags};
 use control::{Config, SpeedController};
@@ -88,6 +92,7 @@ pub struct Core {
     brake_gain: f32,
     prev_brake: f32,
     prev_speed_for_impact: Option<f32>,
+    vehicle: vbus::Vehicle,
 }
 
 /// Starting guess for the brake gain (m/s² per unit of brake demand); learned
@@ -131,6 +136,7 @@ impl Core {
             brake_gain: BRAKE_GAIN_INIT,
             prev_brake: 0.0,
             prev_speed_for_impact: None,
+            vehicle: vbus::Vehicle::new(can::Delivery::Reactive),
         }
     }
 
@@ -169,14 +175,24 @@ impl Core {
     /// One step. Returns the command payload (the caller fills the header and
     /// `answers_seq`) and what changed.
     pub fn step(&mut self, inp: Inputs) -> (Command, Event) {
-        let s = inp.sample;
-        let request = s.flags & sample_flags::ENGAGE_REQUEST != 0;
-        let cancel = s.flags & sample_flags::DRIVER_CANCEL != 0;
-        let override_ = s.flags & sample_flags::DRIVER_OVERRIDE != 0;
-        let paused = s.flags & sample_flags::PAUSED != 0;
+        let host = inp.sample;
+        let request = host.flags & sample_flags::ENGAGE_REQUEST != 0;
+        let cancel = host.flags & sample_flags::DRIVER_CANCEL != 0;
+        let override_ = host.flags & sample_flags::DRIVER_OVERRIDE != 0;
+        let paused = host.flags & sample_flags::PAUSED != 0;
 
-        let dt = if self.last_game_us == 0 { 0.0 } else { s.header.game_time_us.saturating_sub(self.last_game_us) as f32 / 1e6 };
-        self.last_game_us = s.header.game_time_us;
+        let dt = if self.last_game_us == 0 { 0.0 } else { host.header.game_time_us.saturating_sub(self.last_game_us) as f32 / 1e6 };
+        self.last_game_us = host.header.game_time_us;
+
+        // --- The buses and perception (always) ---
+        // From here on the core works on the car as the ADAS ECU sees it on
+        // the bus, not on the host's exact values.
+        let (follow, threat, bus_speed, bus_yaw) = self.perceive(host, inp.actors, dt, host.flags & sample_flags::PAUSED != 0);
+        let mut view = *host;
+        view.speed = bus_speed;
+        view.vx = bus_speed;
+        view.yaw_rate = bus_yaw;
+        let s = &view;
 
         // Acceleration from speed (the deceleration loop's feedback), and the
         // brake gain from what last frame's brake demand achieved.
@@ -196,8 +212,6 @@ impl Core {
         let impact = dt > 0.0 && !paused && self.prev_speed_for_impact.is_some_and(|p| (p - s.speed) / dt > IMPACT_DECEL);
         self.prev_speed_for_impact = (!paused).then_some(s.speed);
 
-        // --- Perception (always) ---
-        let (follow, threat) = self.perceive(s, inp.actors, dt, paused);
 
         // --- AEB (always) ---
         let aeb = if paused || dt <= 0.0 || self.info.is_none() {
@@ -249,6 +263,9 @@ impl Core {
                 self.acc.cycle_gap();
             }
         }
+
+        // The speed controller limits jerk through the host's learned brake gain.
+        self.speed.set_gains(f32::NAN, self.brake_gain);
 
         // --- The engaged feature ---
         let mut cmd = Command::default();
@@ -351,27 +368,48 @@ impl Core {
         (cmd, event)
     }
 
-    /// Front radar → tracker → leads. Without adapter info (no ego geometry,
-    /// no sensor layout yet) there is no perception.
-    fn perceive(&mut self, s: &VehicleSample, actors: &ActorList, dt: f32, paused: bool) -> (Option<Lead>, Option<Lead>) {
-        let Some(info) = self.info else { return (None, None) };
+    /// The buses, then tracker → leads. Returns the leads and the ego speed
+    /// and yaw rate as read from chassis CAN. Without adapter info (no ego
+    /// geometry, no sensor layout yet) there is no radar.
+    fn perceive(&mut self, s: &VehicleSample, actors: &ActorList, dt: f32, paused: bool) -> (Option<Lead>, Option<Lead>, f32, f32) {
+        let have_bus = self.vehicle.ego.frames > 0;
+        let held = |v: &vbus::Vehicle| if have_bus { (v.ego.speed, v.ego.yaw_rate) } else { (s.speed, s.yaw_rate) };
         if paused || dt <= 0.0 {
-            return (None, None);
+            let (v, w) = held(&self.vehicle);
+            return (None, None, v, w);
         }
-        self.tracker.predict(dt, s.vx, s.yaw_rate);
+        // The front radar ECU's scan (its sensor model sees the actors).
+        let scan = match (self.info.is_some(), self.layout.as_slice().get(layout::FRONT_RADAR)) {
+            (true, Some(mount)) => self.radar.step(dt, mount, actors, s.header.frame),
+            _ => None,
+        };
+        let t = s.header.game_time_us as f64 / 1e6;
+        let arrived = self.vehicle.step(t, s.header.frame, s, scan.as_ref());
+        let (v, w) = (self.vehicle.ego.speed, self.vehicle.ego.yaw_rate);
+        let Some(info) = self.info else { return (None, None, v, w) };
+        self.tracker.predict(dt, v, w);
         self.since_scan += dt;
-        if let Some(mount) = self.layout.as_slice().get(layout::FRONT_RADAR)
-            && let Some(scan) = self.radar.step(dt, mount, actors, s.header.frame)
-        {
-            self.tracker.update(&scan, self.since_scan);
+        if let Some(sc) = arrived {
+            self.tracker.update(&sc, self.since_scan);
             self.since_scan = 0.0;
         }
         let front = info.box_max[0];
         let tracks = self.tracker.tracks();
         (
-            select_lead(tracks, s.speed, s.yaw_rate, front, HALF_LANE, LeadKind::Follow),
-            select_lead(tracks, s.speed, s.yaw_rate, front, HALF_LANE, LeadKind::Collision),
+            select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Follow),
+            select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Collision),
+            v,
+            w,
         )
+    }
+
+    /// The virtual vehicle (bus statistics, the frames of the last step).
+    pub fn vehicle(&self) -> &vbus::Vehicle {
+        &self.vehicle
+    }
+
+    pub fn vehicle_mut(&mut self) -> &mut vbus::Vehicle {
+        &mut self.vehicle
     }
 }
 

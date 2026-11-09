@@ -14,7 +14,8 @@ This report covers the work since spike S3/S6: the Phase 0 build, and the first 
 | `sensors` | The front radar model, with a deterministic error model (noise, misses, clutter, 20 Hz) |
 | `fusion` | A Kalman filter per track, track confirmation and deletion, and lead selection along the predicted path |
 | `features` | ACC (set speed, time gap, stop-and-go, gentle handling of cut-ins), plus FCW and staged AEB |
-| `adas-core` | `Core::step`, which is deterministic. Perception and AEB run every frame, and the engaged feature runs on top. It also has engagement rules, impact detection and an online-learned brake gain. Binaries: `adas-core` (live) and `replay` |
+| `adas-core` | `Core::step`, which is deterministic. **Every input goes through the virtual vehicle's two buses** (`vbus`). Perception and AEB run every frame, and the engaged feature runs on top. It also has engagement rules, impact detection and an online-learned brake gain. Binaries: `adas-core` (live) and `replay` |
+| `can` | DBC parsing, Intel and Motorola packing, Toyota checksums, the topology reader, and a bus timing model (real bitstream, FD data phase, arbitration, load, reactive and realistic delivery) |
 | `record` | MCAP recordings of each whole core run. They survive the recorder being killed |
 | `sim` | A closed-loop simulator that speaks the same contract: a road with a bend, a powertrain, brakes, scripted actors and occlusion |
 | `scenario` | `scenarios/*.toml` with pass metrics, run by `cargo test` |
@@ -42,14 +43,14 @@ Driving it:
 
 ## Phase 1 so far
 
-### In the simulator (`cargo test -p scenario`): 41/41 runs pass
+### In the simulator (`cargo test -p scenario`): 41/41 runs pass, with every input through the buses
 
 | Scenario | Runs | Result |
 | --- | --- | --- |
-| ACC follows a slower lead at 2.0 s | 10 | Time-gap error 0.01 s (gate ≤ 0.3); jerk ≤ 2.47 m/s³ (gate ≤ 2.5); no AEB |
-| A car cuts in close ahead | 5 | No AEB; jerk 4.1 m/s³ |
-| The lead brakes hard to a stop | 10 | Stops 2.0–3.4 m behind it |
-| Stop and go | 1 | Stops at the standstill gap, follows off again; no AEB |
+| ACC follows a slower lead at 2.0 s | 10 | Time-gap error 0.02 s (gate ≤ 0.3); jerk ≤ 2.5 m/s³ (gate ≤ 2.5); no AEB |
+| A car cuts in close ahead | 5 | No AEB; jerk 2.9 m/s³ |
+| The lead brakes hard to a stop | 10 | Stops 2–3 m behind it; jerk 2.7 m/s³ |
+| Stop and go | 1 | Stops at the standstill gap, follows off again; no AEB; jerk 2.38 m/s³ |
 | **AEB: stationary car from 50 km/h (gate: 10/10)** | 10 | **10/10**, stopped 6.3–6.7 m short |
 | Stopped car past a bend at 70 km/h | 5 | 5/5 stopped (AEB) |
 
@@ -59,7 +60,7 @@ Driving it:
 | --- | --- |
 | ACC following a lead at 12 m/s | Settled at a **2.03–2.05 s** time gap (target 2.0 s) |
 | The lead brakes hard (session 1) | ACC alone brought the car smoothly to a near-stop behind it, with no AEB needed |
-| **AEB: stationary car from 50 km/h** | **3/3** after tuning (6 stops in total, none hit). Stopped 6.9–7.4 m short at 5.1 m/s² average. AEB triggers about 1.8 s before impact |
+| **AEB: stationary car from 50 km/h (gate: 10/10)** | **10/10** with the current tuning (13 stops in all, none hit). Stopped 6.6–7.6 m short at 5.1 m/s² average, about 1.8 s before impact. Each core run's first stop peaks at about 13.7 m/s² before the brake gain is learned; the later stops peak at 6.8 m/s² |
 
 ### What the GTA runs taught (all fixed)
 
@@ -79,11 +80,24 @@ Driving it:
 
 ## Open items
 
-- **AEB 10/10 in GTA:** 6/6 so far (3 with the current tuning). It needs 7 more runs with the current tuning.
+- **The first AEB stop of a session is harsher** (13.7 m/s² peak), because the brake gain is learned from scratch each run. Saving the learned gain per vehicle would fix that: a `config/vehicles/gta/<model>.toml` profile (D19).
+- **Recordings end "early"** because the core is always killed. A clean shutdown would finish the file (the reader already copes).
 - **No test driver at the wheel.** ACC tests in GTA run unsteered on the airport taxiway (about 450 m usable), so a lead can drift out of line. Lane keeping (Phase 3) removes this; until then, keep runs short or let a human steer.
 - **Static obstacles.** The actor-list radar doesn't see buildings, fences or the end of the taxiway. That's expected for D25; camera and lidar sensing (Phase 5) cover it.
+- **Buses: done so far:**
+  - **Topology:** `config/topology.toml`, with the chassis bus and the ADAS CAN FD bus; the ADAS ECU sits on both.
+  - **DBCs:** the TSS2 chassis DBC from opendbc, and our ADAS CAN FD DBC.
+  - **Bus model:** the timing model.
+  - **Chassis ECUs:** wheel speeds, yaw rate, steering angle, speed and pedals, at TSS2 cycle times.
+  - **Radar ECU:** its object list goes out on CAN FD.
+  - **ADAS ECU:** reads both buses.
+  - **Load:** the chassis bus runs at about 8–9% load.
+  - **Radar path:** a scan arrives in the same or the next frame, within the 2-frame gate.
 - **Still to do in Phase 1:**
-  - the two CAN buses (topology, the TSS2 DBC, code generation, the bus model, chassis ECUs, the EPS model);
+  - actuation over the bus (`ACC_CONTROL` acceleration requests, `STEERING_LTA`, and an actuator ECU with the EPS model); commands still go to the adapter directly;
+  - DBC code generation (the runtime DBC is used instead);
+  - fault injection;
+  - a live CAN trace and bus-load view;
   - D11 takeover escalation;
   - the degradation matrix;
   - the egui panel and Rerun views;

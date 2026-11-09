@@ -18,7 +18,7 @@ One Cargo workspace. Each crate owns one concern, so a phase adds crates instead
 | `adas-core` | bin | Connects to an adapter, runs `step()`, hosts the ECUs (D23) | 0 |
 | `record` / `replay` | lib + bin | MCAP writing and reading; offline runs of the core (D20) | 0 |
 | `shv-sys` | lib | Script Hook V bindings; native wrappers generated at build time | 0 |
-| `gta-edition` | lib | Memory patterns, offsets and the steering hook per game build (D2, D5) | 0 |
+| `gta-edition` | lib | Memory patterns, offsets and the steering write per game build (D2, D5) | 0 |
 | `gta-plugin` | cdylib → `.asi` | The GTA adapter: sampling, standing sensor queries, actuation, safe state, HUD drawing, scenario primitives | 0 |
 | `can` | lib | Topology, bus model, DBC code generation, faults (D9, D17) | 1 |
 | `control` | lib | Speed and steering controllers, EPS model (D5, D19, D28) | 1 |
@@ -110,7 +110,7 @@ Goal: the core drives the car end to end through the GTA adapter, and the platfo
 **Spikes**
 
 - [ ] S1: `shv-sys` bindings; a Rust `.asi` loads on Enhanced, reads speed, draws text; record game timer and frame-time behavior in pause and slow motion; check whether shape tests can return in the same tick
-- [ ] S4: hold a steering angle through a signature-scanned hook with an engage flag, on 3 vehicles; drive pedals by simulated input while player controls are blocked and still readable; measure the no-hook fallback
+- [ ] S4: hold and track a steering angle by the per-frame steering-input write, on 3 vehicles; measure the pedal mapping for simulated input; hold the car at a standstill without reversing
 - [ ] S5: pattern-scan wheel speeds and steering angle into `gta-edition`; check across 3 vehicles
 - [ ] S3: mailbox round trip between adapter and core, 99th percentile under 0.5 ms
 - [ ] S6: line-of-sight cost for 5 radars in heavy traffic and ultrasonic fan cost, within 0.5 ms per frame; check whether parked vehicles appear in the actor list
@@ -122,7 +122,7 @@ Goal: the core drives the car end to end through the GTA adapter, and the platfo
 - [ ] `geom` with ISO 8855 conversion, used inside the GTA adapter
 - [ ] `adas-core`: connect, `step()` per sample, commands echo the sample `seq`
 - [ ] GTA adapter: sampling, standing queries, actuation per D5, driver input, HUD text
-- [ ] Safe state per D24: watchdog in frames, paused during menus and loading, steering hook released at once
+- [ ] Safe state per D24: watchdog in frames, paused during menus and loading, steering write stopped at once
 - [ ] Kill test: kill the core mid-turn and mid-brake; the player regains control within 2 frames
 - [ ] Test driver: keyboard or gamepad input read by the core drives the car through the whole loop
 - [ ] Raw recorder to MCAP, the `replay` binary, and `cargo xtask test` running replays (D20)

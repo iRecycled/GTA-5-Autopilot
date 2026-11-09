@@ -147,7 +147,7 @@ Candidate hosts:
 
 | Host | Fit | Notes |
 | --- | --- | --- |
-| GTA V Enhanced | First host | Steering needs a code hook inside the adapter (D5); the camera needs a render workaround (D29) |
+| GTA V Enhanced | First host | Steering needs a per-frame memory write inside the adapter (D5); the camera needs a render workaround (D29) |
 | Closed-loop sim (ours) | Built in Phase 1 | Implements the same contract, which proves the contract isn't GTA-shaped (D20) |
 | BeamNG.drive | Good | Built-in radar, lidar, camera and ultrasonic sensors, and a control API |
 | CARLA | Very good | Built for ADAS research; full sensor and scenario APIs |
@@ -190,7 +190,7 @@ The adapter enforces the safe state, because the core may be the thing that fail
 
 | Situation | Detected by | What happens |
 | --- | --- | --- |
-| Core stalls or crashes: no fresh command for 6 frames (about 100 ms of game time) | Adapter watchdog | Steering hook released at once (the player steers); throttle released; brake ramped down over about 1 s, or held to a stop if AEB was braking; "TAKE OVER" on the HUD with a chime |
+| Core stalls or crashes: no fresh command for 6 frames (about 100 ms of game time) | Adapter watchdog | Steering write stopped at once (the player steers); throttle released; brake ramped down over about 1 s, or held to a stop if AEB was braking; "TAKE OVER" on the HUD with a chime |
 | Game paused, menu open, loading screen | Adapter | Watchdog paused; the core is told it is paused |
 | Cutscene, ego car lost or changed | Adapter | Disengage; hand back to the player |
 | Core restarts | Epoch counter on the contract | The core always starts disengaged; it never re-engages on its own |
@@ -226,7 +226,7 @@ Rust everywhere we write logic. C++ appears only as a thin shim where a host API
 | --- | --- | --- |
 | Adapter contract | crate `adapter-api` | Versioned message schema, capabilities, mailboxes and rings; sim-neutral (D22) |
 | GTA access | Script Hook V (Enhanced build), crate `shv-sys` | Thin bindings to its C exports (`scriptRegister`, `nativeInit`/`nativePush64`/`nativeCall`, `worldGetAllVehicles`); typed native wrappers generated at build time from a community native database |
-| GTA edition-specific code | crate `gta-edition` | Memory patterns, offsets and the steering hook per game build; the only place Enhanced and Legacy differ (D2, D5) |
+| GTA edition-specific code | crate `gta-edition` | Memory patterns, offsets and the steering write per game build; the only place Enhanced and Legacy differ (D2, D5) |
 | GTA graphics hook (Phase 5) | ReShade with **full add-on support**, version pinned, + C++ shim (D3) | Fixed C interface; a pure-Rust DX12 hook can replace it behind that interface |
 | In-game HUD | Drawn by the adapter; in GTA with Script Hook V draw natives | No dependency on ReShade (D8) |
 | Engineering panel | `egui` window in the core (`ui` crate) | Hot-reloads with the core (D8) |
@@ -254,7 +254,9 @@ These are facts about the platforms that we design around, not decisions. Most a
 | GTA raycasts are budgeted | Only a limited number of rays per frame | Radars use actor lists plus one or two line-of-sight rays per actor; ray fans only for ultrasonics; 360° lidar deferred (D25) |
 | GTA collision shapes are coarse | Raycasts see pedestrians as capsules | Precise sensing uses the depth buffer in Phase 5 |
 | DX12 GPU readback costs 1 to 2 frames | Copying frames to the CPU adds latency | Keep frames on the GPU; run the detector there |
-| GTA overwrites the steering value every frame | A plain memory write doesn't hold | A signature-scanned hook in `gta-edition` with an engage flag (D5) |
+| GTA recomputes the steering angle every frame | Writing the angle field doesn't hold (S4) | Write the smoothed steering input instead, every frame; the game turns it into an angle (D5) |
+| Blocked controls ignore simulated input (S4) | We can't block the player and inject at the same time | Inject unblocked; read the driver's keyboard and gamepad from Windows (D5) |
+| Holding the brake at a standstill reverses the car (S4) | Emergency braking would end in reverse | The adapter holds the car at a standstill without the brake input (D5) |
 | Enhanced memory layout differs from Legacy | Public vehicle-memory offsets may be wrong | Find offsets per build by pattern scanning; spike S5 |
 | GTA road data is a coarse node graph | No true lane-level map | Fit lanes from nodes plus lane counts; real lane lines from vision in Phase 5 |
 | AI traffic and pedestrians act unpredictably | Good for realism, bad for repeatable tests | Scenario actors can be driven along fixed profiles (D27) |
@@ -270,7 +272,7 @@ Spikes can still reopen a decision; each fallback is named in its row. D22–D29
 | D2 | First host game | GTA V Enhanced; all edition-specific code in `gta-edition` | Legacy if S2 fails | Decided | Phase 0 |
 | D3 | GTA graphics hook | ReShade (full add-on support, pinned) behind a fixed C interface; Windows screen capture as a colour-only fallback | Pure-Rust DX12 hook behind the same interface | Decided | Phase 5 |
 | D4 | Where the autopilot runs | Separate process over shared memory; GPU frames copied by the shim into its own shared ring, with a shared fence (#5) | CPU readback for prototyping | Decided | Phase 0 |
-| D5 | GTA controls | Steering: a signature-scanned hook on the game's steering write, with an engage flag. Pedals: simulated input. Player controls blocked and read as driver input (#4) | Pedals by memory write if S4 shows blocked controls conflict; steering by simulated input if the hook fails | Decided | Phase 0 |
+| D5 | GTA controls | Steering: write the vehicle's smoothed steering input every frame while engaged (offset found per build); the core still sends an angle; the adapter converts it to that input with a per-vehicle ratio measured at engage. Pedals: simulated input on unblocked controls, mapped through GTA's 25% deadzone. Driver input read from the keyboard and gamepad through Windows, not the game. A standstill hold that doesn't use the brake input (#4, changed after S4) | Steering: a signature-scanned code hook with an engage flag if the write misbehaves; pedals by memory write | Decided | Phase 0 |
 | D6 | Ground truth vs vision | Ground truth through Phase 4, always through the error model (D18); ground truth recorded as a scoring oracle | — | Decided | Phase 1 |
 | D7 | Vision models | Apache-licensed detector (lyuwenyu/RT-DETR or YOLOX) fine-tuned on auto-labels, aiming at current-gen camera capability: lanes, vehicles, pedestrians, signs, lights | Pretrained weights without fine-tuning | Decided | Phase 5 |
 | D8 | Where views live | In-game HUD drawn by the adapter (GTA: Script Hook V natives); engineering panel as an egui window in the core; Rerun for live views; Foxglove optional for replays (#8) | — | Decided | Phase 1 |
@@ -306,7 +308,7 @@ Throwaway experiments turn the biggest unknowns into facts before real code depe
 | --- | --- | --- | --- |
 | S1 | Rust `.asi` on Script Hook V for Enhanced: load, call natives, read speed, draw text | Runs 10 minutes with no crash; game timer and frame-time behavior in pause and slow motion recorded; whether shape tests can return in the same tick | Rust feasibility, D10, D23 |
 | S3 | Shared-memory round trip between adapter and core | 99th-percentile round trip under 0.5 ms at 60 and 144 fps | D4 |
-| S4 | Steering hook and pedals: hold an angle via the hook; drive pedals by simulated input while player controls are blocked and still readable | Angle holds and responds within one frame on 3 vehicles; pedals work with controls blocked; the no-hook fallback is measured | D5 |
+| S4 | Steering write and pedals: hold an angle by the per-frame write; drive pedals by simulated input; hold the car at a standstill | Angle holds and tracks a changing command on 3 vehicles; pedal mapping measured; standstill hold works | D5 |
 | S5 | Vehicle memory offsets on Enhanced (wheel speeds, steering angle) via pattern scan | Values match game behavior across 3 vehicles | Vehicle-state capability |
 | S6 | Ray budget | Cost of line-of-sight checks for 4+1 radars in heavy traffic and of the ultrasonic fans, within 0.5 ms per frame; whether parked vehicles appear in the actor list | D25 |
 | S2 | Read depth and stencil on Enhanced through a ReShade add-on | Depth at a measured distance within ±2%; stencil separates vehicles, pedestrians and world; frame alignment within 2 px at 30 m/s | D3 |
@@ -319,7 +321,7 @@ S4 and S5 are re-checked on every new game build.
 
 - **GTA patches:** each one stops the GTA adapter until Script Hook V and our patterns are updated. *Mitigation:* pin a game version; keep all game-specific code in `gta-edition`. The core is unaffected.
 - **The adapter contract quietly becomes GTA-shaped.** *Mitigation:* the closed-loop simulator implements the same contract from Phase 1, and Phase 4 adds a second real host.
-- **Steering hook fails on Enhanced (S4):** *Fallback:* simulated input, with sluggish steering in GTA only.
+- **Steering write misbehaves on Enhanced (S4):** *Fallback:* a code hook on the game's steering update, then simulated input (sluggish steering, GTA only).
 - **Depth access fails on Enhanced (S2):** this would block lidar and vision in GTA. *Fallback:* our own DX12 hook, or a host with native cameras.
 - **Rust–C++ boundary:** ReShade's API is C++. *Mitigation:* a shim of fewer than 300 lines with a C interface, and no logic.
 - **Anti-cheat changes:** Rockstar could extend BattlEye to story mode. *Mitigation:* none beyond staying offline; a second host reduces the dependency.

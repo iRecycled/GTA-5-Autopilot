@@ -12,6 +12,7 @@
 //! selection) and AEB run whether or not anything is engaged; the engaged
 //! feature (ACC, the speed profile or the test driver) runs on top; AEB wins.
 
+pub mod degrade;
 pub mod features;
 pub mod layout;
 pub mod vbus;
@@ -56,6 +57,8 @@ pub enum Event {
     /// An impact was detected (as an airbag controller's crash signal would
     /// report it): everything is cancelled.
     Impact,
+    /// The feature can't run (D21): engaging was refused, or it disengaged.
+    Unavailable(degrade::Reason),
 }
 
 /// Deceleration that counts as an impact (m/s², about 1.5 g). Hard braking on
@@ -93,6 +96,11 @@ pub struct Core {
     prev_brake: f32,
     prev_speed_for_impact: Option<f32>,
     vehicle: vbus::Vehicle,
+    /// Frames of the last chassis frame and the last radar scan (D21 health).
+    chassis_last: Option<u64>,
+    radar_last: Option<u64>,
+    scan_arrived: bool,
+    avail: degrade::Availability,
 }
 
 /// Starting guess for the brake gain (m/s² per unit of brake demand); learned
@@ -137,6 +145,10 @@ impl Core {
             prev_brake: 0.0,
             prev_speed_for_impact: None,
             vehicle: vbus::Vehicle::new(can::Delivery::Reactive),
+            chassis_last: None,
+            radar_last: None,
+            scan_arrived: false,
+            avail: degrade::evaluate(None, degrade::Health::default()),
         }
     }
 
@@ -151,6 +163,8 @@ impl Core {
     /// The adapter's identity and ego geometry. Rebuilds the sensor layout.
     pub fn set_info(&mut self, info: &AdapterInfo) {
         self.info = Some(*info);
+        // Give the radar its first scans' worth of grace from here.
+        self.radar_last = None;
         self.layout = layout::default_layout(info.box_min, info.box_max);
     }
 
@@ -180,6 +194,11 @@ impl Core {
         }
     }
 
+    /// What may run, as of the last step (D21).
+    pub fn availability(&self) -> &degrade::Availability {
+        &self.avail
+    }
+
     pub fn aeb_activations(&self) -> u32 {
         self.aeb.activations
     }
@@ -206,6 +225,28 @@ impl Core {
         view.yaw_rate = bus_yaw;
         let s = &view;
 
+        // --- What may run (D21) ---
+        let frame = host.header.frame;
+        if !paused {
+            if self.vehicle.last_frames.iter().any(|(b, _)| *b == "chassis") || self.chassis_last.is_none() {
+                self.chassis_last = Some(frame);
+            }
+            if self.scan_arrived || (self.radar_last.is_none() && self.info.is_some()) {
+                self.radar_last = Some(frame);
+            }
+        }
+        let age = |last: Option<u64>| last.map_or(u64::MAX, |l| frame.saturating_sub(l));
+        self.avail = degrade::evaluate(self.info.as_ref(), degrade::Health { chassis_age: age(self.chassis_last), radar_age: age(self.radar_last) });
+        self.radar.ignore_los = self.avail.los_degraded;
+        let feature_ok = match self.feature {
+            Feature::Acc(_) => {
+                let too_slow = !self.avail.stop_and_go && s.speed < degrade::ACC_MIN_SPEED;
+                self.avail.acc.and(if too_slow { Err(degrade::Reason::NoHold) } else { Ok(()) })
+            }
+            Feature::SpeedProfile(_) => self.avail.drive,
+            Feature::TestDriver(_) => self.avail.drive.and(self.avail.steer),
+        };
+
         // Acceleration from speed (the deceleration loop's feedback), and the
         // brake gain from what last frame's brake demand achieved.
         if dt > 0.0 && !paused {
@@ -226,7 +267,7 @@ impl Core {
 
 
         // --- AEB (always) ---
-        let aeb = if paused || dt <= 0.0 || self.info.is_none() {
+        let aeb = if paused || dt <= 0.0 || self.info.is_none() || self.avail.aeb.is_err() {
             None
         } else {
             Some(self.aeb.step(dt, s.speed, threat, s.driver_throttle, s.driver_brake))
@@ -238,8 +279,13 @@ impl Core {
         if impact && self.state != State::Off {
             self.state = State::Off;
             event = Event::Impact;
+        } else if self.state != State::Off && let Err(r) = feature_ok {
+            self.state = State::Off;
+            event = Event::Unavailable(r);
         } else if self.state == State::Off {
-            if request && !self.prev_request && !cancel && !aeb_braking {
+            if request && !self.prev_request && !cancel && !aeb_braking && let Err(r) = feature_ok {
+                event = Event::Unavailable(r);
+            } else if request && !self.prev_request && !cancel && !aeb_braking {
                 self.state = State::Active;
                 self.speed.reset(s.speed);
                 self.t_engaged = 0.0;
@@ -366,6 +412,16 @@ impl Core {
         if self.state == State::Override {
             f |= hud_flags::OVERRIDE;
         }
+        let message = match feature_ok {
+            Err(r) => {
+                f |= hud_flags::UNAVAILABLE;
+                r.code()
+            }
+            Ok(()) => 0,
+        };
+        if self.avail.aeb.is_err() {
+            f |= hud_flags::AEB_OFF;
+        }
         self.hud = Hud {
             header: Default::default(),
             flags: f,
@@ -375,7 +431,7 @@ impl Core {
             lead_gap: follow.map(|l| l.gap).unwrap_or(f32::NAN),
             lead_speed: follow.map(|l| l.v).unwrap_or(f32::NAN),
             ttc: aeb.map(|a| a.ttc).unwrap_or(f32::INFINITY),
-            _reserved: 0,
+            message,
         };
         (cmd, event)
     }
@@ -386,6 +442,7 @@ impl Core {
     fn perceive(&mut self, s: &VehicleSample, actors: &ActorList, dt: f32, paused: bool) -> (Option<Lead>, Option<Lead>, f32, f32) {
         let have_bus = self.vehicle.ego.frames > 0;
         let held = |v: &vbus::Vehicle| if have_bus { (v.ego.speed, v.ego.yaw_rate) } else { (s.speed, s.yaw_rate) };
+        self.scan_arrived = false;
         if paused || dt <= 0.0 {
             let (v, w) = held(&self.vehicle);
             return (None, None, v, w);
@@ -397,6 +454,7 @@ impl Core {
         };
         let t = s.header.game_time_us as f64 / 1e6;
         let arrived = self.vehicle.step(t, s.header.frame, s, scan.as_ref());
+        self.scan_arrived = arrived.is_some();
         let (v, w) = (self.vehicle.ego.speed, self.vehicle.ego.yaw_rate);
         let Some(info) = self.info else { return (None, None, v, w) };
         self.tracker.predict(dt, v, w);
@@ -440,6 +498,17 @@ mod tests {
         }
     }
 
+    fn with_info(f: Feature, initial: bool) -> Core {
+        let mut c = Core::new(f, initial);
+        c.set_info(&full_info());
+        c
+    }
+
+    fn full_info() -> AdapterInfo {
+        use adapter_api::caps;
+        AdapterInfo { capabilities: caps::STEER | caps::PEDALS | caps::HOLD | caps::ACTORS | caps::LINE_OF_SIGHT, box_max: [2.3, 0.9, 1.5], ..Default::default() }
+    }
+
     fn step(core: &mut Core, seq: u32, flags: u32, speed: f32) -> (Command, Event) {
         let s = sample(seq, flags, speed);
         let a = ActorList::default();
@@ -448,7 +517,7 @@ mod tests {
 
     #[test]
     fn never_engages_on_a_stale_request() {
-        let mut core = Core::new(Feature::speed_profile(), true);
+        let mut core = with_info(Feature::speed_profile(), true);
         for i in 1..10 {
             let (c, _) = step(&mut core, i, sample_flags::ENGAGE_REQUEST, 0.0);
             assert_eq!(c.flags, 0, "engaged on a request that predates the core");
@@ -461,7 +530,7 @@ mod tests {
 
     #[test]
     fn driver_cancel_disengages_and_needs_a_new_request() {
-        let mut core = Core::new(Feature::speed_profile(), false);
+        let mut core = with_info(Feature::speed_profile(), false);
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 0.0);
         let (_, e) = step(&mut core, 2, sample_flags::ENGAGE_REQUEST | sample_flags::DRIVER_CANCEL, 0.0);
         assert_eq!(e, Event::CancelledByDriver);
@@ -471,7 +540,7 @@ mod tests {
 
     #[test]
     fn override_keeps_engagement() {
-        let mut core = Core::new(Feature::speed_profile(), false);
+        let mut core = with_info(Feature::speed_profile(), false);
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 0.0);
         let (c, _) = step(&mut core, 2, sample_flags::ENGAGE_REQUEST | sample_flags::DRIVER_OVERRIDE, 3.0);
         assert!(c.flags & command_flags::ENGAGED != 0);
@@ -482,7 +551,7 @@ mod tests {
 
     #[test]
     fn paused_means_no_actuation() {
-        let mut core = Core::new(Feature::speed_profile(), false);
+        let mut core = with_info(Feature::speed_profile(), false);
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 0.0);
         let (c, _) = step(&mut core, 2, sample_flags::ENGAGE_REQUEST | sample_flags::PAUSED, 0.0);
         assert_eq!((c.throttle, c.brake), (0.0, 0.0));
@@ -491,7 +560,7 @@ mod tests {
     #[test]
     fn deterministic_for_identical_inputs() {
         let run = || {
-            let mut core = Core::new(Feature::speed_profile(), false);
+            let mut core = with_info(Feature::speed_profile(), false);
             (1..600).map(|i| step(&mut core, i, sample_flags::ENGAGE_REQUEST, (i as f32 * 0.01).min(8.0)).0).collect::<Vec<_>>()
         };
         assert_eq!(run(), run());
@@ -500,6 +569,7 @@ mod tests {
     #[test]
     fn an_impact_cancels_engagement() {
         let mut core = Core::new(Feature::Acc(Default::default()), false);
+        core.set_info(&full_info());
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 13.5);
         step(&mut core, 2, sample_flags::ENGAGE_REQUEST, 13.5);
         // 13.5 → 5.3 m/s in one frame: about 490 m/s², an impact.
@@ -508,14 +578,31 @@ mod tests {
         assert_eq!((c.flags, c.throttle), (0, 0.0));
         // Hard braking (8 m/s²) is not an impact.
         let mut core = Core::new(Feature::Acc(Default::default()), false);
+        core.set_info(&full_info());
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 20.0);
         let (_, e) = step(&mut core, 2, sample_flags::ENGAGE_REQUEST, 20.0 - 8.0 * 0.016_667);
         assert_ne!(e, Event::Impact);
     }
 
     #[test]
+    fn an_unavailable_feature_refuses_to_engage() {
+        // ACC with no adapter info: refused, with the reason.
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        let (c, e) = step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 20.0);
+        assert_eq!(e, Event::Unavailable(degrade::Reason::NoAdapterInfo));
+        assert_eq!(c.flags, 0);
+        assert_ne!(core.hud().flags & hud_flags::UNAVAILABLE, 0);
+        // A host without pedals.
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        core.set_info(&AdapterInfo { capabilities: adapter_api::caps::ACTORS | adapter_api::caps::STEER, ..Default::default() });
+        let (_, e) = step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 20.0);
+        assert_eq!(e, Event::Unavailable(degrade::Reason::NoPedals));
+    }
+
+    #[test]
     fn acc_buttons_change_the_set_speed() {
         let mut core = Core::new(Feature::Acc(Default::default()), false);
+        core.set_info(&full_info());
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 20.0);
         let set0 = core.hud().set_speed;
         let mut s = sample(2, sample_flags::ENGAGE_REQUEST, 20.0);

@@ -643,14 +643,15 @@ fn run() {
                     "no lead".to_string()
                 };
                 let hold = if hud.flags & hud_flags::HOLD != 0 { " | HOLD" } else { "" };
-                let colour = if acc { (80, 220, 120) } else { (180, 180, 180) };
+                let aeb_off = if hud.flags & hud_flags::AEB_OFF != 0 { " | AEB OFF" } else { "" };
+                let colour = if acc { (80, 220, 120) } else if hud.flags & hud_flags::UNAVAILABLE != 0 { (255, 170, 60) } else { (180, 180, 180) };
                 let () = invoke!(n::DRAW_RECT, 0.5f32, 0.925f32, 0.34f32, 0.045f32, 0i32, 0i32, 0i32, 170i32, false);
-                draw_text(
-                    0.34,
-                    0.91,
-                    &format!("{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}", if acc { "ACC" } else { "ACC off" }, hud.set_speed * 3.6, hud.time_gap),
-                    colour,
-                );
+                let line = if hud.flags & hud_flags::UNAVAILABLE != 0 {
+                    format!("ACC unavailable: {}{aeb_off}", adapter_api::hud_message::text(hud.message))
+                } else {
+                    format!("{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}{aeb_off}", if acc { "ACC" } else { "ACC off" }, hud.set_speed * 3.6, hud.time_gap)
+                };
+                draw_text(0.34, 0.91, &line, colour);
             }
             if fcw {
                 if (frame / 6) % 2 == 0 {

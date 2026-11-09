@@ -84,6 +84,7 @@ Driving it:
 - **Recordings end "early"** because the core is always killed. A clean shutdown would finish the file (the reader already copes).
 - **No test driver at the wheel.** ACC tests in GTA run unsteered on the airport taxiway (about 450 m usable), so a lead can drift out of line. Lane keeping (Phase 3) removes this; until then, keep runs short or let a human steer.
 - **Static obstacles.** The actor-list radar doesn't see buildings, fences or the end of the taxiway. That's expected for D25; camera and lidar sensing (Phase 5) cover it.
+- **Degradation matrix (D21): done.** See `docs/degradation.md`. Missing host capabilities, a silent chassis bus or a silent radar make features unavailable. Engaging is then refused, and the HUD says why ("ACC unavailable: …", "AEB OFF").
 - **Buses: done so far:**
   - **Topology:** `config/topology.toml`, with the chassis bus and the ADAS CAN FD bus; the ADAS ECU sits on both.
   - **DBCs:** the TSS2 chassis DBC from opendbc, and our ADAS CAN FD DBC.
@@ -99,6 +100,5 @@ Driving it:
   - fault injection;
   - a live CAN trace and bus-load view;
   - D11 takeover escalation;
-  - the degradation matrix;
   - the egui panel and Rerun views;
   - candump export.

@@ -285,6 +285,10 @@ pub mod hud_flags {
     pub const HOLD: u32 = 1 << 5;
     /// The driver's accelerator is overriding ACC.
     pub const OVERRIDE: u32 = 1 << 6;
+    /// The selected feature is unavailable (see `Hud::message`).
+    pub const UNAVAILABLE: u32 = 1 << 7;
+    /// AEB is unavailable.
+    pub const AEB_OFF: u32 = 1 << 8;
 }
 
 /// core → adapter (latest wins): what the driver should see. The adapter only
@@ -304,7 +308,34 @@ pub struct Hud {
     pub lead_speed: f32,
     /// Time to collision with the most threatening object (s); infinite if none.
     pub ttc: f32,
-    pub _reserved: u32,
+    /// Why the selected feature is unavailable (a [`hud_message`] code; 0 = none).
+    pub message: u32,
+}
+
+/// HUD message codes (D21): why a feature is unavailable. Adapters show the
+/// text; the core decides the code.
+pub mod hud_message {
+    pub const NONE: u32 = 0;
+    pub const STARTING_UP: u32 = 1;
+    pub const NO_PEDALS: u32 = 2;
+    pub const NO_RADAR_DATA: u32 = 3;
+    pub const NO_STANDSTILL_HOLD: u32 = 4;
+    pub const NO_STEERING: u32 = 5;
+    pub const VEHICLE_DATA_LOST: u32 = 6;
+    pub const RADAR_BLOCKED: u32 = 7;
+
+    pub fn text(code: u32) -> &'static str {
+        match code {
+            STARTING_UP => "starting up",
+            NO_PEDALS => "no pedal control on this host",
+            NO_RADAR_DATA => "no radar data on this host",
+            NO_STANDSTILL_HOLD => "not available below 30 km/h (no standstill hold)",
+            NO_STEERING => "no steering control on this host",
+            VEHICLE_DATA_LOST => "vehicle data lost",
+            RADAR_BLOCKED => "radar blocked",
+            _ => "",
+        }
+    }
 }
 
 /// Copies `s` into a zero-padded fixed-size field (truncating on a char boundary).

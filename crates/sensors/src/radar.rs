@@ -78,6 +78,9 @@ pub struct RadarScan {
 
 pub struct FrontRadar {
     cfg: RadarConfig,
+    /// The host gives no line-of-sight bits (D21: degraded): treat everything
+    /// in the beam as visible.
+    pub ignore_los: bool,
     /// Index of this radar in the sensor layout (its line-of-sight bit).
     pub index: usize,
     since: f32,
@@ -86,7 +89,7 @@ pub struct FrontRadar {
 
 impl FrontRadar {
     pub fn new(cfg: RadarConfig, index: usize) -> Self {
-        Self { cfg, index, since: f32::INFINITY, scan: 0 }
+        Self { cfg, ignore_los: false, index, since: f32::INFINITY, scan: 0 }
     }
 
     /// Advances by `dt`. Returns a scan when one is due. `ego_vx` is the ego
@@ -113,7 +116,7 @@ impl FrontRadar {
                 continue;
             }
             // Line of sight: the bit must be set and recent (4 refresh periods).
-            if a.los_mask & bit == 0 || a.los_age as f32 > 4.0 * mount.refresh_frames.max(1.0) {
+            if !self.ignore_los && (a.los_mask & bit == 0 || a.los_age as f32 > 4.0 * mount.refresh_frames.max(1.0)) {
                 continue;
             }
             let id = a.id as u64;

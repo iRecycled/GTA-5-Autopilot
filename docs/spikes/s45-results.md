@@ -88,6 +88,44 @@ The handbrake native holds the car. It is the adapter's equivalent of a real car
 - **RPM and gear** come from natives, so they need no offset: `_GET_VEHICLE_CURRENT_REV_RATIO` (0.2 at idle to 1.0) and `_GET_VEHICLE_CURRENT_DRIVE_GEAR`.
 - **Yaw rate and body velocity** also come from natives: `GET_ENTITY_ROTATION_VELOCITY` and `GET_ENTITY_SPEED_VECTOR`.
 
+### Speed control: launch, hold, stop (S4 follow-up)
+
+Question: can injected pedals alone, with no gamepad, launch smoothly from a stop and hold a set speed? The F10 test runs on the Sultan:
+- **Profile:** 8, 15, 5 and 12 m/s for 9–10 s each, then a stop.
+- **Steering** is held straight by the steering write.
+- **Reference speed:** the controller follows a reference that changes no faster than production-ACC comfort limits (accel ≤ 2.0 m/s², braking ≤ 3.0 m/s², jerk ≤ 2.5 m/s³).
+- **Controller:** feed-forward on the planned acceleration, plus PI on the speed error with anti-windup. The pedal demand goes through the 25% deadzone mapping.
+
+| Segment | Peak accel / braking | Error over the last 2 s |
+| --- | --- | --- |
+| 0 → 8 m/s (launch) | 2.2 m/s² | −0.01 m/s (RMS 0.02) |
+| 8 → 15 m/s | 3.0 / −3.4 m/s² (gear shift) | +0.03 (RMS 0.05) |
+| 15 → 5 m/s | −3.4 m/s² | +0.06 (RMS 0.07) |
+| 5 → 12 m/s | 2.1 m/s² | +0.15, still settling |
+| 12 → 0 m/s, hold | −3.3 m/s² | 0.00, held by the handbrake |
+
+- **Launch:** the car rolls after 0.46 s and accelerates at 1.0–1.9 m/s² with low jerk (2.5 m/s³ peak during the launch).
+- **The deadzone compensation is exact.** The throttle the vehicle reports equals the controller's demand.
+- **Upshifts** cut power for about 0.3 s. Speed dips by up to 0.9 m/s while on throttle, and that causes the jerk spikes (40–50 m/s³) during acceleration. They come from GTA's gearbox, not the controller; the loop recovers within about a second.
+- **Two fixes were needed to get a clean stop:**
+  - *The reference must reach zero in finite time.* An exponential approach left a long crawl.
+  - *The hold may engage only once the car has stopped* (< 0.1 m/s), with the pedals released. Engaging the handbrake at 0.6 m/s gave a −9 m/s² grab.
+
+Earlier passes, for the record:
+- *Without feed-forward,* the error over the last 2 s was 0.2–0.7 m/s with overshoot up to 0.4 m/s.
+- *On the other vehicles,* the Baller and Futo matched the Sultan. The Mule is underpowered and stays about 0.3 m/s short of 12 and 15 m/s while still accelerating.
+
+**Comparison with GTA's own AI driver.** Data: 211 s of `TASK_VEHICLE_DRIVE_WANDER` city driving from the S1 soak, scored the same way:
+
+| | GTA AI | Our speed control |
+| --- | --- | --- |
+| Acceleration, median / 95th percentile | 2.7 / 10.9 m/s² | 0.9 / 2.2 m/s² |
+| Braking, median / 5th percentile | −1.7 / −11.0 m/s² | −0.6 / −3.2 m/s² |
+| Jerk, median / 95th percentile | 2.9 / 47 m/s³ | 0.6 / 4.3 m/s³ |
+| Launch 0 → 5 m/s: time, peak accel | 1.9 s, 8.6 m/s² (median of 9) | 2.3 s, 2.2 m/s² |
+
+GTA's AI floors it off the line and brakes hard. Our controller drives like a production ACC, and it reaches 5 m/s only 0.4 s later than the AI. The AI's extremes include some city-traffic bumps, but its medians are still 2–3× harsher.
+
 ## Decisions
 
 - **D5 changed** (PRD on PR #12):
@@ -110,7 +148,9 @@ The core sees an angle command and a standstill-hold request, and gets back angl
 
 ## Open items
 
-- Gamepad trigger scale (the user's Xbox controller), which sets the driver-override threshold (D11).
+- **A virtual gamepad isn't needed for speed control.** Simulated pedals cover the launch and the hold. The gamepad trigger scale, which sets the driver-override threshold (D11), still needs either the user's Xbox controller or a virtual-pad driver. ViGEmBus would need an admin install, and Windows' built-in `InputInjector` gamepad isn't seen by GTA or XInput.
+- **Pedal chatter near zero demand.** Around the coast band, the throttle flickers between 0 and the minimum (0.03 real throttle). It's harmless here; the `control` crate should add hysteresis.
+- **The speed controller belongs in the core.** Its reference shaping, feed-forward and PI are sim-neutral and move to the `control` crate. Only the deadzone mapping and the handbrake hold stay in the GTA adapter.
 - Re-run the F9 sweep and F11 drive test after every game update. The offsets are found by the sweep, not hard-coded.
 - Behaviour on slopes, at higher speeds (lock ratio at speed), and with the speed-sensitive steering of a gamepad: Phase 0 integration tests.
 - Teleporting into the airport raises a wanted level even with `SET_MAX_WANTED_LEVEL(0)`. A second teleport from inside the car clears it. This only affects test tooling.

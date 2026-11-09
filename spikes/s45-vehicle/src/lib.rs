@@ -9,7 +9,8 @@
 //!   in it; player invincible; the previous test car is deleted.
 //! - F9  steering sweep (stationary): injects a sine steering input and ranks
 //!   every float field of the vehicle struct by correlation (background thread).
-//! - F10 pedal test (see `Mode::Pedals`).
+//! - F10 speed-hold test: comfort-limited launch from a stop and PI speed
+//!   tracking over a target profile (8, 15, 5, 12, 0 m/s; 9-10 s each), steering held straight.
 //! - F11 drive test: speed up to 10 m/s, track a steering-angle command three
 //!   ways, brake to a stop, try three standstill holds; snapshots the wheel
 //!   structs to find wheel speeds; logs RPM and gear from natives.
@@ -65,7 +66,6 @@ mod n {
     pub const SET_CONTROL_VALUE_NEXT_FRAME: u64 = 0xE8A25867FBA3B05E;
     pub const GET_DISABLED_CONTROL_NORMAL: u64 = 0x11E65974A982637C;
     pub const GET_CONTROL_NORMAL: u64 = 0xEC3C9B8D5327B563;
-    pub const IS_DISABLED_CONTROL_PRESSED: u64 = 0xE2587F8CBBD87B1D;
     pub const BEGIN_TEXT_COMMAND_DISPLAY_TEXT: u64 = 0x25FBB336DF1804CB;
     pub const ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME: u64 = 0x6C188BE134E074AA;
     pub const END_TEXT_COMMAND_DISPLAY_TEXT: u64 = 0xCD015E5BB0D96A57;
@@ -162,7 +162,39 @@ const SWEEP_PHASE_S: f64 = 3.0;
 const SWEEP_SECONDS: f64 = 3.0 * SWEEP_PHASE_S;
 const SWEEP_PERIOD_S: f64 = 2.0;
 const MAX_LAG_FRAMES: usize = 20;
-const PEDAL_PHASE_S: f64 = 3.0;
+
+/// Speed-hold test (F10): a target-speed profile and a PI controller on the
+/// speed error. Proves injected throttle/brake can hold a commanded speed with
+/// no gamepad and no blocked controls (the portable core's longitudinal loop).
+/// Each segment is (seconds, target m/s).
+const HOLD_PROFILE: [(f64, f32); 5] = [(10.0, 8.0), (10.0, 15.0), (10.0, 5.0), (9.0, 12.0), (9.0, 0.0)];
+/// PI gains. Output is a pedal demand in [-1, 1]: + is throttle, - is brake.
+const HOLD_KP: f32 = 0.22;
+const HOLD_KI: f32 = 0.14; // per second, on the integrated speed error
+const HOLD_INTEG_CLAMP: f32 = 1.0;
+/// Feed-forward: pedal demand per m/s² of planned acceleration, so the loop
+/// doesn't wait for an error to build before accelerating.
+const HOLD_KFF: f32 = 0.11;
+/// Injected pedals have a 25% deadzone: a demand d in (0, 1] is sent as
+/// 0.25 + 0.75 d so the vehicle sees d. Below this, coast.
+const PEDAL_DEADZONE: f32 = 0.25;
+const HOLD_COAST_BAND: f32 = 0.02;
+/// Comfort limits on the reference speed the PI follows (production-ACC-like):
+/// acceleration up to 2.0 m/s², braking up to 3.0 m/s², jerk up to 2.5 m/s³.
+const REF_ACCEL_MAX: f32 = 2.0;
+const REF_DECEL_MAX: f32 = 3.0;
+const REF_JERK_MAX: f32 = 2.5;
+/// How hard the reference closes on the target (1/s) before the limits apply.
+const REF_GAIN: f32 = 0.8;
+/// The reference never closes on its target slower than this (m/s²), and locks
+/// onto it within REF_SNAP (m/s).
+const REF_MIN_ACC: f32 = 0.5;
+const REF_SNAP: f32 = 0.05;
+/// Stop-and-hold: below STOP_SPEED (m/s) the car counts as stopped and the hold
+/// engages; until then the stop finishes on at least this brake demand.
+const STOP_SPEED: f32 = 0.1;
+const STOP_BRAKE_DEMAND: f32 = 0.12;
+
 // ---- DLL entry ----
 
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
@@ -400,7 +432,7 @@ struct SweepFrame {
 enum Mode {
     Idle,
     Sweep { t: f64, frames: Vec<SweepFrame>, prev: Option<(u8, f32, f32, f32)>, base: usize },
-    Pedals { t: f64, csv: BufWriter<File> },
+    SpeedHold { t: f64, integ: f32, reference: f32, ref_acc: f32, base: usize, csv: BufWriter<File> },
     Drive(Box<Drive>),
 }
 
@@ -565,7 +597,7 @@ fn run() {
     let dir = log_dir();
     let stem = run_stem();
     let mut log = BufWriter::new(File::create(dir.join(format!("{stem}.log"))).expect("create log"));
-    let _ = writeln!(log, "S4/S5 spike started. F7 teleport, F8 next car, F9 sweep, F10 pedals, F11 drive test");
+    let _ = writeln!(log, "S4/S5 spike started. F7 teleport, F8 next car, F9 sweep, F10 speed-hold, F11 drive test");
     let _ = log.flush();
 
     let mut keys = Keys { prev: [false; 5] };
@@ -606,15 +638,13 @@ fn run() {
                 mode = Mode::Sweep { t: 0.0, frames: Vec::new(), prev: None, base };
             } else if f10 {
                 run_no += 1;
-                let f = File::create(dir.join(format!("{stem}-pedals-{run_no}.csv"))).expect("create pedals csv");
+                let (_, name) = vehicle_name(veh);
+                let f = File::create(dir.join(format!("{stem}-speedhold-{run_no}.csv"))).expect("create speedhold csv");
                 let mut csv = BufWriter::new(f);
-                let _ = writeln!(
-                    csv,
-                    "frame,t_s,phase,inj_throttle,inj_brake,speed_mps,veh_throttle,disabled_norm_acc,control_norm_acc,disabled_pressed_acc,disabled_norm_brake"
-                );
-                let _ = writeln!(log, "frame {frame}: PEDALS start (file pedals-{run_no})");
-                *status.lock().unwrap() = "pedal test".into();
-                mode = Mode::Pedals { t: 0.0, csv };
+                let _ = writeln!(csv, "frame,t_s,target_mps,ref_mps,ref_acc,speed_mps,err,u,thr_inj,brk_inj,veh_throttle,integ");
+                let _ = writeln!(log, "frame {frame}: SPEEDHOLD start, vehicle {name}, file speedhold-{run_no}");
+                *status.lock().unwrap() = format!("speed-hold ({name})");
+                mode = Mode::SpeedHold { t: 0.0, integ: 0.0, reference: speed, ref_acc: 0.0, base, csv };
             } else if f11 {
                 run_no += 1;
                 let (model, name) = vehicle_name(veh);
@@ -691,49 +721,98 @@ fn run() {
                     }
                 }
             }
-            Mode::Pedals { mut t, mut csv } => {
-                // 0: unblocked throttle ramp 0→1 (injection scale)   1: unblocked brake 1.0
-                // 2: blocked + throttle 0.6 (repeat)                   3: blocked, nothing (press W: driver read)
-                // 4: unblocked, nothing (press W: how a real key ramps the throttle)
-                let phase = (t / PEDAL_PHASE_S) as u32;
-                let within = (t - phase as f64 * PEDAL_PHASE_S) / PEDAL_PHASE_S;
-                let (thr, brk, blocked) = match phase {
-                    0 => (within as f32, 0.0f32, false),
-                    1 => (0.0, 1.0, false),
-                    2 => (0.6, 0.0, true),
-                    3 => (0.0, 0.0, true),
-                    _ => (0.0, 0.0, false),
-                };
-                unsafe {
-                    if blocked {
-                        let () = invoke!(n::DISABLE_CONTROL_ACTION, PLAYER_CONTROL, INPUT_VEH_ACCELERATE, true);
-                        let () = invoke!(n::DISABLE_CONTROL_ACTION, PLAYER_CONTROL, INPUT_VEH_BRAKE, true);
-                    }
-                    if thr > 0.0 {
-                        let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_ACCELERATE, thr);
-                    }
-                    if brk > 0.0 {
-                        let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_BRAKE, brk);
-                    }
-                }
-                let veh_thr: f32 = if in_vehicle { unsafe { invoke!(n::VEHICLE_THROTTLE, veh) } } else { 0.0 };
-                let dis_acc: f32 = unsafe { invoke!(n::GET_DISABLED_CONTROL_NORMAL, PLAYER_CONTROL, INPUT_VEH_ACCELERATE) };
-                let ctl_acc: f32 = unsafe { invoke!(n::GET_CONTROL_NORMAL, PLAYER_CONTROL, INPUT_VEH_ACCELERATE) };
-                let dis_pr: bool = unsafe { invoke!(n::IS_DISABLED_CONTROL_PRESSED, PLAYER_CONTROL, INPUT_VEH_ACCELERATE) };
-                let dis_brk: f32 = unsafe { invoke!(n::GET_DISABLED_CONTROL_NORMAL, PLAYER_CONTROL, INPUT_VEH_BRAKE) };
-                let _ = writeln!(
-                    csv,
-                    "{frame},{t:.3},{phase},{thr:.3},{brk},{speed:.3},{veh_thr:.3},{dis_acc:.3},{ctl_acc:.3},{},{dis_brk:.3}",
-                    dis_pr as u8
-                );
-                t += dt as f64;
-                if t >= 5.0 * PEDAL_PHASE_S {
-                    let _ = csv.flush();
-                    let _ = writeln!(log, "frame {frame}: PEDALS done");
-                    *status.lock().unwrap() = "pedal test done".into();
+            Mode::SpeedHold { mut t, mut integ, mut reference, mut ref_acc, base: hold_base, mut csv } => {
+                if !in_vehicle || base != hold_base {
+                    let _ = writeln!(log, "frame {frame}: SPEEDHOLD aborted (left vehicle)");
+                    *status.lock().unwrap() = "speed-hold aborted".into();
                     Mode::Idle
                 } else {
-                    Mode::Pedals { t, csv }
+                    // Current target from the profile.
+                    let mut acc = 0.0;
+                    let mut target = HOLD_PROFILE[HOLD_PROFILE.len() - 1].1;
+                    for &(len, tgt) in HOLD_PROFILE.iter() {
+                        if t < acc + len {
+                            target = tgt;
+                            break;
+                        }
+                        acc += len;
+                    }
+                    // Comfort-limited reference: accel and jerk bounded, so a launch
+                    // from a stop rolls on gently instead of flooring it.
+                    let e_ref = target - reference;
+                    let mut want_acc = (REF_GAIN * e_ref).clamp(-REF_DECEL_MAX, REF_ACCEL_MAX);
+                    // Finite-time approach: never close slower than REF_MIN_ACC, so a
+                    // stop doesn't end in a long crawl.
+                    if e_ref.abs() > REF_SNAP && want_acc.abs() < REF_MIN_ACC {
+                        want_acc = REF_MIN_ACC * e_ref.signum();
+                    }
+                    let step = REF_JERK_MAX * dt;
+                    ref_acc += (want_acc - ref_acc).clamp(-step, step);
+                    let next = (reference + ref_acc * dt).max(0.0);
+                    // Lock onto the target once reached (or crossed).
+                    if (target - next).abs() <= REF_SNAP || (target - next).signum() != e_ref.signum() {
+                        reference = target;
+                        ref_acc = 0.0;
+                    } else {
+                        reference = next;
+                    }
+                    // PI on the speed error (anti-windup: freeze the integral at the clamp).
+                    let err = reference - speed;
+                    let integ_next = (integ + err * dt).clamp(-HOLD_INTEG_CLAMP, HOLD_INTEG_CLAMP);
+                    let u_raw = HOLD_KFF * ref_acc + HOLD_KP * err + HOLD_KI * integ_next;
+                    let u = u_raw.clamp(-1.0, 1.0);
+                    // Anti-windup: don't integrate further while the output is saturated.
+                    if u_raw == u || (u_raw > 1.0 && err < 0.0) || (u_raw < -1.0 && err > 0.0) {
+                        integ = integ_next;
+                    }
+                    // Split into throttle/brake with the deadzone compensation.
+                    let (mut thr, mut brk) = (0.0f32, 0.0f32);
+                    // Stop-and-hold: once the reference is at zero, finish the stop on
+                    // gentle brake (never throttle), and engage the hold only when the
+                    // car is actually stopped, with the pedals released.
+                    let stopping = target < 0.05 && reference < 0.05;
+                    let held = stopping && speed < STOP_SPEED;
+                    if held {
+                        integ = 0.0;
+                    } else if stopping {
+                        let d = (-u).clamp(STOP_BRAKE_DEMAND, 1.0);
+                        brk = PEDAL_DEADZONE + (1.0 - PEDAL_DEADZONE) * d;
+                    } else if u > HOLD_COAST_BAND {
+                        thr = PEDAL_DEADZONE + (1.0 - PEDAL_DEADZONE) * u.min(1.0);
+                    } else if u < -HOLD_COAST_BAND {
+                        brk = PEDAL_DEADZONE + (1.0 - PEDAL_DEADZONE) * (-u).min(1.0);
+                    }
+                    unsafe {
+                        // Hold the wheel straight so the car stays on the taxiway.
+                        write_f32(base + STEER_INPUT_OFFSET, 0.0);
+                        if thr > 0.0 {
+                            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_ACCELERATE, thr);
+                        }
+                        if brk > 0.0 {
+                            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_BRAKE, brk);
+                        }
+                        // At a standstill target, hold with the handbrake (S4 finding).
+                        let () = invoke!(n::SET_VEHICLE_HANDBRAKE, veh, held);
+                    }
+                    let veh_thr: f32 = unsafe { invoke!(n::VEHICLE_THROTTLE, veh) };
+                    let _ = writeln!(
+                        csv,
+                        "{frame},{t:.3},{target:.2},{reference:.3},{ref_acc:.3},{speed:.3},{err:.3},{u:.3},{thr:.3},{brk:.3},{veh_thr:.3},{integ:.3}"
+                    );
+                    *status.lock().unwrap() = format!("speed-hold: target {target:.0}, now {:.1} m/s", speed);
+                    t += dt as f64;
+                    let total: f64 = HOLD_PROFILE.iter().map(|p| p.0).sum();
+                    if t >= total {
+                        unsafe {
+                            let () = invoke!(n::SET_VEHICLE_HANDBRAKE, veh, false);
+                        }
+                        let _ = csv.flush();
+                        let _ = writeln!(log, "frame {frame}: SPEEDHOLD done");
+                        *status.lock().unwrap() = "speed-hold done".into();
+                        Mode::Idle
+                    } else {
+                        Mode::SpeedHold { t, integ, reference, ref_acc, base: hold_base, csv }
+                    }
                 }
             }
             Mode::Drive(mut d) => {
@@ -858,7 +937,7 @@ fn run() {
         unsafe {
             let () = invoke!(n::DRAW_RECT, 0.24f32, 0.05f32, 0.46f32, 0.08f32, 0i32, 0i32, 0i32, 160i32, false);
             draw_text(0.015, 0.015, &format!("ADAS S4/S5  |  {:.1} km/h  |  {st}", speed * 3.6));
-            draw_text(0.015, 0.040, "F7 teleport  |  F8 next car  |  F9 sweep (stationary)  |  F10 pedals  |  F11 drive test");
+            draw_text(0.015, 0.040, "F7 teleport  |  F8 next car  |  F9 sweep (stationary)  |  F10 speed-hold  |  F11 drive test");
         }
 
         unsafe { shv_sys::scriptWait(0) };

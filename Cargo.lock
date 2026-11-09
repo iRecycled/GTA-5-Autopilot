@@ -339,6 +339,7 @@ version = "0.1.0"
 dependencies = [
  "adapter-api",
  "adas-core",
+ "can",
  "serde",
  "sim",
  "toml",

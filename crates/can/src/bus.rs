@@ -163,6 +163,9 @@ pub struct Bus {
     busy_until: f64,
     busy_time: f64,
     since: f64,
+    /// Time the bus has been busy since it started (s). Never reset, so a
+    /// viewer can compute load over any window.
+    pub busy_total: f64,
     pub delivered_total: u64,
     faults: Vec<Fault>,
     rng: Rng,
@@ -182,6 +185,7 @@ impl Bus {
             busy_until: 0.0,
             busy_time: 0.0,
             since: 0.0,
+            busy_total: 0.0,
             delivered_total: 0,
             faults: Vec::new(),
             rng,
@@ -282,6 +286,7 @@ impl Bus {
                 break;
             }
             self.busy_time += dur;
+            self.busy_total += dur;
             clock = end;
             f.delivered = match self.cfg.delivery {
                 Delivery::Reactive => t,
@@ -307,6 +312,11 @@ impl Bus {
         self.busy_time = 0.0;
         self.since = self.now;
         l
+    }
+
+    /// Bus time (s): the last `step`'s `t`.
+    pub fn now(&self) -> f64 {
+        self.now
     }
 
     pub fn backlog(&self) -> usize {

@@ -2,10 +2,15 @@
 //! `Core::step` per host frame; records the whole run to MCAP.
 //!
 //! Usage: `adas-core [--feature acc|speed-profile|test-driver] [--spin]
-//!                   [--record DIR | --no-record] [--link NAME]`
+//!                   [--record DIR | --no-record] [--link NAME]
+//!                   [--telemetry PORT,PORT... | --no-telemetry]`
 //!
 //! - `--spin`: busy-poll for samples (lowest latency, uses a CPU core);
 //!   default: sleep on the adapter's sample event.
+//! - telemetry (on by default): each step goes to the engineering panel
+//!   (`adas-panel`, port 47300) and the Rerun views (`adas-viz`, port 47302) over UDP on
+//!   localhost, after the command is out. The panel's fault injections arrive
+//!   on port 47301; they apply before the next step and are recorded.
 //! - test driver: I = throttle, K = brake, J / L = steer (read from Windows,
 //!   so they work while GTA has focus).
 
@@ -15,8 +20,9 @@ use std::sync::atomic::Ordering;
 
 use adapter_api::shm::{DEFAULT_NAME, SharedLink};
 use adapter_api::{CONTRACT_VERSION, Header, MsgKind, sample_flags, str_of, wall_time_ns};
-use adas_core::{Core, Event, Feature, Inputs, Stick};
+use adas_core::{Core, Event, Feature, Inputs, Stick, telem};
 use record::{Profile, Recorder, Stick3};
+use telemetry::Packet;
 
 /// `config/vehicles/<host>/<model>.toml` (D19): a file-system-safe slug.
 fn slug(s: &str) -> String {
@@ -178,10 +184,16 @@ fn main() {
     let mut name = DEFAULT_NAME.to_string();
     let mut feature = Feature::speed_profile();
     let mut rec_dir: Option<PathBuf> = Some(PathBuf::from("recordings"));
+    let mut telemetry_ports = vec![telemetry::PANEL_PORT, telemetry::RERUN_PORT];
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--spin" => spin = true,
+            "--no-telemetry" => telemetry_ports.clear(),
+            "--telemetry" => {
+                let list = args.next().expect("--telemetry needs ports, e.g. 47300,47302");
+                telemetry_ports = list.split(',').map(|p| p.trim().parse().expect("bad port")).collect();
+            }
             "--link" => name = args.next().expect("--link needs a name"),
             "--record" => rec_dir = Some(PathBuf::from(args.next().expect("--record needs a directory"))),
             "--no-record" => rec_dir = None,
@@ -243,6 +255,7 @@ fn main() {
     // rebuild the perception state as well (the tracker's history starts
     // before any engagement).
     let mut recorder: Option<Recorder> = None;
+    let mut recording_name = String::new();
     if let Some(dir) = &rec_dir {
         let _ = std::fs::create_dir_all(dir);
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -252,11 +265,33 @@ fn main() {
         match Recorder::create(&path, &meta) {
             Ok(r) => {
                 println!("recording {}", path.display());
+                recording_name = path.display().to_string();
                 recorder = Some(r);
             }
             Err(e) => eprintln!("cannot record to {}: {e}", path.display()),
         }
     }
+
+    // Telemetry to the viewers, and fault injection from the panel.
+    let telemetry_on = !telemetry_ports.is_empty();
+    let mut tx = telemetry::Sender::udp(&telemetry_ports);
+    let mut control = if telemetry_on {
+        match telemetry::Receiver::bind(telemetry::CONTROL_PORT) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("panel control port {} unavailable ({e}); fault injection off", telemetry::CONTROL_PORT);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if telemetry_on {
+        println!("telemetry to ports {telemetry_ports:?}; panel control on {}", telemetry::CONTROL_PORT);
+    }
+    let mut last_hello = 0u64;
+    let mut host_names = (String::new(), String::new());
+    let mut events: Vec<String> = Vec::new();
 
     let mut one_way: Vec<u64> = Vec::with_capacity(1024);
     let mut step_ns: Vec<u64> = Vec::with_capacity(1024);
@@ -301,6 +336,8 @@ fn main() {
             println!("adapter: {} / {}; sensor layout published ({} sensors)", str_of(&info.host), str_of(&info.vehicle), l.count);
             // A new vehicle: start from its profile, if there is one.
             let (host, vehicle) = (str_of(&info.host).to_string(), str_of(&info.vehicle).to_string());
+            host_names = (host.clone(), vehicle.clone());
+            last_hello = 0;
             if profile.as_ref().is_none_or(|p| p.1 != host || p.2 != vehicle) {
                 let path = profile_path(&host, &vehicle);
                 match load_brake_gain(&path) {
@@ -323,6 +360,26 @@ fn main() {
         last_game_us = s.header.game_time_us;
         let stick = test_driver.then(|| stick_src.read(dt.clamp(0.0, 0.1)));
 
+        // Fault injection from the panel: applied before this step, starting
+        // at this sample's time, and recorded so a replay applies it too.
+        if let Some(rx) = control.as_mut() {
+            while let Some(p) = rx.try_recv() {
+                let Packet::Control(c) = p else { continue };
+                let f = telem::fault_from_control(&c, s.header.game_time_us as f64 / 1e6);
+                match telem::apply_fault(&mut core, &f) {
+                    Ok(()) => {
+                        let text = format!("fault at frame {}: {c:?}", s.header.frame);
+                        println!("{text}");
+                        events.push(text);
+                        if let Some(r) = recorder.as_mut() {
+                            let _ = r.fault(&f, s.header.wall_time_ns);
+                        }
+                    }
+                    Err(e) => eprintln!("panel fault rejected: {e}"),
+                }
+            }
+        }
+
         let (mut cmd, event) = core.step(Inputs { sample: &s, actors: &actors, stick });
         cmd_seq = cmd_seq.wrapping_add(1);
         cmd.answers_seq = s.header.seq;
@@ -335,17 +392,23 @@ fn main() {
         hud.header = Header { kind: MsgKind::Hud, version: CONTRACT_VERSION, seq: cmd_seq, frame: s.header.frame, game_time_us: s.header.game_time_us, wall_time_ns: wall_time_ns() };
         link.hud.write(&hud);
         let stick3 = stick.map(|k| Stick3 { throttle: k.throttle, brake: k.brake, steer: k.steer });
-        match event {
-            Event::Engaged => println!("engaged at frame {} ({:.2} m/s)", s.header.frame, s.speed),
-            Event::CancelledByDriver => println!("cancelled by driver at frame {}", s.header.frame),
-            Event::Disengaged => println!("disengaged at frame {}", s.header.frame),
-            Event::CancelledByAeb => println!("AEB at frame {}: ACC cancelled", s.header.frame),
-            Event::Impact => println!("IMPACT at frame {} ({:.1} m/s): everything cancelled", s.header.frame, s.speed),
-            Event::Unavailable(r) => println!("{} unavailable at frame {}: {}", feature.name(), s.header.frame, r.text()),
-            Event::None => {}
+        let text = match event {
+            Event::Engaged => Some(format!("engaged at frame {} ({:.2} m/s)", s.header.frame, s.speed)),
+            Event::CancelledByDriver => Some(format!("cancelled by driver at frame {}", s.header.frame)),
+            Event::Disengaged => Some(format!("disengaged at frame {}", s.header.frame)),
+            Event::CancelledByAeb => Some(format!("AEB at frame {}: ACC cancelled", s.header.frame)),
+            Event::Impact => Some(format!("IMPACT at frame {} ({:.1} m/s): everything cancelled", s.header.frame, s.speed)),
+            Event::Unavailable(r) => Some(format!("{} unavailable at frame {}: {}", feature.name(), s.header.frame, r.text())),
+            Event::None => None,
+        };
+        if let Some(t) = text {
+            println!("{t}");
+            events.push(t);
         }
         if cmd.flags & adapter_api::command_flags::AEB != 0 && cmd.brake > 0.0 && !aeb_logged {
-            println!("AEB braking at frame {} ({:.1} m/s, ttc {:.2} s, brake {:.2})", s.header.frame, s.speed, hud.ttc, cmd.brake);
+            let t = format!("AEB braking at frame {} ({:.1} m/s, ttc {:.2} s, brake {:.2})", s.header.frame, s.speed, hud.ttc, cmd.brake);
+            println!("{t}");
+            events.push(t);
             aeb_logged = true;
         } else if cmd.flags & adapter_api::command_flags::AEB == 0 {
             aeb_logged = false;
@@ -355,6 +418,31 @@ fn main() {
         {
             eprintln!("recording failed: {e}");
             recorder = None;
+        }
+
+        // Telemetry for the panel and the Rerun views.
+        if telemetry_on {
+            if t1.saturating_sub(last_hello) > 1_000_000_000 {
+                last_hello = t1;
+                tx.send(&Packet::Hello {
+                    contract: CONTRACT_VERSION,
+                    feature: feature.name().to_string(),
+                    host: host_names.0.clone(),
+                    vehicle: host_names.1.clone(),
+                    recording: recording_name.clone(),
+                });
+            }
+            let latency = t1.saturating_sub(s.header.wall_time_ns).min(u32::MAX as u64) as u32;
+            let step_time = t1.saturating_sub(t0).min(u32::MAX as u64) as u32;
+            tx.send(&Packet::Step(Box::new(telem::step(&core, &s, &actors, &cmd, latency, step_time))));
+            for p in telemetry::frame_packets(s.header.frame, telem::frames(&core)) {
+                tx.send(&p);
+            }
+            for text in events.drain(..) {
+                tx.send(&Packet::Event { frame: s.header.frame, text });
+            }
+        } else {
+            events.clear();
         }
 
         // Save the profile when the learned brake gain has drifted (every 10 s at most).

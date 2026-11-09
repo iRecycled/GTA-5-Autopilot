@@ -1,0 +1,18 @@
+[package]
+name = "panel"
+version = "0.1.0"
+description = "The engineering panel (egui): live CAN trace, bus load per network, latency, vehicle state, fault injection"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "adas-panel"
+path = "src/main.rs"
+
+[dependencies]
+adas-core = { path = "../adas-core" }
+adapter-api = { path = "../adapter-api" }
+telemetry = { path = "../telemetry" }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+png = "0.18"

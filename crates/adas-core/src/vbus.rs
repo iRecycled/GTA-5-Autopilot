@@ -6,16 +6,15 @@
 //! features see the vehicle the way a real ADAS ECU does, quantised to the
 //! signals' resolution, at their rates, with the buses' delays.
 //!
-//! The DBC files and the topology are compiled in, so a replay rebuilds the
-//! same bus traffic.
+//! The messages are generated from the DBC files at build time (`msgs`) and
+//! the topology is compiled in, so a replay rebuilds the same bus traffic.
 
 use crate::actuators::{AccelRequest, AdasRequest, FULL_DECEL_SENT, SteerRequest};
+use crate::msgs::{adas, chassis};
 use adapter_api::VehicleSample;
-use can::{Bus, Dbc, Delivery, Frame, Message, Topology, toyota};
+use can::{Bus, CanMessage, Delivery, Frame, Topology, toyota};
 use sensors::{RadarObject, RadarScan};
 
-const CHASSIS_DBC: &str = include_str!("../../../dbc/toyota_nodsu_pt_generated.dbc");
-const ADAS_DBC: &str = include_str!("../../../dbc/adas_canfd.dbc");
 const TOPOLOGY: &str = include_str!("../../../config/topology.toml");
 
 /// Steering-wheel angle ÷ road-wheel angle (TSS2 cars are about 14.8).
@@ -53,7 +52,7 @@ pub struct BusStats {
 }
 
 struct Periodic {
-    msg: &'static str,
+    id: u32,
     period: f64,
     next: f64,
     counter: u8,
@@ -67,8 +66,6 @@ struct Pending {
 }
 
 pub struct Vehicle {
-    chassis_dbc: Dbc,
-    adas_dbc: Dbc,
     pub chassis: Bus,
     pub adas: Bus,
     periodic: Vec<Periodic>,
@@ -81,6 +78,10 @@ pub struct Vehicle {
     /// Every frame delivered in the last step: (bus, frame).
     pub last_frames: Vec<(&'static str, Frame)>,
     lta_counter: u8,
+    /// The yaw-rate sensor's last (time, speed), for its longitudinal
+    /// acceleration, and that acceleration (m/s²).
+    imu_prev: Option<(f64, f32)>,
+    accel_x: f32,
     /// What the actuator ECUs last received, and when (s).
     pub accel_rx: AccelRequest,
     pub steer_rx: SteerRequest,
@@ -93,28 +94,34 @@ pub struct Vehicle {
 /// a silent ADAS ECU releases the car.
 pub const ACTUATOR_TIMEOUT: f64 = 0.1;
 
-fn msg<'a>(dbc: &'a Dbc, name: &str) -> &'a Message {
-    dbc.message(name).unwrap_or_else(|| panic!("DBC lacks {name}"))
+/// Encodes a message, sealing Toyota's checksum if it has a `CHECKSUM` signal.
+fn sealed<M: CanMessage>(m: &M) -> Vec<u8> {
+    let mut d = m.encode();
+    if M::has_signal("CHECKSUM") {
+        toyota::seal(M::ID, &mut d);
+    }
+    d
+}
+
+/// A received chassis frame carries a `CHECKSUM` signal.
+fn has_checksum(id: u32) -> bool {
+    chassis::signals(id).is_some_and(|s| s.contains(&"CHECKSUM"))
 }
 
 impl Vehicle {
     pub fn new(delivery: Delivery) -> Self {
         let topo = Topology::parse(TOPOLOGY).expect("config/topology.toml");
-        let chassis_dbc = Dbc::parse(CHASSIS_DBC).expect("chassis DBC");
-        let adas_dbc = Dbc::parse(ADAS_DBC).expect("ADAS DBC");
-        let p = |msg: &'static str, hz: f64| Periodic { msg, period: 1.0 / hz, next: 0.0, counter: 0 };
+        let p = |id: u32, hz: f64| Periodic { id, period: 1.0 / hz, next: 0.0, counter: 0 };
         Self {
             chassis: Bus::new(topo.bus_config("chassis", delivery).expect("chassis bus")),
             adas: Bus::new(topo.bus_config("adas", delivery).expect("adas bus")),
-            chassis_dbc,
-            adas_dbc,
             periodic: vec![
-                p("KINEMATICS", 80.0),
-                p("STEER_ANGLE_SENSOR", 80.0),
-                p("WHEEL_SPEEDS", 80.0),
-                p("SPEED", 50.0),
-                p("BRAKE_MODULE", 40.0),
-                p("PCM_CRUISE", 33.0),
+                p(chassis::Kinematics::ID, 80.0),
+                p(chassis::SteerAngleSensor::ID, 80.0),
+                p(chassis::WheelSpeeds::ID, 80.0),
+                p(chassis::Speed::ID, 50.0),
+                p(chassis::BrakeModule::ID, 40.0),
+                p(chassis::PcmCruise::ID, 33.0),
             ],
             adas_counter: 0,
             ego: EgoBus::default(),
@@ -123,6 +130,8 @@ impl Vehicle {
             stats: BusStats::default(),
             last_frames: Vec::new(),
             lta_counter: 0,
+            imu_prev: None,
+            accel_x: 0.0,
             accel_rx: AccelRequest::default(),
             steer_rx: SteerRequest::default(),
             accel_rx_t: f64::NEG_INFINITY,
@@ -135,6 +144,15 @@ impl Vehicle {
     /// what the car measures (sample-and-hold between host frames).
     fn publish_chassis(&mut self, t: f64, s: &VehicleSample) {
         let kph = (s.speed * 3.6) as f64;
+        // The yaw-rate sensor's accelerations: longitudinal from the change
+        // in speed since the last host frame, lateral v·ω (ISO 8855, left +).
+        if let Some((t0, v0)) = self.imu_prev
+            && t > t0
+        {
+            self.accel_x = ((s.speed - v0) as f64 / (t - t0)) as f32;
+        }
+        self.imu_prev = Some((t, s.speed));
+        let (ax, ay) = (self.accel_x as f64, (s.speed * s.yaw_rate) as f64);
         let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
         for p in &mut self.periodic {
             // Start-up and long pauses: resync instead of sending the backlog.
@@ -142,27 +160,27 @@ impl Vehicle {
                 p.next = t;
             }
             while p.next <= t {
-                let m = msg(&self.chassis_dbc, p.msg);
-                let mut data = match p.msg {
-                    "WHEEL_SPEEDS" => m
-                        .encode(&[("WHEEL_SPEED_FR", kph), ("WHEEL_SPEED_FL", kph), ("WHEEL_SPEED_RR", kph), ("WHEEL_SPEED_RL", kph)])
-                        .expect("WHEEL_SPEEDS"),
-                    "KINEMATICS" => m.encode(&[("YAW_RATE", (s.yaw_rate as f64).to_degrees())]).expect("KINEMATICS"),
-                    "STEER_ANGLE_SENSOR" => {
+                // Messages with a CHECKSUM signal carry Toyota's checksum.
+                let data = match p.id {
+                    chassis::WheelSpeeds::ID => sealed(&chassis::WheelSpeeds {
+                        wheel_speed_fr: kph,
+                        wheel_speed_fl: kph,
+                        wheel_speed_rr: kph,
+                        wheel_speed_rl: kph,
+                        ..Default::default()
+                    }),
+                    chassis::Kinematics::ID => sealed(&chassis::Kinematics { yaw_rate: (s.yaw_rate as f64).to_degrees(), accel_x: ax, accel_y: ay }),
+                    chassis::SteerAngleSensor::ID => {
                         let a = if s.steer_angle.is_finite() { (s.steer_angle * STEERING_RATIO) as f64 } else { 0.0 };
-                        m.encode(&[("STEER_ANGLE", a.to_degrees())]).expect("STEER_ANGLE_SENSOR")
+                        sealed(&chassis::SteerAngleSensor { steer_angle: a.to_degrees(), ..Default::default() })
                     }
-                    "SPEED" => m.encode(&[("SPEED", kph)]).expect("SPEED"),
-                    "BRAKE_MODULE" => m.encode(&[("BRAKE_PRESSED", if s.driver_brake > 0.1 { 1.0 } else { 0.0 })]).expect("BRAKE_MODULE"),
-                    "PCM_CRUISE" => m.encode(&[("GAS_RELEASED", if s.driver_throttle > 0.05 { 0.0 } else { 1.0 })]).expect("PCM_CRUISE"),
+                    chassis::Speed::ID => sealed(&chassis::Speed { speed: kph, ..Default::default() }),
+                    chassis::BrakeModule::ID => sealed(&chassis::BrakeModule { brake_pressed: s.driver_brake > 0.1, ..Default::default() }),
+                    chassis::PcmCruise::ID => sealed(&chassis::PcmCruise { gas_released: s.driver_throttle.partial_cmp(&0.05) != Some(std::cmp::Ordering::Greater), ..Default::default() }),
                     _ => unreachable!(),
                 };
-                // Messages with a CHECKSUM signal carry Toyota's checksum.
-                if m.signal("CHECKSUM").is_some() {
-                    toyota::seal(m.id, &mut data);
-                }
                 p.counter = p.counter.wrapping_add(1);
-                out.push((m.id, data));
+                out.push((p.id, data));
                 p.next += p.period;
             }
         }
@@ -173,35 +191,38 @@ impl Vehicle {
 
     /// The front radar ECU: one scan as a status frame and one frame per object.
     fn publish_radar(&mut self, scan: &RadarScan, frame: u64) {
-        let st = msg(&self.adas_dbc, "RADAR_STATUS");
-        let ob = msg(&self.adas_dbc, "RADAR_OBJECT");
         let objects = &scan.objects[..scan.objects.len().min(32)];
-        let seal = |m: &Message, mut data: Vec<u8>, ctr: &mut u8| {
-            m.signal("COUNTER").expect("COUNTER").encode(&mut data, *ctr as f64);
-            *ctr = ctr.wrapping_add(1);
-            toyota::seal(m.id, &mut data);
-            data
+        let mut next_counter = || {
+            let c = self.adas_counter;
+            self.adas_counter = c.wrapping_add(1);
+            c as f64
         };
-        let status = st.encode(&[("SCAN_COUNTER", (scan.scan & 0xFFFF) as f64), ("NUM_OBJECTS", objects.len() as f64)]).expect("RADAR_STATUS");
-        let status = seal(st, status, &mut self.adas_counter);
-        self.adas.send(st.id, status);
+        let status = adas::RadarStatus {
+            scan_counter: (scan.scan & 0xFFFF) as f64,
+            num_objects: objects.len() as f64,
+            counter: next_counter(),
+            ..Default::default()
+        };
+        let mut frames = vec![(adas::RadarStatus::ID, sealed(&status))];
         for (slot, o) in objects.iter().enumerate() {
-            let d = ob
-                .encode(&[
-                    ("SLOT", slot as f64),
-                    ("TRACK_ID", (o.id & 0xFFFF) as f64),
-                    ("DIST_X", o.x as f64),
-                    ("DIST_Y", o.y as f64),
-                    ("VEL_X", o.vx as f64),
-                    ("VEL_Y", o.vy as f64),
-                    ("WIDTH", o.width as f64),
-                    ("HALF_LENGTH", o.half_length as f64),
-                    ("STATIONARY", o.stationary as u8 as f64),
-                    ("EXIST_PROB", 0.99),
-                ])
-                .expect("RADAR_OBJECT");
-            let d = seal(ob, d, &mut self.adas_counter);
-            self.adas.send(ob.id, d);
+            let obj = adas::RadarObject {
+                slot: slot as f64,
+                track_id: (o.id & 0xFFFF) as f64,
+                dist_x: o.x as f64,
+                dist_y: o.y as f64,
+                vel_x: o.vx as f64,
+                vel_y: o.vy as f64,
+                width: o.width as f64,
+                half_length: o.half_length as f64,
+                stationary: o.stationary,
+                exist_prob: 0.99,
+                counter: next_counter(),
+                ..Default::default()
+            };
+            frames.push((adas::RadarObject::ID, sealed(&obj)));
+        }
+        for (id, d) in frames {
+            self.adas.send(id, d);
         }
         self.sent_scans.push((scan.scan & 0xFFFF, frame));
         if self.sent_scans.len() > 16 {
@@ -240,50 +261,38 @@ impl Vehicle {
     /// this step's requests; in realistic delivery, after their transmission).
     /// Returns what the actuator ECUs act on now.
     pub fn actuate(&mut self, t: f64, r: &AdasRequest) -> (AccelRequest, SteerRequest) {
-        let acc = msg(&self.chassis_dbc, "ACC_CONTROL");
-        let mut d = acc
-            .encode(&[
-                ("ACCEL_CMD", r.accel as f64),
-                ("ACC_TYPE", r.acc_active as u8 as f64),
-                ("PERMIT_BRAKING", 1.0),
-                ("RELEASE_STANDSTILL", if r.hold { 0.0 } else { 1.0 }),
-            ])
-            .expect("ACC_CONTROL");
-        toyota::seal(acc.id, &mut d);
-        let acc_id = acc.id;
-        let pcs = msg(&self.chassis_dbc, "PRE_COLLISION_2");
+        let acc = chassis::AccControl {
+            accel_cmd: r.accel as f64,
+            acc_type: r.acc_active as u8 as f64,
+            permit_braking: true,
+            release_standstill: !r.hold,
+            ..Default::default()
+        };
         let decel = if r.aeb_decel.is_finite() { r.aeb_decel } else { FULL_DECEL_SENT };
         let braking = r.aeb_decel > 0.0;
-        let mut p = pcs
-            .encode(&[
-                // Toyota sends the deceleration as a negative acceleration.
-                ("DSS1GDRV", if braking { -decel as f64 } else { 0.0 }),
-                ("IBTRGR", braking as u8 as f64),
-                ("PBATRGR", r.aeb_hold as u8 as f64),
-            ])
-            .expect("PRE_COLLISION_2");
-        toyota::seal(pcs.id, &mut p);
-        let pcs_id = pcs.id;
-        let lta = msg(&self.chassis_dbc, "STEERING_LTA");
+        let pcs = chassis::PreCollision2 {
+            // Toyota sends the deceleration as a negative acceleration.
+            dss1gdrv: if braking { -decel as f64 } else { 0.0 },
+            ibtrgr: braking,
+            pbatrgr: r.aeb_hold as u8 as f64,
+            ..Default::default()
+        };
         let sw_deg = if r.steer_request && r.steer_angle.is_finite() { (r.steer_angle * STEERING_RATIO).to_degrees() as f64 } else { 0.0 };
-        let mut l = lta
-            .encode(&[
-                ("STEER_REQUEST", r.steer_request as u8 as f64),
-                ("STEER_REQUEST_2", r.steer_request as u8 as f64),
-                ("LKA_ACTIVE", r.steer_request as u8 as f64),
-                ("SETME_X1", 1.0),
-                ("SETME_X3", 3.0),
-                ("PERCENTAGE", 100.0),
-                ("STEER_ANGLE_CMD", sw_deg),
-                ("COUNTER", (self.lta_counter & 0x3F) as f64),
-            ])
-            .expect("STEERING_LTA");
+        let lta = chassis::SteeringLta {
+            steer_request: r.steer_request,
+            steer_request_2: r.steer_request,
+            lka_active: r.steer_request,
+            setme_x1: true,
+            setme_x3: 3.0,
+            percentage: 100.0,
+            steer_angle_cmd: sw_deg,
+            counter: (self.lta_counter & 0x3F) as f64,
+            ..Default::default()
+        };
         self.lta_counter = self.lta_counter.wrapping_add(1);
-        toyota::seal(lta.id, &mut l);
-        let lta_id = lta.id;
-        self.chassis.send(acc_id, d);
-        self.chassis.send(pcs_id, p);
-        self.chassis.send(lta_id, l);
+        self.chassis.send(chassis::AccControl::ID, sealed(&acc));
+        self.chassis.send(chassis::PreCollision2::ID, sealed(&pcs));
+        self.chassis.send(chassis::SteeringLta::ID, sealed(&lta));
         for f in self.chassis.step(t) {
             self.stats.chassis_frames += 1;
             self.read_actuation(&f, t);
@@ -305,8 +314,8 @@ impl Vehicle {
 
     /// The powertrain/brake ECU and the EPS read their requests.
     fn read_actuation(&mut self, f: &Frame, t: f64) {
-        let Some(m) = self.chassis_dbc.message_by_id(f.id) else { return };
-        if !matches!(m.name.as_str(), "ACC_CONTROL" | "PRE_COLLISION_2" | "STEERING_LTA") {
+        let (acc, pcs, lta) = (chassis::AccControl::ID, chassis::PreCollision2::ID, chassis::SteeringLta::ID);
+        if f.id != acc && f.id != pcs && f.id != lta {
             // Chassis traffic that was still queued: the ADAS ECU reads it too.
             self.read_chassis(f);
             return;
@@ -315,72 +324,73 @@ impl Vehicle {
             self.stats.errors += 1;
             return;
         }
-        let g = |n: &str| m.decode(&f.data, n).unwrap_or(0.0);
-        match m.name.as_str() {
-            "ACC_CONTROL" => {
-                self.accel_rx.acc_active = g("ACC_TYPE") as u8 == 1;
-                self.accel_rx.accel = g("ACCEL_CMD") as f32;
-                self.accel_rx.hold = g("RELEASE_STANDSTILL") < 0.5;
-                self.accel_rx_t = t;
-            }
-            "PRE_COLLISION_2" => {
-                self.accel_rx.aeb_decel = if g("IBTRGR") > 0.5 { (-g("DSS1GDRV")).max(0.0) as f32 } else { 0.0 };
-                self.accel_rx.aeb_hold = g("PBATRGR") as u8 == 1;
-                self.pcs_rx_t = t;
-            }
-            "STEERING_LTA" => {
-                self.steer_rx = SteerRequest { request: g("STEER_REQUEST") > 0.5, sw_deg: g("STEER_ANGLE_CMD") as f32 };
-                self.steer_rx_t = t;
-            }
-            _ => {}
+        if f.id == acc {
+            let m = chassis::AccControl::decode(&f.data);
+            self.accel_rx.acc_active = m.acc_type as u8 == 1;
+            self.accel_rx.accel = m.accel_cmd as f32;
+            self.accel_rx.hold = !m.release_standstill;
+            self.accel_rx_t = t;
+        } else if f.id == pcs {
+            let m = chassis::PreCollision2::decode(&f.data);
+            self.accel_rx.aeb_decel = if m.ibtrgr { (-m.dss1gdrv).max(0.0) as f32 } else { 0.0 };
+            self.accel_rx.aeb_hold = m.pbatrgr as u8 == 1;
+            self.pcs_rx_t = t;
+        } else {
+            let m = chassis::SteeringLta::decode(&f.data);
+            self.steer_rx = SteerRequest { request: m.steer_request, sw_deg: m.steer_angle_cmd as f32 };
+            self.steer_rx_t = t;
         }
     }
 
     fn read_chassis(&mut self, f: &Frame) {
-        let Some(m) = self.chassis_dbc.message_by_id(f.id) else { return };
-        if m.signal("CHECKSUM").is_some() && !toyota::verify(f.id, &f.data) {
+        if chassis::name(f.id).is_none() {
+            return;
+        }
+        if has_checksum(f.id) && !toyota::verify(f.id, &f.data) {
             self.stats.errors += 1;
             return;
         }
-        let g = |n: &str| m.decode(&f.data, n).unwrap_or(0.0);
-        match m.name.as_str() {
-            "WHEEL_SPEEDS" => {
-                let mean = (g("WHEEL_SPEED_FR") + g("WHEEL_SPEED_FL") + g("WHEEL_SPEED_RR") + g("WHEEL_SPEED_RL")) / 4.0;
+        match f.id {
+            chassis::WheelSpeeds::ID => {
+                let m = chassis::WheelSpeeds::decode(&f.data);
+                let mean = (m.wheel_speed_fr + m.wheel_speed_fl + m.wheel_speed_rr + m.wheel_speed_rl) / 4.0;
                 self.ego.speed = (mean / 3.6).max(0.0) as f32;
             }
-            "KINEMATICS" => self.ego.yaw_rate = (g("YAW_RATE") as f32).to_radians(),
-            "STEER_ANGLE_SENSOR" => self.ego.steer_angle = (g("STEER_ANGLE") as f32).to_radians() / STEERING_RATIO,
-            "BRAKE_MODULE" => self.ego.brake_pressed = g("BRAKE_PRESSED") > 0.5,
-            "PCM_CRUISE" => self.ego.gas_pressed = g("GAS_RELEASED") < 0.5,
+            chassis::Kinematics::ID => self.ego.yaw_rate = (chassis::Kinematics::decode(&f.data).yaw_rate as f32).to_radians(),
+            chassis::SteerAngleSensor::ID => {
+                self.ego.steer_angle = (chassis::SteerAngleSensor::decode(&f.data).steer_angle as f32).to_radians() / STEERING_RATIO
+            }
+            chassis::BrakeModule::ID => self.ego.brake_pressed = chassis::BrakeModule::decode(&f.data).brake_pressed,
+            chassis::PcmCruise::ID => self.ego.gas_pressed = !chassis::PcmCruise::decode(&f.data).gas_released,
             _ => {}
         }
         self.ego.frames += 1;
     }
 
     fn read_adas(&mut self, f: &Frame, frame: u64) -> Option<RadarScan> {
-        let m = self.adas_dbc.message_by_id(f.id)?;
+        adas::name(f.id)?;
         if !toyota::verify(f.id, &f.data) {
             self.stats.errors += 1;
             return None;
         }
-        let g = |n: &str| m.decode(&f.data, n).unwrap_or(0.0);
-        match m.name.as_str() {
-            "RADAR_STATUS" => {
-                let scan = g("SCAN_COUNTER") as u32;
-                let expected = g("NUM_OBJECTS") as usize;
-                self.pending = Some(Pending { scan, frame, expected, objects: Vec::with_capacity(expected) });
+        match f.id {
+            adas::RadarStatus::ID => {
+                let m = adas::RadarStatus::decode(&f.data);
+                let expected = m.num_objects as usize;
+                self.pending = Some(Pending { scan: m.scan_counter as u32, frame, expected, objects: Vec::with_capacity(expected) });
             }
-            "RADAR_OBJECT" => {
+            adas::RadarObject::ID => {
                 if let Some(p) = self.pending.as_mut() {
+                    let m = adas::RadarObject::decode(&f.data);
                     p.objects.push(RadarObject {
-                        id: g("TRACK_ID") as u32,
-                        x: g("DIST_X") as f32,
-                        y: g("DIST_Y") as f32,
-                        vx: g("VEL_X") as f32,
-                        vy: g("VEL_Y") as f32,
-                        width: g("WIDTH") as f32,
-                        half_length: g("HALF_LENGTH") as f32,
-                        stationary: g("STATIONARY") > 0.5,
+                        id: m.track_id as u32,
+                        x: m.dist_x as f32,
+                        y: m.dist_y as f32,
+                        vx: m.vel_x as f32,
+                        vy: m.vel_y as f32,
+                        width: m.width as f32,
+                        half_length: m.half_length as f32,
+                        stationary: m.stationary,
                         clutter: false,
                     });
                 }
@@ -403,17 +413,37 @@ impl Vehicle {
     /// Injects a fault on `bus` ("chassis" or "adas"), on the message named
     /// `message` (`None` = every frame on the bus).
     pub fn inject(&mut self, bus: &str, message: Option<&str>, kind: can::FaultKind, p: f64, from: f64, until: f64) -> Result<(), String> {
-        let (b, dbc) = match bus {
-            "chassis" => (&mut self.chassis, &self.chassis_dbc),
-            "adas" => (&mut self.adas, &self.adas_dbc),
+        let (b, lookup): (&mut Bus, fn(&str) -> Option<u32>) = match bus {
+            "chassis" => (&mut self.chassis, chassis::id),
+            "adas" => (&mut self.adas, adas::id),
             _ => return Err(format!("no bus {bus:?} (chassis, adas)")),
         };
         let id = match message {
-            Some(m) => Some(dbc.message(m).ok_or(format!("{bus} has no message {m}"))?.id),
+            Some(m) => Some(lookup(m).ok_or(format!("{bus} has no message {m}"))?),
             None => None,
         };
         b.inject(can::Fault { id, kind, p, from, until });
         Ok(())
+    }
+
+    /// Injects a fault on bus 0 (chassis) or 1 (adas), by message id.
+    pub fn inject_fault(&mut self, bus: u8, f: can::Fault) -> Result<(), String> {
+        match bus {
+            0 => self.chassis.inject(f),
+            1 => self.adas.inject(f),
+            _ => return Err(format!("no bus {bus}")),
+        }
+        Ok(())
+    }
+
+    /// Clears the faults on bus 0 or 1, or on both (`None`).
+    pub fn clear_faults(&mut self, bus: Option<u8>) {
+        if bus.is_none_or(|b| b == 0) {
+            self.chassis.clear_faults();
+        }
+        if bus.is_none_or(|b| b == 1) {
+            self.adas.clear_faults();
+        }
     }
 
     /// Bus loads since the last call (resets the windows).
@@ -441,6 +471,24 @@ mod tests {
         assert!((v.ego.steer_angle - 0.05).abs() < 1.5f32.to_radians() / STEERING_RATIO, "steer {}", v.ego.steer_angle);
         assert!(v.ego.brake_pressed && !v.ego.gas_pressed);
         assert_eq!(v.stats.errors, 0);
+    }
+
+    #[test]
+    fn kinematics_carries_real_accelerations() {
+        let mut v = Vehicle::new(Delivery::Reactive);
+        // Speeding up at 2 m/s² in a left turn (v·ω = 20 × 0.1 = 2 m/s²).
+        let mut last = None;
+        for i in 0..20 {
+            let t = i as f64 / 72.0;
+            let s = VehicleSample { speed: 20.0 + 2.0 * t as f32, yaw_rate: 0.1, ..Default::default() };
+            v.step(t, i, &s, None);
+            if let Some((_, f)) = v.last_frames.iter().rev().find(|(_, f)| f.id == chassis::Kinematics::ID) {
+                last = Some(chassis::Kinematics::decode(&f.data));
+            }
+        }
+        let k = last.expect("KINEMATICS sent");
+        assert!((k.accel_x - 2.0).abs() < 0.1, "accel_x {}", k.accel_x);
+        assert!((k.accel_y - 2.07).abs() < 0.1, "accel_y {}", k.accel_y);
     }
 
     #[test]

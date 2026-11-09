@@ -166,24 +166,55 @@ impl Signal {
 
     /// The physical value.
     pub fn decode(&self, data: &[u8]) -> f64 {
-        let raw = self.get_raw(data);
-        let v = if self.signed && self.len < 64 && raw >> (self.len - 1) & 1 == 1 { raw as i64 - (1i64 << self.len) } else { raw as i64 };
-        v as f64 * self.factor + self.offset
+        raw_to_phys(self.get_raw(data), self.len, self.signed, self.factor, self.offset)
     }
 
     /// Writes a physical value (rounded to the nearest step, saturated to the
     /// raw range).
     pub fn encode(&self, data: &mut [u8], value: f64) {
-        let steps = ((value - self.offset) / self.factor).round();
-        let raw = if self.signed {
-            let lo = -(1i64 << (self.len - 1)) as f64;
-            let hi = ((1i64 << (self.len - 1)) - 1) as f64;
-            let v = steps.clamp(lo, hi) as i64;
-            (v as u64) & mask(self.len)
-        } else {
-            steps.clamp(0.0, mask(self.len) as f64) as u64
-        };
-        self.set_raw(data, raw);
+        self.set_raw(data, phys_to_raw(value, self.len, self.signed, self.factor, self.offset));
+    }
+
+    /// Bit runs within one byte, for code generation: (byte, lowest bit in
+    /// the byte, width, the run's lowest bit in the raw value), skipping bytes
+    /// at or past `msg_len`.
+    pub fn runs(&self, msg_len: usize) -> Vec<(usize, u32, u32, u32)> {
+        let bits = self.bits();
+        let n = bits.len() as u32;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bits.len() {
+            let mut j = i;
+            while j + 1 < bits.len() && bits[j + 1] + 1 == bits[j] && bits[j + 1] / 8 == bits[i] / 8 {
+                j += 1;
+            }
+            let byte = (bits[i] / 8) as usize;
+            if byte < msg_len {
+                out.push((byte, bits[j] % 8, (j - i + 1) as u32, n - 1 - j as u32));
+            }
+            i = j + 1;
+        }
+        out
+    }
+}
+
+/// A raw value to a physical one (sign-extends signed signals).
+pub fn raw_to_phys(raw: u64, len: u32, signed: bool, factor: f64, offset: f64) -> f64 {
+    let v = if signed && len < 64 && raw >> (len - 1) & 1 == 1 { raw as i64 - (1i64 << len) } else { raw as i64 };
+    v as f64 * factor + offset
+}
+
+/// A physical value to a raw one: rounded to the nearest step, saturated to
+/// the raw range.
+pub fn phys_to_raw(value: f64, len: u32, signed: bool, factor: f64, offset: f64) -> u64 {
+    let steps = ((value - offset) / factor).round();
+    if signed {
+        let lo = -(1i64 << (len - 1)) as f64;
+        let hi = ((1i64 << (len - 1)) - 1) as f64;
+        let v = steps.clamp(lo, hi) as i64;
+        (v as u64) & mask(len)
+    } else {
+        steps.clamp(0.0, mask(len) as f64) as u64
     }
 }
 

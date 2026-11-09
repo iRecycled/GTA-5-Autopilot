@@ -1,0 +1,19 @@
+[package]
+name = "viz"
+version = "0.1.0"
+description = "The Rerun views (D8): bird's-eye view, vehicle-state plots, bus load per network, CAN trace, from the core's telemetry"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "adas-viz"
+path = "src/main.rs"
+
+[dependencies]
+adas-core = { path = "../adas-core" }
+adapter-api = { path = "../adapter-api" }
+record = { path = "../record" }
+telemetry = { path = "../telemetry" }
+# Must match the viewer's version (the pip wheel `rerun-sdk==0.42.0` provides it).
+rerun = { version = "=0.42.0", default-features = false, features = ["sdk"] }

@@ -7,6 +7,10 @@
 //! made with, and a replay can feed the core exactly what it saw live.
 //! Metadata `adas` holds what the replay needs to rebuild the core: the
 //! feature, its parameters and the initial engage-request flag.
+//!
+//! Between steps: `info` (adapter info), `profile` (a vehicle profile) and
+//! `fault` (a bus fault injected live, from the engineering panel). Each
+//! applies before the next step, live and in a replay.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -30,6 +34,31 @@ unsafe impl Raw for Command {}
 unsafe impl Raw for AdapterInfo {}
 unsafe impl Raw for Stick3 {}
 unsafe impl Raw for Profile {}
+unsafe impl Raw for FaultRec {}
+
+/// A bus fault injected (or faults cleared) between steps.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FaultRec {
+    /// 1 = inject, 2 = clear.
+    pub op: u32,
+    /// 0 chassis, 1 adas; for clear, `u32::MAX` = both.
+    pub bus: u32,
+    /// Message id; `u32::MAX` = every frame.
+    pub id: u32,
+    /// 0 drop, 1 corrupt, 2 delay.
+    pub kind: u32,
+    pub delay: f64,
+    pub p: f64,
+    /// Active for bus times in `[from, until)` (s).
+    pub from: f64,
+    pub until: f64,
+}
+
+impl FaultRec {
+    pub const INJECT: u32 = 1;
+    pub const CLEAR: u32 = 2;
+}
 
 /// A vehicle profile as applied to the core (D19), recorded so a replay
 /// applies it at the same step.
@@ -94,6 +123,7 @@ struct Channels {
     stick: u16,
     command: u16,
     info: u16,
+    fault: u16,
 }
 
 pub struct Recorder {
@@ -125,6 +155,7 @@ impl Recorder {
             stick: chan("stick", "adas.Stick")?,
             command: chan("command", "adas.Command")?,
             info: chan("info", "adas.AdapterInfo")?,
+            fault: chan("fault", "adas.Fault")?,
         };
         let mut meta = meta.clone();
         meta.insert("contract".into(), ver);
@@ -144,6 +175,11 @@ impl Recorder {
 
     pub fn info(&mut self, i: &AdapterInfo) -> io::Result<()> {
         self.put(self.ch.info, i.header.wall_time_ns, bytes_of(i))
+    }
+
+    /// A fault injected (or faults cleared) before the next step.
+    pub fn fault(&mut self, f: &FaultRec, t_ns: u64) -> io::Result<()> {
+        self.put(self.ch.fault, t_ns, bytes_of(f))
     }
 
     /// Records one core step.
@@ -175,6 +211,8 @@ pub struct Frame {
     pub info: Option<AdapterInfo>,
     /// A vehicle profile applied just before this step.
     pub profile: Option<Profile>,
+    /// Faults injected or cleared just before this step, in order.
+    pub faults: Vec<FaultRec>,
     pub sample: VehicleSample,
     pub actors: ActorList,
     pub stick: Option<Stick3>,
@@ -217,6 +255,7 @@ impl Recording {
         let mut truncated = false;
         let mut pending_info: Option<AdapterInfo> = None;
         let mut pending_profile: Option<Profile> = None;
+        let mut pending_faults: Vec<FaultRec> = Vec::new();
         for m in mcap::MessageStream::new(&data).map_err(|e| bad(e.to_string()))? {
             let m = match m {
                 Ok(m) => m,
@@ -231,6 +270,7 @@ impl Recording {
                 "sample" => frames.push(Frame {
                     info: pending_info.take(),
                     profile: pending_profile.take(),
+                    faults: std::mem::take(&mut pending_faults),
                     sample: from_bytes(&m.data).ok_or_else(|| bad("bad sample".into()))?,
                     actors: ActorList::default(),
                     stick: None,
@@ -252,6 +292,7 @@ impl Recording {
                     }
                 }
                 "profile" => pending_profile = from_bytes(&m.data),
+                "fault" => pending_faults.extend(from_bytes::<FaultRec>(&m.data)),
                 "info" => {
                     let i: Option<AdapterInfo> = from_bytes(&m.data);
                     if info.is_none() {
@@ -292,6 +333,11 @@ mod tests {
             s.header.wall_time_ns = i as u64 * 1000;
             let c = Command { answers_seq: i, throttle: 0.1 * i as f32, ..Default::default() };
             let stick = (i % 2 == 0).then_some(Stick3 { throttle: 0.5, brake: 0.0, steer: -0.25 });
+            if i == 3 {
+                let f = FaultRec { op: FaultRec::INJECT, bus: 1, id: u32::MAX, kind: 0, p: 1.0, from: 1.0, until: 3.0, ..Default::default() };
+                rec.fault(&f, 2500).unwrap();
+                rec.fault(&FaultRec { op: FaultRec::CLEAR, bus: u32::MAX, ..Default::default() }, 2600).unwrap();
+            }
             rec.step(&s, &actors, stick, &c).unwrap();
         }
         rec.finish().unwrap();
@@ -303,6 +349,10 @@ mod tests {
         assert_eq!(r.frames[2].command.unwrap().answers_seq, 3);
         assert_eq!(r.frames[1].stick.unwrap().steer, -0.25);
         assert!(r.frames[0].stick.is_none());
+        assert_eq!(r.frames[2].faults.len(), 2, "faults apply before the step they precede");
+        assert_eq!((r.frames[2].faults[0].bus, r.frames[2].faults[0].until), (1, 3.0));
+        assert_eq!(r.frames[2].faults[1].op, FaultRec::CLEAR);
+        assert!(r.frames[1].faults.is_empty() && r.frames[3].faults.is_empty());
         assert_eq!(r.frames[4].actors.as_slice().len(), 2);
         assert_eq!(r.frames[4].actors.actors[1].kind, ActorKind::Pedestrian);
         assert!(!r.truncated);

@@ -14,6 +14,10 @@ sensors = { path = "../sensors" }
 fusion = { path = "../fusion" }
 features = { path = "../features" }
 can = { path = "../can" }
+telemetry = { path = "../telemetry" }
+
+[build-dependencies]
+can = { path = "../can" }
 
 [[bin]]
 name = "adas-core"

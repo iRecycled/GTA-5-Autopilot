@@ -19,6 +19,8 @@ pub mod actuators;
 pub mod degrade;
 pub mod features;
 pub mod layout;
+pub mod msgs;
+pub mod telem;
 pub mod vbus;
 
 use adapter_api::{ActorList, AdapterInfo, Command, Hud, SensorLayout, VehicleSample, buttons, command_flags, hud_flags, sample_flags};
@@ -113,6 +115,8 @@ pub struct Core {
     radar_last: Option<u64>,
     scan_arrived: bool,
     avail: degrade::Availability,
+    /// Track ids of the follow lead and the collision threat, last step (for views).
+    lead_ids: (Option<u32>, Option<u32>),
 }
 
 /// Starting guess for the brake gain (m/s² per unit of brake demand); learned
@@ -181,7 +185,18 @@ impl Core {
             radar_last: None,
             scan_arrived: false,
             avail: degrade::evaluate(None, degrade::Health::default()),
+            lead_ids: (None, None),
         }
+    }
+
+    /// Track ids of the follow lead and the collision threat after the last step.
+    pub fn lead_ids(&self) -> (Option<u32>, Option<u32>) {
+        self.lead_ids
+    }
+
+    /// The longitudinal acceleration estimate (m/s²).
+    pub fn accel_estimate(&self) -> f32 {
+        self.a_est
     }
 
     pub fn state(&self) -> State {
@@ -251,6 +266,7 @@ impl Core {
         // From here on the core works on the car as the ADAS ECU sees it on
         // the bus, not on the host's exact values.
         let (follow, threat, bus_speed, bus_yaw) = self.perceive(host, inp.actors, dt, host.flags & sample_flags::PAUSED != 0);
+        self.lead_ids = (follow.map(|l| l.id), threat.map(|l| l.id));
         let mut view = *host;
         view.speed = bus_speed;
         view.vx = bus_speed;

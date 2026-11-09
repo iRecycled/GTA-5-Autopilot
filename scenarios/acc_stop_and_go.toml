@@ -1,0 +1,27 @@
+# Traffic jam: the lead slows from 50 km/h to a stop, waits, then pulls away.
+# ACC stops behind it at the standstill gap and follows it off again.
+name = "ACC: stop and go"
+feature = "acc"
+duration = 50.0
+
+[ego]
+speed_kph = 50
+engage_at = 0.5
+set_kph = 50
+
+[[actor]]
+s = 40
+speed_kph = 50
+[[actor.event]]
+t = 15
+speed_kph = 0
+accel = 2.0
+[[actor.event]]
+t = 30
+speed_kph = 40
+accel = 1.5
+
+[pass]
+max_aeb = 0
+max_jerk = 2.5
+end_speed_above = 8.0

@@ -1,0 +1,11 @@
+[package]
+name = "sim"
+version = "0.1.0"
+description = "Closed-loop simulator producing the adapter contract's messages: tests the core without any game (D20)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+adapter-api = { path = "../adapter-api" }
+geom = { path = "../geom" }

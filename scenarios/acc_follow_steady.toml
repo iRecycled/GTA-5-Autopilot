@@ -1,0 +1,24 @@
+# Highway follow: ACC set to 100 km/h closes on an 80 km/h lead and settles at
+# the 2.0 s time gap. Phase 1 gate: gap error ≤ 0.3 s, jerk ≤ 2.5 m/s³, no AEB.
+name = "ACC: follow a slower lead at the time gap"
+feature = "acc"
+duration = 60.0
+
+[ego]
+speed_kph = 90
+engage_at = 0.5
+set_kph = 100
+
+[[actor]]
+s = 90
+speed_kph = 80
+
+[repeat]
+count = 10
+vary_s = 40
+
+[pass]
+max_jerk = 2.5
+gap_error_s = 0.3
+steady = [40.0, 60.0]
+max_aeb = 0

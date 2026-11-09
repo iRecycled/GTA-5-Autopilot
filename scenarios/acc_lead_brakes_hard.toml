@@ -1,0 +1,26 @@
+# Following at 90 km/h, the lead brakes at 7 m/s² to a stop. ACC alone may
+# not be enough; AEB backs it up. No collision, stopped with room to spare.
+name = "ACC: the lead brakes hard to a stop"
+feature = "acc"
+duration = 45.0
+
+[ego]
+speed_kph = 90
+engage_at = 0.5
+set_kph = 90
+
+[[actor]]
+s = 55
+speed_kph = 90
+[[actor.event]]
+t = 25
+speed_kph = 0
+accel = 7.0
+
+[repeat]
+count = 10
+vary_s = 10
+
+[pass]
+min_stop_gap = 1.0
+end_speed_below = 0.1

@@ -1,0 +1,21 @@
+# Phase 1 gate: AEB stops before a stationary car from 50 km/h in 10 of 10
+# runs. Nothing is engaged: a driver cruises at 50 km/h and doesn't react.
+name = "AEB: stationary car ahead at 50 km/h"
+feature = "none"
+duration = 20.0
+
+[ego]
+speed_kph = 50
+
+[[actor]]
+s = 80
+speed_kph = 0
+
+[repeat]
+count = 10
+vary_s = 30
+
+[pass]
+min_aeb = 1
+min_stop_gap = 0.3
+end_speed_below = 0.1

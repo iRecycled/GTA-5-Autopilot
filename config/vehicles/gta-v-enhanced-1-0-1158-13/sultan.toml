@@ -1,0 +1,5 @@
+# Vehicle profile (D19) for SULTAN on GTA V Enhanced 1.0.1158.13.
+# Learned on line by adas-core; edit by hand only with the core stopped.
+
+# Deceleration per unit of brake demand (m/s^2).
+brake_gain = 43.278

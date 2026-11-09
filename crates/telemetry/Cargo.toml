@@ -1,0 +1,9 @@
+[package]
+name = "telemetry"
+version = "0.1.0"
+description = "The core's live telemetry stream (steps, CAN frames, events) and the panel's control messages, over UDP on localhost"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

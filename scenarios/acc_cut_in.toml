@@ -1,0 +1,30 @@
+# At 100 km/h, a 90 km/h car in the left lane cuts in about 25 m ahead.
+# ACC must back off smoothly, without an emergency stop.
+name = "ACC: a car cuts in close ahead"
+feature = "acc"
+duration = 40.0
+
+[ego]
+speed_kph = 100
+engage_at = 0.5
+set_kph = 100
+
+[[actor]]
+s = 30
+lane = 1
+speed_kph = 90
+[[actor.event]]
+t = 1.5
+lane = 0
+duration = 3.0
+
+[repeat]
+count = 5
+vary_s = 10
+
+[pass]
+max_aeb = 0
+# A cut-in needs firmer braking than steady following, but no lurch.
+max_jerk = 5.0
+gap_error_s = 0.3
+steady = [32.0, 40.0]

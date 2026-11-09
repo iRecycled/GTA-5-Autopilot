@@ -1,0 +1,38 @@
+# Bus topology (D17): every bus, every ECU and the buses it sits on.
+# Phase 1 has two buses (D9); body CAN and a gateway arrive in Phase 4.
+
+[[bus]]
+name = "chassis"
+kind = "classic"          # CAN 2.0
+nominal_bps = 500_000
+dbc = "dbc/toyota_nodsu_pt_generated.dbc"
+
+[[bus]]
+name = "adas"
+kind = "fd"               # CAN FD with bit-rate switching
+nominal_bps = 500_000
+data_bps = 2_000_000
+dbc = "dbc/adas_canfd.dbc"
+
+# Chassis ECUs publish what the car measures (D9): wheel speeds, steering
+# angle, yaw rate, vehicle speed, driver pedals. Cycle times follow the TSS2
+# cars they are modelled on.
+[[ecu]]
+name = "abs"              # wheel speeds, vehicle speed, brake pedal
+buses = ["chassis"]
+
+[[ecu]]
+name = "eps"              # steering angle sensor, EPS status
+buses = ["chassis"]
+
+[[ecu]]
+name = "imu"              # yaw rate and lateral acceleration
+buses = ["chassis"]
+
+[[ecu]]
+name = "front_radar"      # object list (D25)
+buses = ["adas"]
+
+[[ecu]]
+name = "adas"             # the ADAS ECU: features; on both buses (D9)
+buses = ["chassis", "adas"]

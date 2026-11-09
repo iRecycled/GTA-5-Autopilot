@@ -1,0 +1,28 @@
+# The ADAS ECU's acceleration requests (ACC_CONTROL) never reach the
+# powertrain: ACC can't brake for a lead that brakes hard to a stop. AEB's
+# request travels in its own message (PRE_COLLISION_2) and stops the car.
+name = "Fault: ACC_CONTROL lost, AEB still stops the car"
+feature = "acc"
+duration = 40.0
+
+[ego]
+speed_kph = 60
+engage_at = 0.5
+
+[[actor]]
+s = 50
+speed_kph = 60
+[[actor.event]]
+t = 10
+speed_kph = 0
+accel = 6.0
+
+[[fault]]
+bus = "chassis"
+message = "ACC_CONTROL"
+kind = "drop"
+
+[pass]
+min_aeb = 1
+end_speed_below = 0.1
+min_stop_gap = 0.5

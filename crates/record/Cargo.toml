@@ -1,0 +1,12 @@
+[package]
+name = "record"
+version = "0.1.0"
+description = "Drive recordings in MCAP: everything the core consumes and produces, for replay (D20)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+adapter-api = { path = "../adapter-api" }
+# No compression features: zstd and lz4 pull in C code.
+mcap = { version = "0.26", default-features = false }

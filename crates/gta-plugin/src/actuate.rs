@@ -80,15 +80,24 @@ pub fn hold(veh: i32, on: bool) {
 pub struct ReleaseRamp {
     brake: f32,
     rate: f32,
+    /// Keep braking until the car stops (AEB was braking when the core went away).
+    to_stop: bool,
 }
 
 impl ReleaseRamp {
     pub fn new() -> Self {
-        Self { brake: 0.0, rate: 0.0 }
+        Self { brake: 0.0, rate: 0.0, to_stop: false }
     }
     pub fn start(&mut self, brake: f32) {
         self.brake = brake.clamp(0.0, 1.0);
         self.rate = self.brake; // per second → about 1 s to zero
+        self.to_stop = false;
+    }
+    /// D24: if AEB was braking, keep braking to a stop.
+    pub fn start_to_stop(&mut self, brake: f32) {
+        self.brake = brake.clamp(0.3, 1.0);
+        self.rate = 0.0;
+        self.to_stop = true;
     }
     pub fn active(&self) -> bool {
         self.brake > 0.0
@@ -97,7 +106,11 @@ impl ReleaseRamp {
         self.brake = 0.0;
     }
     /// Applies this frame's ramp brake.
-    pub fn step(&mut self, dt: f32) {
+    pub fn step(&mut self, dt: f32, speed: f32) {
+        if self.to_stop && speed < 0.3 {
+            self.brake = 0.0;
+            self.to_stop = false;
+        }
         if self.brake > 0.0 {
             pedals(0.0, self.brake);
             self.brake = (self.brake - self.rate * dt).max(0.0);

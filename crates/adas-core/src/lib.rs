@@ -70,7 +70,18 @@ pub struct Core {
     acc: ::features::Acc,
     aeb: ::features::Aeb,
     hud: Hud,
+    /// Longitudinal acceleration estimated from speed (m/s², low-passed).
+    a_est: f32,
+    prev_speed: Option<f32>,
+    /// The AEB deceleration loop's integral (brake demand).
+    aeb_i: f32,
 }
+
+/// Feed-forward guess for the AEB deceleration loop: deceleration per unit of
+/// brake demand (m/s²). The integral corrects for the host's real brakes.
+const BRAKE_FF_GAIN: f32 = 8.0;
+/// Integral gain of the AEB deceleration loop (demand per m/s²·s).
+const AEB_KI: f32 = 0.35;
 
 impl Core {
     /// `initial_request`: the engage-request flag as first seen, so a request
@@ -101,6 +112,9 @@ impl Core {
             acc: ::features::Acc::new(acc_cfg),
             aeb: ::features::Aeb::new(Default::default()),
             hud: Hud::default(),
+            a_est: 0.0,
+            prev_speed: None,
+            aeb_i: 0.0,
         }
     }
 
@@ -148,6 +162,15 @@ impl Core {
         let dt = if self.last_game_us == 0 { 0.0 } else { s.header.game_time_us.saturating_sub(self.last_game_us) as f32 / 1e6 };
         self.last_game_us = s.header.game_time_us;
 
+        // Acceleration from speed (the deceleration loop's feedback).
+        if dt > 0.0 && !paused {
+            if let Some(p) = self.prev_speed {
+                let a = (s.speed - p) / dt;
+                self.a_est += (a - self.a_est) * (dt / 0.08).min(1.0);
+            }
+            self.prev_speed = Some(s.speed);
+        }
+
         // --- Perception (always) ---
         let (follow, threat) = self.perceive(s, inp.actors, dt, paused);
 
@@ -155,9 +178,9 @@ impl Core {
         let aeb = if paused || dt <= 0.0 || self.info.is_none() {
             None
         } else {
-            Some(self.aeb.step(dt, s.speed, threat, s.driver_throttle))
+            Some(self.aeb.step(dt, s.speed, threat, s.driver_throttle, s.driver_brake))
         };
-        let aeb_braking = aeb.is_some_and(|a| a.brake > 0.0 || a.hold);
+        let aeb_braking = aeb.is_some_and(|a| a.decel > 0.0 || a.hold);
 
         // --- Engagement ---
         let mut event = Event::None;
@@ -237,11 +260,20 @@ impl Core {
             if a.warn {
                 cmd.flags |= command_flags::FCW;
             }
-            if a.brake > 0.0 {
+            if a.decel > 0.0 {
+                // Track the requested deceleration on the host's brakes.
+                let brake = if a.decel.is_finite() {
+                    self.aeb_i = (self.aeb_i + AEB_KI * (a.decel + self.a_est) * dt).clamp(-0.6, 0.6);
+                    (a.decel / BRAKE_FF_GAIN + self.aeb_i).clamp(0.05, 1.0)
+                } else {
+                    1.0
+                };
                 cmd.flags |= command_flags::AEB;
                 cmd.throttle = 0.0;
-                cmd.brake = cmd.brake.max(a.brake);
+                cmd.brake = cmd.brake.max(brake);
                 cmd.flags &= !command_flags::HOLD;
+            } else {
+                self.aeb_i = 0.0;
             }
             if a.hold {
                 cmd.flags |= command_flags::AEB | command_flags::HOLD;

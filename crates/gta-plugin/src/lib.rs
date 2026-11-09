@@ -9,8 +9,11 @@
 //! - on release, steering stops at once, throttle is dropped and any brake
 //!   fades out over about a second; TAKE OVER shows on the HUD.
 //!
-//! Dev keys: F6 60 fps cap · F7 teleport to the next test spot · F8 spawn a
-//! Sultan · F9 GTA AI drives · F10 engage / cancel.
+//! Driver keys: F10 engage / cancel ACC · Page Up / Page Down set speed ±5 km/h
+//! · Home cycle the time gap. AEB is always armed.
+//! Test keys: F6 60 fps cap · F7 teleport to the next test spot · F8 spawn a
+//! Sultan · F9 GTA AI drives · F11 spawn a lead car ahead (12 m/s) · F5 the
+//! lead brakes hard · F4 spawn a stopped car ahead.
 //!
 //! Logs: `<game folder>/adas-logs/adas-<unix time>.log` and `-frames.csv`.
 
@@ -31,7 +34,8 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use adapter_api::shm::{DEFAULT_NAME, SharedLink};
 use adapter_api::{
-    ActorList, AdapterInfo, CONTRACT_VERSION, Header, MsgKind, VehicleSample, caps, command_flags, fixed_str, sample_flags, wall_time_ns,
+    ActorList, AdapterInfo, CONTRACT_VERSION, Header, MsgKind, VehicleSample, buttons, caps, command_flags, fixed_str, hud_flags, sample_flags,
+    wall_time_ns,
 };
 use shv_sys::{Vector3, invoke};
 
@@ -43,6 +47,12 @@ const VK_F7: i32 = 0x76;
 const VK_F8: i32 = 0x77;
 const VK_F9: i32 = 0x78;
 const VK_F10: i32 = 0x79;
+const VK_F4: i32 = 0x73;
+const VK_F5: i32 = 0x74;
+const VK_F11: i32 = 0x7A;
+const VK_PRIOR: i32 = 0x21;
+const VK_NEXT: i32 = 0x22;
+const VK_HOME: i32 = 0x24;
 
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -95,7 +105,7 @@ fn run_stem() -> String {
 }
 
 struct Keys {
-    prev: [bool; 5],
+    prev: [bool; 11],
 }
 
 impl Keys {
@@ -174,7 +184,10 @@ fn run() {
     };
     let _ = log.flush();
 
-    let mut keys = Keys { prev: [false; 5] };
+    let mut keys = Keys { prev: [false; 11] };
+    let mut lead: Option<tools::Lead> = None;
+    let mut aeb_last = false;
+    let mut fcw_last = false;
     let mut cap60 = false;
     let mut spot = 0usize;
     let mut test_car = 0i32;
@@ -257,6 +270,27 @@ fn run() {
             }
             ramp.cancel();
             let _ = writeln!(log, "frame {frame}: engage request {}", if engage_req { "ON" } else { "OFF" });
+        }
+        let mut btn = 0u32;
+        if keys.pressed(5, VK_PRIOR) {
+            btn |= buttons::SPEED_UP;
+        }
+        if keys.pressed(6, VK_NEXT) {
+            btn |= buttons::SPEED_DOWN;
+        }
+        if keys.pressed(7, VK_HOME) {
+            btn |= buttons::GAP;
+        }
+        if keys.pressed(8, VK_F11) && in_vehicle {
+            tools::spawn_lead(veh, 50.0, 12.0, &mut lead, &mut log);
+            last_tick = wall_time_ns();
+        }
+        if keys.pressed(9, VK_F4) && in_vehicle {
+            tools::spawn_lead(veh, 70.0, 0.0, &mut lead, &mut log);
+            last_tick = wall_time_ns();
+        }
+        if keys.pressed(10, VK_F5) {
+            tools::lead_brake(&lead, &mut log);
         }
         if !in_vehicle {
             engage_req = false;
@@ -346,6 +380,7 @@ fn run() {
             | if engage_req { sample_flags::ENGAGE_REQUEST } else { 0 }
             | if driver_override { sample_flags::DRIVER_OVERRIDE } else { 0 }
             | if driver_cancel { sample_flags::DRIVER_CANCEL } else { 0 };
+        s.buttons = btn;
         seq = seq.wrapping_add(1);
         s.header = Header { kind: MsgKind::VehicleSample, version: CONTRACT_VERSION, seq, frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() };
         link.sample.write(&s);
@@ -396,6 +431,23 @@ fn run() {
         let fresh = cmd.answers_seq != 0 && age <= WATCHDOG_FRAMES && !core_exited;
         let core_engaged = cmd.flags & command_flags::ENGAGED != 0;
         let active = in_vehicle && engage_req && core_engaged && fresh && !paused;
+        // AEB acts whether or not anything is engaged, and over the accelerator.
+        let aeb = in_vehicle && fresh && !paused && cmd.flags & command_flags::AEB != 0;
+        if aeb && engage_req {
+            engage_req = false;
+            let _ = writeln!(log, "frame {frame}: AEB: ACC cancelled");
+        }
+        if aeb && !aeb_last {
+            let _ = writeln!(log, "frame {frame}: AEB braking ({:.1} m/s, brake {:.2})", s.speed, cmd.brake);
+        }
+        if aeb_last && !fresh && in_vehicle && s.speed > 0.3 {
+            // D24: the core went away while AEB was braking: brake to a stop.
+            ramp.start_to_stop(last_brake);
+            takeover_until = wall_time_ns() + 3_000_000_000;
+            takeover_why = "core stopped during AEB";
+            let _ = writeln!(log, "frame {frame}: core lost during AEB: braking to a stop");
+        }
+        aeb_last = aeb;
         let release = if engage_req && was_active && !fresh {
             Some(if core_exited { Release::CoreExited } else { Release::Stalled })
         } else {
@@ -413,14 +465,14 @@ fn run() {
                 ramp.start(last_brake);
             }
         }
-        if active {
-            if cmd.flags & command_flags::STEER != 0 {
+        if active || aeb {
+            if active && cmd.flags & command_flags::STEER != 0 {
                 steering.apply(base, &off, cmd.steer_angle, measured_angle);
             } else {
                 steering.reset();
             }
-            let want_hold = cmd.flags & command_flags::HOLD != 0 && !driver_override;
-            if !driver_override {
+            let want_hold = cmd.flags & command_flags::HOLD != 0 && (!driver_override || aeb);
+            if !driver_override || aeb {
                 actuate::pedals(cmd.throttle, cmd.brake);
                 last_brake = cmd.brake;
             }
@@ -437,13 +489,13 @@ fn run() {
                 hold_on = false;
             }
             if in_vehicle && !paused {
-                ramp.step(dt);
+                ramp.step(dt, s.speed);
             }
             if !was_active || !ramp.active() {
                 last_brake = 0.0;
             }
         }
-        was_active = active;
+        was_active = active || aeb;
         let t_end = wall_time_ns();
         let work_ns = (t_end - t_frame) - (t_waited - t_wait);
         win_work.push(work_ns);
@@ -520,7 +572,14 @@ fn run() {
             let _ = csv.flush();
         }
 
-        // --- HUD ---
+        // --- HUD (what the core says the driver should see, D8) ---
+        let (_, hud) = link.hud.read();
+        let hud_live = fresh && hud.header.frame + 6 >= frame as u64;
+        let fcw = hud_live && hud.flags & (hud_flags::FCW | hud_flags::AEB) != 0;
+        if fcw && !fcw_last {
+            let () = unsafe { invoke!(n::PLAY_SOUND_FRONTEND, -1i32, c"TIMER_STOP", c"HUD_MINI_GAME_SOUNDSET", true) };
+        }
+        fcw_last = fcw;
         unsafe {
             let () = invoke!(n::DRAW_RECT, 0.25f32, 0.065f32, 0.48f32, 0.11f32, 0i32, 0i32, 0i32, 160i32, false);
             let (label, colour) = if wall_time_ns() < takeover_until {
@@ -539,7 +598,41 @@ fn run() {
             draw_text(0.015, 0.012, &format!("ADAS | {:.0} km/h | {label}", s.speed * 3.6), colour);
             draw_text(0.015, 0.037, &hud2, (255, 255, 255));
             let warn = if edition.verified { "" } else { " | UNVERIFIED GAME BUILD" };
-            draw_text(0.015, 0.062, &format!("F10 engage | F7 teleport | F8 sultan | F9 AI | F6 cap60 {}{warn}", if cap60 { "ON" } else { "off" }), (255, 255, 255));
+            draw_text(
+                0.015,
+                0.062,
+                &format!(
+                    "F10 ACC | PgUp/PgDn speed | Home gap | F11 lead | F5 lead brakes | F4 stopped car | F7 tp | F8 car | F9 AI | F6 cap60 {}{warn}",
+                    if cap60 { "ON" } else { "off" }
+                ),
+                (255, 255, 255),
+            );
+            // The driver display: ACC state, set speed, gap bars, lead.
+            if hud_live {
+                let acc = hud.flags & hud_flags::ACC != 0;
+                let bars = "|".repeat(hud.gap_index as usize + 1);
+                let lead_txt = if hud.flags & hud_flags::LEAD != 0 {
+                    format!("lead {:.0} m @ {:.0} km/h", hud.lead_gap, hud.lead_speed * 3.6)
+                } else {
+                    "no lead".to_string()
+                };
+                let hold = if hud.flags & hud_flags::HOLD != 0 { " | HOLD" } else { "" };
+                let colour = if acc { (80, 220, 120) } else { (180, 180, 180) };
+                let () = invoke!(n::DRAW_RECT, 0.5f32, 0.925f32, 0.34f32, 0.045f32, 0i32, 0i32, 0i32, 170i32, false);
+                draw_text(
+                    0.34,
+                    0.91,
+                    &format!("{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}", if acc { "ACC" } else { "ACC off" }, hud.set_speed * 3.6, hud.time_gap),
+                    colour,
+                );
+            }
+            if fcw {
+                if (frame / 6) % 2 == 0 {
+                    let () = invoke!(n::DRAW_RECT, 0.5f32, 0.4f32, 0.3f32, 0.08f32, 200i32, 20i32, 20i32, 200i32, false);
+                }
+                let txt = if hud.flags & hud_flags::AEB != 0 { "EMERGENCY BRAKING" } else { "BRAKE!" };
+                draw_text(0.42, 0.385, txt, (255, 255, 255));
+            }
         }
 
         unsafe { shv_sys::scriptWait(0) };

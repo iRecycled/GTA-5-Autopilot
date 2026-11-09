@@ -122,3 +122,82 @@ pub fn ai_drive(ped: i32, veh: i32, on: bool) {
         }
     }
 }
+
+/// A scripted lead car for ACC/AEB tests: spawned `distance` m ahead on the
+/// ego car's heading, driven by an AI driver straight ahead at `speed` m/s
+/// (or parked with no driver when `speed` is 0).
+pub struct Lead {
+    pub veh: i32,
+    pub ped: i32,
+}
+
+fn load_model(name: &core::ffi::CStr) -> Option<u32> {
+    unsafe {
+        let model: u32 = invoke!(n::GET_HASH_KEY, name);
+        let () = invoke!(n::REQUEST_MODEL, model);
+        for _ in 0..300 {
+            let loaded: bool = invoke!(n::HAS_MODEL_LOADED, model);
+            if loaded {
+                return Some(model);
+            }
+            shv_sys::scriptWait(0);
+        }
+        None
+    }
+}
+
+pub fn clear_lead(lead: &mut Option<Lead>) {
+    if let Some(mut l) = lead.take() {
+        unsafe {
+            if l.ped != 0 {
+                let () = invoke!(n::SET_ENTITY_AS_MISSION_ENTITY, l.ped, true, true);
+                let () = invoke!(n::DELETE_PED, &mut l.ped as *mut i32);
+            }
+            let () = invoke!(n::SET_ENTITY_AS_MISSION_ENTITY, l.veh, true, true);
+            let () = invoke!(n::DELETE_VEHICLE, &mut l.veh as *mut i32);
+        }
+    }
+}
+
+pub fn spawn_lead(ego: i32, distance: f32, speed: f32, lead: &mut Option<Lead>, log: &mut impl Write) {
+    clear_lead(lead);
+    let (Some(car), Some(driver)) = (load_model(c"blista"), load_model(c"a_m_y_business_01")) else {
+        let _ = writeln!(log, "LEAD: models did not load");
+        return;
+    };
+    unsafe {
+        let pos: Vector3 = invoke!(n::GET_ENTITY_COORDS, ego, true);
+        let fwd: Vector3 = invoke!(n::GET_ENTITY_FORWARD_VECTOR, ego);
+        let heading: f32 = invoke!(n::GET_ENTITY_HEADING, ego);
+        let (x, y) = (pos.x + fwd.x * distance, pos.y + fwd.y * distance);
+        let veh: i32 = invoke!(n::CREATE_VEHICLE, car, x, y, pos.z + 0.5, heading, false, false, false);
+        let _: bool = invoke!(n::SET_VEHICLE_ON_GROUND_PROPERLY, veh, 5.0f32);
+        let mut ped = 0i32;
+        if speed > 0.0 {
+            ped = invoke!(n::CREATE_PED_INSIDE_VEHICLE, veh, 26i32, driver, -1i32, false, false);
+            let () = invoke!(n::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, ped, true);
+            let () = invoke!(n::SET_PED_KEEP_TASK, ped, true);
+            let () = invoke!(n::SET_VEHICLE_ENGINE_ON, veh, true, true, false);
+            let (tx, ty) = (pos.x + fwd.x * 3000.0, pos.y + fwd.y * 3000.0);
+            // Straight-line driving for the whole distance (no road network on the apron).
+            let () = invoke!(n::TASK_VEHICLE_DRIVE_TO_COORD, ped, veh, tx, ty, pos.z, speed, 0i32, car, 786_603i32, 5.0f32, 3000.0f32);
+            let () = invoke!(n::SET_VEHICLE_FORWARD_SPEED, veh, speed);
+        } else {
+            let () = invoke!(n::SET_VEHICLE_ENGINE_ON, veh, false, true, true);
+        }
+        let () = invoke!(n::SET_MODEL_AS_NO_LONGER_NEEDED, car);
+        let () = invoke!(n::SET_MODEL_AS_NO_LONGER_NEEDED, driver);
+        let _ = writeln!(log, "LEAD spawned {distance:.0} m ahead, {speed:.1} m/s (veh {veh}, driver {ped})");
+        *lead = Some(Lead { veh, ped });
+    }
+}
+
+/// The lead brakes until it stops (TASK_VEHICLE_TEMP_ACTION 27).
+pub fn lead_brake(lead: &Option<Lead>, log: &mut impl Write) {
+    if let Some(l) = lead
+        && l.ped != 0
+    {
+        let () = unsafe { invoke!(n::TASK_VEHICLE_TEMP_ACTION, l.ped, l.veh, 27i32, 15_000i32) };
+        let _ = writeln!(log, "LEAD brakes hard");
+    }
+}

@@ -22,6 +22,17 @@ fn same(a: &Command, b: &Command) -> bool {
         && a.diag.iter().zip(&b.diag).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
+/// Ground truth, for scoring only: bumper gap to the nearest actor ahead in
+/// the ego lane (|y| < 1.5 m), or NaN.
+fn gt_gap(actors: &adapter_api::ActorList, front: f32) -> f32 {
+    actors
+        .as_slice()
+        .iter()
+        .filter(|a| a.y.abs() < 1.5 && a.x > 0.0)
+        .map(|a| a.x - 0.5 * a.length - front)
+        .fold(f32::NAN, |m, g| if m.is_nan() || g < m { g } else { m })
+}
+
 fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> {
     let rec = Recording::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if rec.truncated {
@@ -35,12 +46,14 @@ fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> 
         None => None,
     };
     if let Some(w) = out.as_mut() {
-        let _ = writeln!(w, "frame,t_s,speed,actors,flags,throttle,brake,steer,diag0,diag1,diag2,diag3,hud_flags,lead_gap,lead_speed,ttc,match");
+        let _ = writeln!(w, "frame,t_s,speed,actors,flags,throttle,brake,steer,diag0,diag1,diag2,diag3,hud_flags,lead_gap,lead_speed,ttc,gt_gap,match");
     }
     let (mut compared, mut diffs) = (0usize, 0usize);
+    let mut front = rec.info.map(|i| i.box_max[0]).unwrap_or(2.3);
     for (i, f) in rec.frames.iter().enumerate() {
         if let Some(info) = &f.info {
             core.set_info(info);
+            front = info.box_max[0];
         }
         let stick = f.stick.map(|s| Stick { throttle: s.throttle, brake: s.brake, steer: s.steer });
         let (c, _) = core.step(Inputs { sample: &f.sample, actors: &f.actors, stick });
@@ -64,7 +77,7 @@ fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> 
         if let Some(w) = out.as_mut() {
             let _ = writeln!(
                 w,
-                "{},{:.3},{:.3},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.2},{:.2},{:.2},{}",
+                "{},{:.3},{:.3},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.2},{:.2},{:.2},{:.2},{}",
                 f.sample.header.frame,
                 f.sample.header.game_time_us as f64 / 1e6,
                 f.sample.speed,
@@ -81,6 +94,7 @@ fn replay(path: &Path, csv: Option<&PathBuf>) -> Result<(usize, usize), String> 
                 core.hud().lead_gap,
                 core.hud().lead_speed,
                 core.hud().ttc,
+                gt_gap(&f.actors, front),
                 ok as u8
             );
         }

@@ -2,8 +2,11 @@
 //!
 //! Time to collision (TTC) = gap ÷ closing speed. Stages, as in the PRD:
 //! warn at about 2.5 s, partial braking at about 1.6 s, full braking at about
-//! 0.9 s. Once AEB has brought the car to a stop it holds it there until the
-//! driver presses the accelerator. AEB runs whether or not ACC is engaged.
+//! 0.9 s. Braking stages request a *deceleration* (as a production AEB asks
+//! the brake controller), not a pedal position: hosts' brakes differ (GTA's
+//! give about 11 m/s² at half pedal). Once AEB has brought the car to a stop it
+//! holds it for a few seconds, until the driver presses a pedal, then hands
+//! over. AEB runs whether or not ACC is engaged.
 //!
 //! Besides TTC, the stages also trigger on the deceleration needed to stop in
 //! time, v_rel² / 2·(gap − margin), as production AEB does: at low closing
@@ -24,8 +27,11 @@ pub struct AebConfig {
     pub full_ttc: f32,
     /// Leave a stage when TTC is this much above its threshold (s).
     pub hysteresis: f32,
-    /// Brake demand in the partial stage (0..=1).
-    pub partial_brake: f32,
+    /// Deceleration requested in the partial stage (m/s²); the full stage
+    /// asks for the maximum.
+    pub partial_decel_cmd: f32,
+    /// Standstill hold after an AEB stop (s), then the driver takes over.
+    pub hold_time: f32,
     /// Ignore threats below this ego speed (m/s): parking manoeuvres.
     pub min_speed: f32,
     /// Ignore closing speeds below this (m/s).
@@ -48,7 +54,8 @@ impl Default for AebConfig {
             partial_ttc: 1.6,
             full_ttc: 0.9,
             hysteresis: 0.4,
-            partial_brake: 0.5,
+            partial_decel_cmd: 4.0,
+            hold_time: 3.0,
             min_speed: 2.0,
             min_closing: 1.0,
             min_brake_time: 0.5,
@@ -83,8 +90,8 @@ pub struct Aeb {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AebRequest {
     pub stage: AebStage,
-    /// Brake demand (0..=1); 0 when not braking.
-    pub brake: f32,
+    /// Requested deceleration (m/s²): 0 when not braking, infinite for full.
+    pub decel: f32,
     /// Hold the car at a standstill.
     pub hold: bool,
     /// Warn the driver (FCW chime and flash).
@@ -103,7 +110,7 @@ impl Aeb {
         Self { cfg, stage: AebStage::Off, in_stage: 0.0, activations: 0 }
     }
 
-    pub fn step(&mut self, dt: f32, ego_speed: f32, threat: Option<Lead>, driver_throttle: f32) -> AebRequest {
+    pub fn step(&mut self, dt: f32, ego_speed: f32, threat: Option<Lead>, driver_throttle: f32, driver_brake: f32) -> AebRequest {
         let c = self.cfg;
         let t = threat.map(|l| ttc(&l, ego_speed)).unwrap_or(f32::INFINITY);
         let closing = threat.map(|l| ego_speed - l.v).unwrap_or(0.0);
@@ -134,7 +141,7 @@ impl Aeb {
 
         let next = match self.stage {
             AebStage::Hold => {
-                if driver_throttle > 0.05 { AebStage::Off } else { AebStage::Hold }
+                if driver_throttle > 0.05 || driver_brake > 0.1 || self.in_stage >= c.hold_time { AebStage::Off } else { AebStage::Hold }
             }
             _ if driver_throttle > c.driver_cancel_throttle => AebStage::Off,
             AebStage::Partial | AebStage::Full if ego_speed < 0.3 => AebStage::Hold,
@@ -159,12 +166,12 @@ impl Aeb {
             self.stage = next;
             self.in_stage = 0.0;
         }
-        let brake = match self.stage {
-            AebStage::Partial => c.partial_brake,
-            AebStage::Full => 1.0,
+        let decel = match self.stage {
+            AebStage::Partial => c.partial_decel_cmd,
+            AebStage::Full => f32::INFINITY,
             _ => 0.0,
         };
-        AebRequest { stage: self.stage, brake, hold: self.stage == AebStage::Hold, warn: self.stage >= AebStage::Warn && self.stage != AebStage::Hold, ttc: t }
+        AebRequest { stage: self.stage, decel, hold: self.stage == AebStage::Hold, warn: self.stage >= AebStage::Warn && self.stage != AebStage::Hold, ttc: t }
     }
 }
 
@@ -180,27 +187,27 @@ mod tests {
     fn stages_with_falling_ttc() {
         let mut a = Aeb::new(AebConfig::default());
         let v = 14.0; // 50 km/h toward a stopped car
-        assert_eq!(a.step(0.01, v, Some(lead(50.0, 0.0)), 0.0).stage, AebStage::Off); // 3.6 s
+        assert_eq!(a.step(0.01, v, Some(lead(50.0, 0.0)), 0.0, 0.0).stage, AebStage::Off); // 3.6 s
         // 34 m: TTC 2.4 s and 2.97 m/s² needed: warn only.
-        assert_eq!(a.step(0.01, v, Some(lead(34.0, 0.0)), 0.0).stage, AebStage::Warn);
-        let r = a.step(0.01, v, Some(lead(24.0, 0.0)), 0.0); // 1.7 s, 4.3 m/s² needed
-        assert_eq!((r.stage, r.brake), (AebStage::Partial, 0.5));
-        let r = a.step(0.01, v, Some(lead(10.0, 0.0)), 0.0); // 0.7 s
-        assert_eq!((r.stage, r.brake), (AebStage::Full, 1.0));
+        assert_eq!(a.step(0.01, v, Some(lead(34.0, 0.0)), 0.0, 0.0).stage, AebStage::Warn);
+        let r = a.step(0.01, v, Some(lead(24.0, 0.0)), 0.0, 0.0); // 1.7 s, 4.3 m/s² needed
+        assert_eq!((r.stage, r.decel), (AebStage::Partial, 4.0));
+        let r = a.step(0.01, v, Some(lead(10.0, 0.0)), 0.0, 0.0); // 0.7 s
+        assert_eq!((r.stage, r.decel), (AebStage::Full, f32::INFINITY));
         assert_eq!(a.activations, 1);
     }
 
     #[test]
     fn holds_after_stopping_until_the_driver_accelerates() {
         let mut a = Aeb::new(AebConfig::default());
-        a.step(0.01, 10.0, Some(lead(5.0, 0.0)), 0.0);
+        a.step(0.01, 10.0, Some(lead(5.0, 0.0)), 0.0, 0.0);
         assert_eq!(a.stage, AebStage::Full);
         for _ in 0..100 {
-            a.step(0.01, 0.0, Some(lead(1.0, 0.0)), 0.0);
+            a.step(0.01, 0.0, Some(lead(1.0, 0.0)), 0.0, 0.0);
         }
-        let r = a.step(0.01, 0.0, Some(lead(1.0, 0.0)), 0.0);
-        assert!(r.hold && r.brake == 0.0);
-        assert_eq!(a.step(0.01, 0.0, Some(lead(1.0, 0.0)), 0.3).stage, AebStage::Off);
+        let r = a.step(0.01, 0.0, Some(lead(1.0, 0.0)), 0.0, 0.0);
+        assert!(r.hold && r.decel == 0.0);
+        assert_eq!(a.step(0.01, 0.0, Some(lead(1.0, 0.0)), 0.3, 0.0).stage, AebStage::Off);
     }
 
     #[test]
@@ -208,33 +215,33 @@ mod tests {
         let mut a = Aeb::new(AebConfig::default());
         // Following at the same speed: no closing, no threat.
         for _ in 0..1000 {
-            assert_eq!(a.step(0.01, 25.0, Some(lead(30.0, 25.0)), 0.0).stage, AebStage::Off);
+            assert_eq!(a.step(0.01, 25.0, Some(lead(30.0, 25.0)), 0.0, 0.0).stage, AebStage::Off);
         }
         // Creeping in a car park: below the minimum speed.
-        assert_eq!(a.step(0.01, 1.5, Some(lead(0.5, 0.0)), 0.0).stage, AebStage::Off);
+        assert_eq!(a.step(0.01, 1.5, Some(lead(0.5, 0.0)), 0.0, 0.0).stage, AebStage::Off);
         assert_eq!(a.activations, 0);
     }
 
     #[test]
     fn hysteresis_and_minimum_brake_time() {
         let mut a = Aeb::new(AebConfig::default());
-        a.step(0.01, 14.0, Some(lead(25.0, 0.0)), 0.0); // partial (4.1 m/s² needed)
+        a.step(0.01, 14.0, Some(lead(25.0, 0.0)), 0.0, 0.0); // partial (4.1 m/s² needed)
         // The threat vanishes at once: braking still lasts the minimum time.
-        let r = a.step(0.1, 14.0, None, 0.0);
+        let r = a.step(0.1, 14.0, None, 0.0, 0.0);
         assert_eq!(r.stage, AebStage::Partial);
-        let r = a.step(0.5, 14.0, None, 0.0);
+        let r = a.step(0.5, 14.0, None, 0.0, 0.0);
         assert_eq!(r.stage, AebStage::Off);
     }
 
     #[test]
     fn does_not_step_down_while_still_closing() {
         let mut a = Aeb::new(AebConfig::default());
-        assert_eq!(a.step(0.01, 14.0, Some(lead(25.0, 0.0)), 0.0).stage, AebStage::Partial);
+        assert_eq!(a.step(0.01, 14.0, Some(lead(25.0, 0.0)), 0.0, 0.0).stage, AebStage::Partial);
         // Braking makes the constant-speed TTC grow; AEB keeps braking anyway.
         for i in 0..100 {
             let v = 14.0 - 0.1 * i as f32;
-            let r = a.step(0.05, v, Some(lead(20.0 - 0.05 * i as f32, 0.0)), 0.0);
-            assert!(r.brake > 0.0, "released at {v} m/s");
+            let r = a.step(0.05, v, Some(lead(20.0 - 0.05 * i as f32, 0.0)), 0.0, 0.0);
+            assert!(r.decel > 0.0, "released at {v} m/s");
         }
         assert_eq!(a.activations, 1);
     }
@@ -243,13 +250,27 @@ mod tests {
     fn required_deceleration_triggers_full_braking() {
         let mut a = Aeb::new(AebConfig::default());
         // 8 m/s closing at 6 m: TTC 0.75 s and 6.4 m/s² needed: full braking.
-        assert_eq!(a.step(0.01, 8.0, Some(lead(6.0, 0.0)), 0.0).stage, AebStage::Full);
+        assert_eq!(a.step(0.01, 8.0, Some(lead(6.0, 0.0)), 0.0, 0.0).stage, AebStage::Full);
+    }
+
+    #[test]
+    fn the_standstill_hold_hands_over_after_a_while() {
+        let mut a = Aeb::new(AebConfig::default());
+        a.step(0.01, 10.0, Some(lead(5.0, 0.0)), 0.0, 0.0);
+        a.step(0.01, 0.0, Some(lead(1.0, 0.0)), 0.0, 0.0);
+        assert_eq!(a.stage, AebStage::Hold);
+        for _ in 0..290 {
+            a.step(0.01, 0.0, Some(lead(1.0, 0.0)), 0.0, 0.0);
+        }
+        assert_eq!(a.stage, AebStage::Hold);
+        a.step(0.2, 0.0, Some(lead(1.0, 0.0)), 0.0, 0.0);
+        assert_eq!(a.stage, AebStage::Off, "held longer than hold_time");
     }
 
     #[test]
     fn hard_throttle_cancels() {
         let mut a = Aeb::new(AebConfig::default());
-        a.step(0.01, 14.0, Some(lead(10.0, 0.0)), 0.0);
-        assert_eq!(a.step(0.01, 14.0, Some(lead(9.0, 0.0)), 0.9).stage, AebStage::Off);
+        a.step(0.01, 14.0, Some(lead(10.0, 0.0)), 0.0, 0.0);
+        assert_eq!(a.step(0.01, 14.0, Some(lead(9.0, 0.0)), 0.9, 0.0).stage, AebStage::Off);
     }
 }

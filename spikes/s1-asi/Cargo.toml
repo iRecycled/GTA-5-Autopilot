@@ -1,0 +1,13 @@
+[package]
+name = "s1-asi"
+version = "0.1.0"
+description = "Spike S1: a Rust .asi on Script Hook V for GTA V Enhanced (throwaway)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+shv-sys = { path = "../../crates/shv-sys" }

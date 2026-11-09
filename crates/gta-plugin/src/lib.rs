@@ -21,6 +21,7 @@ mod actors;
 mod actuate;
 mod input;
 mod n;
+mod remote;
 mod tools;
 mod win;
 
@@ -186,6 +187,14 @@ fn run() {
     let _ = log.flush();
 
     let mut keys = Keys { prev: [false; 12] };
+    // Test commands over UDP (`remote`): scripted driver inputs until a time.
+    let mut remote = remote::Remote::new();
+    let _ = writeln!(log, "test commands on UDP {}: {}", remote::PORT, if remote.listening() { "listening" } else { "unavailable" });
+    let mut scripted: Option<(input::Driver, u64)> = None;
+    let mut scripted_steer = false;
+    let mut veh_name = String::new();
+    let mut spot_name = String::from("-");
+    let mut last_speed = 0.0f32;
     let mut lead: Option<tools::Lead> = None;
     let mut aeb_last = false;
     let mut fcw_last = false;
@@ -314,14 +323,102 @@ fn run() {
         if keys.pressed(10, VK_F5) {
             tools::lead_brake(&lead, &mut log);
         }
+        // --- Test commands (UDP, `remote`) ---
+        for (cmd, from) in remote.poll() {
+            let reply = match cmd {
+                Err(e) => format!("err {e}"),
+                Ok(c) => {
+                    let _ = writeln!(log, "frame {frame}: remote {c:?}");
+                    match c {
+                        remote::Cmd::Status => format!(
+                            "ok ready in_vehicle={} vehicle={} speed={last_speed:.2} engaged={} spot={spot_name}",
+                            in_vehicle as u8,
+                            if in_vehicle { veh_name.as_str() } else { "-" },
+                            engage_req as u8
+                        ),
+                        remote::Cmd::Car(m) => {
+                            test_mode = true;
+                            tools::clear_lead(&mut lead);
+                            let model = CString::new(m.clone()).unwrap_or_default();
+                            tools::spawn(ped, &model, &mut test_car, &mut log);
+                            last_tick = wall_time_ns();
+                            format!("ok car {m}")
+                        }
+                        remote::Cmd::Tp(name) => match tools::spot_index(&name) {
+                            Some(i) => {
+                                test_mode = true;
+                                tools::clear_lead(&mut lead);
+                                let v: i32 = if unsafe { invoke!(n::IS_PED_IN_ANY_VEHICLE, ped, false) } { unsafe { invoke!(n::GET_VEHICLE_PED_IS_IN, ped, false) } } else { 0 };
+                                tools::teleport(ped, v, i, &mut log);
+                                spot = (i + 1) % tools::spot_count().max(1);
+                                spot_name = name.clone();
+                                last_tick = wall_time_ns();
+                                format!("ok tp {name}")
+                            }
+                            None => format!("err no spot {name:?}"),
+                        },
+                        remote::Cmd::Lead(d, v) if in_vehicle => {
+                            tools::spawn_lead(veh, d, v, &mut lead, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok lead".into()
+                        }
+                        remote::Cmd::Stopped(d) if in_vehicle => {
+                            tools::spawn_lead(veh, d, 0.0, &mut lead, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok stopped".into()
+                        }
+                        remote::Cmd::LeadBrake => {
+                            tools::lead_brake(&lead, &mut log);
+                            "ok lead_brake".into()
+                        }
+                        remote::Cmd::Clear => {
+                            tools::clear_lead(&mut lead);
+                            "ok clear".into()
+                        }
+                        remote::Cmd::Engage if in_vehicle => {
+                            if !engage_req {
+                                engage_req = true;
+                                ramp.cancel();
+                            }
+                            "ok engage".into()
+                        }
+                        remote::Cmd::Cancel => {
+                            engage_req = false;
+                            "ok cancel".into()
+                        }
+                        remote::Cmd::Button(b) => {
+                            btn |= b;
+                            "ok button".into()
+                        }
+                        remote::Cmd::Drive { throttle, brake, steer, secs } => {
+                            let analog = [throttle, brake, steer.abs()].iter().any(|v| *v > 0.0 && *v < 1.0);
+                            scripted = Some((input::Driver { throttle, brake, steer, analog }, wall_time_ns() + (secs as f64 * 1e9) as u64));
+                            "ok drive".into()
+                        }
+                        _ => "err not in a vehicle".into(),
+                    }
+                }
+            };
+            remote.reply(from, &reply);
+        }
+
         if !in_vehicle {
             engage_req = false;
         }
 
-        // --- Driver input (from Windows, D5) ---
+        // --- Driver input (from Windows, D5; or scripted by a test) ---
         // The core decides cancel and override from the raw inputs (D11); the
         // adapter only lets the driver's pedals win at once.
-        let drv = if ai { input::Driver::default() } else { input::read() };
+        if scripted.is_some_and(|(_, until)| wall_time_ns() >= until) {
+            scripted = None;
+        }
+        let drv = if ai {
+            input::Driver::default()
+        } else if let Some((d, _)) = scripted {
+            d
+        } else {
+            input::read()
+        };
         let driver_override = drv.on_pedals();
         if drv.active() {
             ramp.cancel();
@@ -343,6 +440,7 @@ fn run() {
             };
             let name_ptr: *const core::ffi::c_char = unsafe { invoke!(n::GET_DISPLAY_NAME_FROM_VEHICLE_MODEL, model) };
             let name = if name_ptr.is_null() { "?".into() } else { unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy().into_owned() };
+            veh_name.clone_from(&name);
             // GTA's entity frame is x right, y forward: ISO x = GTA y, ISO y = -GTA x.
             let (min_iso, max_iso) = ([lo.y, -hi.x, lo.z], [hi.y, -lo.x, hi.z]);
             info_seq += 1;
@@ -399,6 +497,7 @@ fn run() {
             | if engage_req { sample_flags::ENGAGE_REQUEST } else { 0 }
             | if drv.analog { sample_flags::INPUT_ANALOG } else { 0 };
         s.buttons = btn;
+        last_speed = s.speed;
         seq = seq.wrapping_add(1);
         s.header = Header { kind: MsgKind::VehicleSample, version: CONTRACT_VERSION, seq, frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() };
         link.sample.write(&s);
@@ -536,6 +635,22 @@ fn run() {
             }
         }
         was_active = active || aeb;
+        // A test's scripted driver acts on the car as a real one would.
+        if let Some((d, _)) = scripted
+            && in_vehicle
+            && !paused
+        {
+            if d.throttle > 0.0 || d.brake > 0.0 {
+                actuate::pedals(d.throttle, d.brake);
+            }
+            if d.steer != 0.0 {
+                steering.apply(base, &off, d.steer * steering.max_angle(), measured_angle);
+                scripted_steer = true;
+            }
+        } else if scripted_steer {
+            steering.reset();
+            scripted_steer = false;
+        }
         let t_end = wall_time_ns();
         let work_ns = (t_end - t_frame) - (t_waited - t_wait);
         win_work.push(work_ns);
@@ -685,7 +800,17 @@ fn run() {
                 } else {
                     format!("{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}{aeb_off}", if acc { "ACC" } else { "ACC off" }, hud.set_speed * 3.6, hud.time_gap)
                 };
-                draw_text(0.34, 0.91, &line, colour);
+                // The lead-car icon: grey with no lead, white with one, green while following.
+                let (r, g, b) = if hud.flags & hud_flags::FOLLOWING != 0 {
+                    (80, 220, 120)
+                } else if hud.flags & hud_flags::LEAD != 0 {
+                    (240, 240, 240)
+                } else {
+                    (90, 90, 90)
+                };
+                let () = invoke!(n::DRAW_RECT, 0.346f32, 0.929f32, 0.016f32, 0.014f32, r, g, b, 230i32, false);
+                let () = invoke!(n::DRAW_RECT, 0.346f32, 0.918f32, 0.009f32, 0.010f32, r, g, b, 230i32, false);
+                draw_text(0.36, 0.91, &line, colour);
             }
             if takeover && !fcw {
                 let stop = hud.flags & hud_flags::CONTROLLED_STOP != 0;

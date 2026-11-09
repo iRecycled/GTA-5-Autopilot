@@ -96,6 +96,7 @@ pub fn step(core: &Core, s: &VehicleSample, actors: &ActorList, cmd: &Command, l
             .iter()
             .map(|a| telemetry::Actor { id: a.id, kind: a.kind as u8, x: a.x, y: a.y, yaw: a.yaw, length: a.length, width: a.width, vx: a.vx })
             .collect(),
+        ego_front: core.info().map(|i| i.box_max[0]).unwrap_or(f32::NAN),
     }
 }
 

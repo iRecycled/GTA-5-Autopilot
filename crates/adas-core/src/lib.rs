@@ -241,6 +241,11 @@ impl Core {
         self.layout = layout::default_layout(info.box_min, info.box_max);
     }
 
+    /// The adapter's identity and ego geometry, once received.
+    pub fn info(&self) -> Option<&AdapterInfo> {
+        self.info.as_ref()
+    }
+
     /// The standing line-of-sight queries for the adapter.
     pub fn layout(&self) -> &SensorLayout {
         &self.layout

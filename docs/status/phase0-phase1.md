@@ -183,6 +183,19 @@ Watching it:
   The Sultan does about the same (6.6–7.6 m short).
 - **Found: GTA's brakes aren't linear.** About 80 m/s² per unit at light pedal, 43 at AEB levels. So the single learned brake gain drifts with how the car was last braked: a gentle controlled stop taught the Sultan 67.7. The Sultan's profile was put back to 43.3. A pedal-to-deceleration curve, rather than one gain, belongs to the Phase 4 calibration drive.
 - **Gate change:** the false-AEB rate per 30 min of driving moves to Phase 3, which makes long drives possible; Phase 1 asks for no AEB in any run that shouldn't trigger it (every non-AEB scenario and GTA run so far).
-- **Still to do in Phase 1:**
-  - openpilot notes (D13);
-  - HUD: a lead-car icon (the HUD has text for the lead, set speed, gap bars and warnings).
+- **In-game tests from one command: `cargo xtask gta --car sultan,baller`** (see `gta-tests/README.md`).
+  - **What changed.** Tests used to be PowerShell scripts of key presses, focus changes and fixed sleeps. Now:
+    - the adapter takes test commands over UDP (spawn, named teleport, lead and stopped cars, engage, buttons, scripted driver inputs);
+    - the `gta-test` runner starts GTA if needed, runs each test's steps, waits on the core's telemetry, and scores each run;
+    - the Straight To Story Mode mod skips the menus.
+  - **Tests.** Five in `gta-tests/`: ACC follow, the lead brakes hard, AEB on a stopped car, steering keeps ACC and brake cancels, and an unanswered takeover.
+  - **First run: 10/10 on the Sultan and the Baller, in about 3.5 minutes.**
+
+    | Test | Sultan | Baller |
+    | --- | --- | --- |
+    | ACC follow, time-gap error | 0.02 s | 0.03 s |
+    | Lead brakes hard, stopped behind it (no AEB) | 5.1 m | 5.2 m |
+    | AEB, stopped short | 7.1 m | 7.2 m |
+  - **Closing GTA, deploying and restarting** went through the same command (`--restart`); GTA was back in story mode with the adapter ready in 60 s.
+  - **Tests can't change calibration.** They run the core with `--no-profile-save`.
+- **openpilot notes (D13): done.** See `docs/openpilot-notes.md`, with values verified against openpilot's and opendbc's current source. The main finding for Phase 3: our EPS model is about 20 times faster than a TSS2 car's LTA limits allow, and has five times their range. It needs real, speed-dependent limits before lane keeping.

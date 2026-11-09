@@ -1,0 +1,12 @@
+[package]
+name = "gta-test"
+version = "0.1.0"
+description = "Runs in-game tests (gta-tests/*.toml) against GTA V through the adapter's test commands and scores them from the core's telemetry"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+telemetry = { path = "../telemetry" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

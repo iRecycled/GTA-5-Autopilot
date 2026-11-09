@@ -8,6 +8,11 @@
 //!   `recordings/regression/` and require identical commands (D20)
 //! - `launch`    start GTA V Enhanced through Steam
 //! - `log`       print the newest spike log from `<game folder>/adas-logs`
+//! - `gta [tests...] [--car a,b] [--restart]`  run the in-game tests
+//!   (`gta-tests/*.toml`, see the `gta-test` crate). Builds the core, the
+//!   runner and the adapter first; if the adapter in the game folder is out of
+//!   date it is deployed (with `--restart`, a running GTA is closed for it;
+//!   the runner then starts it again)
 //!
 //! The game folder comes from `GTA5_DIR` if set, otherwise from Steam's library list.
 
@@ -36,8 +41,9 @@ fn main() -> ExitCode {
         "undeploy" => undeploy(),
         "launch" => launch(),
         "log" => show_log(),
+        "gta" => gta(env::args().skip(2).collect()),
         _ => Err(format!(
-            "usage: cargo xtask <gta-dir|deploy|undeploy|launch|log|test>{}",
+            "usage: cargo xtask <gta-dir|deploy|undeploy|launch|log|test|gta>{}",
             if cmd.is_empty() { String::new() } else { format!(" (unknown command '{cmd}')") }
         )),
     };
@@ -162,6 +168,49 @@ fn undeploy() -> Result<(), String> {
         println!("nothing to remove");
     }
     Ok(())
+}
+
+/// The in-game tests: build, bring the adapter up to date, run `gta-test`.
+fn gta(args: Vec<String>) -> Result<(), String> {
+    let restart = args.iter().any(|a| a == "--restart");
+    let rest: Vec<String> = args.into_iter().filter(|a| a != "--restart").collect();
+    let root = workspace_root();
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        .args(["build", "--release", "--package", "adas-core", "--package", "gta-test", "--package", "gta-plugin"])
+        .status()
+        .map_err(|e| format!("cargo build failed to start: {e}"))?;
+    if !status.success() {
+        return Err("cargo build failed".into());
+    }
+    let built = root.join("target").join("release").join("gta_plugin.dll");
+    let deployed = gta_dir()?.join("adas.asi");
+    let stale = fs::read(&built).map_err(|e| format!("{}: {e}", built.display()))? != fs::read(&deployed).unwrap_or_default();
+    if stale {
+        if game_running() && restart {
+            println!("the adapter changed: closing GTA to deploy it");
+            let _ = Command::new("taskkill").args(["/IM", GAME_EXE, "/F"]).status();
+            for _ in 0..60 {
+                if !game_running() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        if game_running() {
+            println!("warning: the adapter in the game is out of date; pass --restart to restart GTA with the new one");
+        } else {
+            deploy("adas")?;
+        }
+    }
+    let status = Command::new(root.join("target").join("release").join("gta-test.exe"))
+        .current_dir(&root)
+        .args(&rest)
+        .status()
+        .map_err(|e| format!("gta-test failed to start: {e}"))?;
+    if status.success() { Ok(()) } else { Err("some in-game tests failed".into()) }
 }
 
 fn launch() -> Result<(), String> {

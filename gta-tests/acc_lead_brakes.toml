@@ -1,0 +1,15 @@
+# The lead brakes hard to a stop; ACC stops behind it.
+name = "ACC: the lead brakes hard"
+steps = [
+  "engage",
+  "set 50",
+  "lead 40 43",
+  "sleep 8",
+  "lead_brake",
+  "wait stopped 20",
+  "sleep 1",
+]
+
+[pass]
+stop_gap_min = 2.0
+end_kph_below = 1.0

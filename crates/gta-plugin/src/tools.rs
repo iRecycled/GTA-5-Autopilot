@@ -44,6 +44,19 @@ pub fn test_car_model() -> std::ffi::CString {
     std::ffi::CString::new(name).unwrap_or_else(|_| c"sultan".to_owned())
 }
 
+/// The index of the test spot with this name (case-insensitive), or a number.
+pub fn spot_index(name: &str) -> Option<usize> {
+    if let Ok(i) = name.parse::<usize>() {
+        return (i < spot_count()).then_some(i);
+    }
+    let user = user_spots();
+    if user.is_empty() {
+        SPOTS.iter().position(|s| s.0.eq_ignore_ascii_case(name))
+    } else {
+        user.iter().position(|s| s.0.eq_ignore_ascii_case(name))
+    }
+}
+
 pub fn spot_count() -> usize {
     let u = user_spots();
     if u.is_empty() { SPOTS.len() } else { u.len() }

@@ -166,8 +166,9 @@ Goal: the first phase that feels like a modern car. It follows traffic smoothly 
 
 **Gate:**
 - ACC: gap error ≤ 0.3 s at steady state; jerk ≤ 2.5 m/s³; no AEB activation in 10 of 10 highway follow runs.
-- AEB: stops before a stationary car from 50 km/h in 10 of 10 runs, in the sim and in GTA; ≤ 1 false activation per 30 min.
+- AEB: stops before a stationary car from 50 km/h in 10 of 10 runs, in the sim and in GTA; no activation in any run that shouldn't trigger it (following, cut-in, lead braking, faults). The false-activation rate per 30 min moves to Phase 3, where lane keeping makes long drives possible.
 - Radar path ≤ 2 frames at the 99th percentile; live CAN trace and bus load on both buses.
+- Override and takeover (D11): brake cancels, gas overrides, steering doesn't cancel ACC; an unanswered takeover request ends in a controlled stop with hazards, in the sim and in GTA.
 
 ## Phase 2 · Surround: corner radars and ultrasonics
 
@@ -194,7 +195,7 @@ Goal: the car steers itself within its lane, with a camera ECU that already beha
 - [ ] Optional driver-monitoring toggle (D11)
 - [ ] Scenarios: a long highway run, a tight bend, a lane that ends, a pedestrian stepping out
 
-**Gate:** lane-centre error ≤ 0.3 m RMS on a named highway loop; ≤ 1 takeover per 10 km; pedestrian AEB stops in 10 of 10 runs at 30 km/h.
+**Gate:** lane-centre error ≤ 0.3 m RMS on a named highway loop; ≤ 1 takeover per 10 km; pedestrian AEB stops in 10 of 10 runs at 30 km/h; ≤ 1 false AEB activation per 30 min of driving in traffic (moved from Phase 1).
 
 ## Phase 4 · Full network and a second host
 

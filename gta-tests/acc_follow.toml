@@ -1,0 +1,15 @@
+# ACC follows a slower lead at the 2.0 s time gap.
+name = "ACC: follow a lead at 43 km/h"
+steps = [
+  "engage",
+  "set 50",
+  "gap 2.0",
+  "wait speed>=48 25",
+  "lead 40 43",
+  "sleep 14",
+  "check_gap 4",
+]
+
+[pass]
+max_aeb = 0
+max_gap_error_s = 0.3

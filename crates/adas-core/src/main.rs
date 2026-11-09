@@ -3,7 +3,9 @@
 //!
 //! Usage: `adas-core [--feature acc|speed-profile|test-driver] [--spin]
 //!                   [--record DIR | --no-record] [--link NAME]
-//!                   [--telemetry PORT,PORT... | --no-telemetry]`
+//!                   [--telemetry PORT,PORT... | --no-telemetry] [--no-profile-save]`
+//!
+//! - `--no-profile-save`: load vehicle profiles but never write them (tests).
 //!
 //! - `--spin`: busy-poll for samples (lowest latency, uses a CPU core);
 //!   default: sleep on the adapter's sample event.
@@ -185,10 +187,13 @@ fn main() {
     let mut feature = Feature::speed_profile();
     let mut rec_dir: Option<PathBuf> = Some(PathBuf::from("recordings"));
     let mut telemetry_ports = vec![telemetry::PANEL_PORT, telemetry::RERUN_PORT];
+    // Tests load vehicle profiles but never rewrite them.
+    let mut save_profiles = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--spin" => spin = true,
+            "--no-profile-save" => save_profiles = false,
             "--no-telemetry" => telemetry_ports.clear(),
             "--telemetry" => {
                 let list = args.next().expect("--telemetry needs ports, e.g. 47300,47302");
@@ -398,7 +403,12 @@ fn main() {
             Event::Disengaged => Some(format!("disengaged at frame {}", s.header.frame)),
             Event::CancelledByAeb => Some(format!("AEB at frame {}: ACC cancelled", s.header.frame)),
             Event::Impact => Some(format!("IMPACT at frame {} ({:.1} m/s): everything cancelled", s.header.frame, s.speed)),
+            Event::Unavailable(r) if core.takeover().is_some() => {
+                Some(format!("TAKE OVER at frame {}: {} unavailable ({})", s.header.frame, feature.name(), r.text()))
+            }
             Event::Unavailable(r) => Some(format!("{} unavailable at frame {}: {}", feature.name(), s.header.frame, r.text())),
+            Event::TakenOver => Some(format!("driver took over at frame {}", s.header.frame)),
+            Event::ControlledStop => Some(format!("takeover not answered at frame {} ({:.1} m/s): controlled stop, hazards on", s.header.frame, s.speed)),
             Event::None => None,
         };
         if let Some(t) = text {
@@ -446,7 +456,7 @@ fn main() {
         }
 
         // Save the profile when the learned brake gain has drifted (every 10 s at most).
-        if t1.saturating_sub(last_profile_check) > 10_000_000_000 {
+        if save_profiles && t1.saturating_sub(last_profile_check) > 10_000_000_000 {
             last_profile_check = t1;
             if let Some((path, host, vehicle, saved)) = profile.as_mut() {
                 let g = core.brake_gain();

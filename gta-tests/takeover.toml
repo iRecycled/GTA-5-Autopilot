@@ -1,0 +1,19 @@
+# D11: the radar goes silent while ACC is engaged. The driver ignores the
+# takeover request; the car makes a controlled stop with hazards; then the
+# driver answers with the accelerator.
+name = "D11: unanswered takeover ends in a controlled stop"
+steps = [
+  "engage",
+  "set 50",
+  "wait speed>=45 25",
+  "fault adas drop 3",
+  "wait event:TAKE OVER 2",
+  "wait event:controlled stop 6",
+  "wait stopped 25",
+  "drive 0.6 0 0 0.3",
+  "wait event:driver took over 3",
+]
+
+[pass]
+max_aeb = 0
+events = ["TAKE OVER", "controlled stop", "driver took over"]

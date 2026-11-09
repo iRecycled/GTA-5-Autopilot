@@ -1,0 +1,20 @@
+# D11: steering doesn't cancel ACC; the brake does. A quarter of lock (an
+# analogue input: above 15% for 100 ms counts), left then right; full lock
+# at speed would swerve. The key debounce is covered by unit tests.
+name = "D11: steering keeps ACC, brake cancels"
+steps = [
+  "engage",
+  "set 50",
+  "wait speed>=40 25",
+  "drive 0 0 0.25 0.4",
+  "drive 0 0 -0.25 0.4",
+  "sleep 1",
+  "wait engaged 1",
+  "drive 0 1 0 0.3",
+  "wait event:cancelled by driver 2",
+]
+
+[pass]
+max_aeb = 0
+events = ["cancelled by driver"]
+no_events = ["took over"]

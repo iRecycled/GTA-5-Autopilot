@@ -146,6 +146,8 @@ pub struct Step {
     pub radar_latency_frames: u32,
     pub tracks: Vec<Track>,
     pub actors: Vec<Actor>,
+    /// The ego car's front edge from its reference point (m), for gaps.
+    pub ego_front: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -406,6 +408,7 @@ fn encode_step(w: &mut W, s: &Step) {
             w.f32(v);
         }
     }
+    w.f32(s.ego_front);
 }
 
 fn decode_step(r: &mut R) -> Option<Step> {
@@ -461,6 +464,7 @@ fn decode_step(r: &mut R) -> Option<Step> {
         }
         s.actors.push(a);
     }
+    s.ego_front = r.f32()?;
     Some(s)
 }
 

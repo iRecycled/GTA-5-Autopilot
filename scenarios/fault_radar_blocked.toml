@@ -1,9 +1,10 @@
 # Following at the time gap, the radar's frames stop for 2 s (blocked, or its
-# ECU fails). Within 0.5 s ACC disengages and says why: "radar blocked". The
-# driver (who here never touches the pedals) coasts; nothing is hit.
+# ECU fails). Within 0.5 s ACC says why ("radar blocked") and asks the driver
+# to take over (D11). The simulated driver never answers: the request chimes,
+# then the car makes a controlled stop with its hazards on. Nothing is hit.
 name = "Fault: the radar goes silent while following"
 feature = "acc"
-duration = 30.0
+duration = 40.0
 
 [ego]
 speed_kph = 90
@@ -23,3 +24,8 @@ until = 17.0
 [pass]
 unavailable = "radar blocked"
 max_aeb = 0
+# The request at about 15.5 s, the stop from about 19.5 s: about 13 s at
+# 2 m/s² from about 24 m/s.
+end_speed_below = 0.3
+# No jerk limit: the stop's onset is ramped (under 3 m/s³), but reaching a
+# standstill at 2 m/s² ends in a one-frame jolt, as any firm stop does.

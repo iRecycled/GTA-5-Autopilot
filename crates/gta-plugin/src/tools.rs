@@ -33,6 +33,30 @@ fn user_spots() -> Vec<(String, f32, f32, f32, f32, bool)> {
         .collect()
 }
 
+/// The test car F8 spawns: the model name in `%LOCALAPPDATA%\adas\car.txt`
+/// (e.g. `baller`), or the Sultan.
+pub fn test_car_model() -> std::ffi::CString {
+    let name = std::env::var_os("LOCALAPPDATA")
+        .and_then(|d| std::fs::read_to_string(PathBuf::from(d).join("adas").join("car.txt")).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or_else(|| "sultan".to_string());
+    std::ffi::CString::new(name).unwrap_or_else(|_| c"sultan".to_owned())
+}
+
+/// The index of the test spot with this name (case-insensitive), or a number.
+pub fn spot_index(name: &str) -> Option<usize> {
+    if let Ok(i) = name.parse::<usize>() {
+        return (i < spot_count()).then_some(i);
+    }
+    let user = user_spots();
+    if user.is_empty() {
+        SPOTS.iter().position(|s| s.0.eq_ignore_ascii_case(name))
+    } else {
+        user.iter().position(|s| s.0.eq_ignore_ascii_case(name))
+    }
+}
+
 pub fn spot_count() -> usize {
     let u = user_spots();
     if u.is_empty() { SPOTS.len() } else { u.len() }

@@ -1740,6 +1740,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gta-test"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "telemetry",
+ "toml",
+]
+
+[[package]]
 name = "guillotiere"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

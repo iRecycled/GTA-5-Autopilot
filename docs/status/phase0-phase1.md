@@ -161,5 +161,41 @@ Watching it:
   - in the other, F7 teleported to downtown instead of the airport, because the plugin keeps the spot index across core runs.
 
   The test script now checks the adapter log and presses F7 until it reaches the airport.
-- **Still to do in Phase 1:**
-  - D11 takeover escalation (waits for lane keeping).
+- **Override and takeover (D11): done.** openpilot's model, decided in the core (`adas-core/src/driver.rs`) from the raw driver inputs, so every host gets the same rules:
+  - **brake** cancels at once;
+  - **gas** pauses speed control while pressed;
+  - **steering** pauses lateral control and no longer cancels ACC. It counts only when held: a key for 150 ms, or a stick above 15% for 100 ms. The adapter reports which kind of device it is (`sample_flags::INPUT_ANALOG`).
+
+  The adapter no longer decides cancels. It still lets the driver's pedals win at once, and it resets its engage request when the core disengages, as a stalk would.
+
+  **Takeover escalation.** When the engaged feature can't continue (radar blocked, vehicle data lost, …), ACC no longer simply switches off. It asks the driver to take over:
+  - a visual request at once;
+  - a chime from 1.5 s;
+  - from 4 s, a controlled stop: 2 m/s², ramped in over 0.8 s, then the standstill hold, hazards on.
+
+  The request stands until the driver answers with the accelerator, steering, the brake or the cancel button. It stays even if the cause clears.
+  - **In the sim:** the radar-silent scenario now ends in the controlled stop, with no AEB and no collision. Unit tests cover the timing, an accelerator answer, and steering that pauses lateral control without cancelling.
+  - **In GTA (Sultan):** held steering at 89 km/h didn't cancel ACC. The panel's control port dropped the ADAS bus for 3 s, and the takeover request followed 0.5 s later. The chime came, then the controlled stop from 39 km/h with the hazards on and a hold at standstill. The accelerator answered it; re-engaging and touching the brake cancelled.
+- **A second vehicle profile: the Baller (SUV).** F8 now spawns the model named in `%LOCALAPPDATA%\adas\car.txt` (the Sultan by default). Two AEB stops from 50 km/h:
+  - with no profile yet: 7.6 m short;
+  - with the learned gain of 61.3 saved: 7.0 m short at 5.2 m/s² on average.
+
+  The Sultan does about the same (6.6–7.6 m short).
+- **Found: GTA's brakes aren't linear.** About 80 m/s² per unit at light pedal, 43 at AEB levels. So the single learned brake gain drifts with how the car was last braked: a gentle controlled stop taught the Sultan 67.7. The Sultan's profile was put back to 43.3. A pedal-to-deceleration curve, rather than one gain, belongs to the Phase 4 calibration drive.
+- **Gate change:** the false-AEB rate per 30 min of driving moves to Phase 3, which makes long drives possible; Phase 1 asks for no AEB in any run that shouldn't trigger it (every non-AEB scenario and GTA run so far).
+- **In-game tests from one command: `cargo xtask gta --car sultan,baller`** (see `gta-tests/README.md`).
+  - **What changed.** Tests used to be PowerShell scripts of key presses, focus changes and fixed sleeps. Now:
+    - the adapter takes test commands over UDP (spawn, named teleport, lead and stopped cars, engage, buttons, scripted driver inputs);
+    - the `gta-test` runner starts GTA if needed, runs each test's steps, waits on the core's telemetry, and scores each run;
+    - the Straight To Story Mode mod skips the menus.
+  - **Tests.** Five in `gta-tests/`: ACC follow, the lead brakes hard, AEB on a stopped car, steering keeps ACC and brake cancels, and an unanswered takeover.
+  - **First run: 10/10 on the Sultan and the Baller, in about 3.5 minutes.**
+
+    | Test | Sultan | Baller |
+    | --- | --- | --- |
+    | ACC follow, time-gap error | 0.02 s | 0.03 s |
+    | Lead brakes hard, stopped behind it (no AEB) | 5.1 m | 5.2 m |
+    | AEB, stopped short | 7.1 m | 7.2 m |
+  - **Closing GTA, deploying and restarting** went through the same command (`--restart`); GTA was back in story mode with the adapter ready in 60 s.
+  - **Tests can't change calibration.** They run the core with `--no-profile-save`.
+- **openpilot notes (D13): done.** See `docs/openpilot-notes.md`, with values verified against openpilot's and opendbc's current source. The main finding for Phase 3: our EPS model is about 20 times faster than a TSS2 car's LTA limits allow, and has five times their range. It needs real, speed-dependent limits before lane keeping.

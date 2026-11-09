@@ -1,0 +1,16 @@
+# AEB on a stopped car from 50 km/h (the Phase 1 gate's 10/10 test, once).
+name = "AEB: stopped car from 50 km/h"
+steps = [
+  "engage",
+  "set 50",
+  "wait speed>=48 25",
+  "stopped 70",
+  "wait event:AEB braking 15",
+  "wait stopped 15",
+  "sleep 1",
+]
+
+[pass]
+min_aeb = 1
+stop_gap_min = 2.0
+stop_gap_max = 15.0

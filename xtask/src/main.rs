@@ -1,7 +1,7 @@
 //! `cargo xtask <command>`
 //!
 //! - `gta-dir`   print the GTA V Enhanced folder that will be used
-//! - `deploy [spike]`  build a spike (`s1` default, `s45`) and make it the only
+//! - `deploy [spike]`  build a spike (`s1` default, `s45`, `s36`) and make it the only
 //!   `adas-*.asi` in the game folder
 //! - `undeploy`  remove every deployed spike `.asi` from the game folder
 //! - `launch`    start GTA V Enhanced through Steam
@@ -21,6 +21,7 @@ const GAME_EXE: &str = "GTA5_Enhanced.exe";
 const SPIKES: &[(&str, &str, &str, &str)] = &[
     ("s1", "s1-asi", "s1_asi.dll", "adas-s1.asi"),
     ("s45", "s45-vehicle", "s45_vehicle.dll", "adas-s45.asi"),
+    ("s36", "s36-link", "s36_link.dll", "adas-s36.asi"),
 ];
 
 fn main() -> ExitCode {

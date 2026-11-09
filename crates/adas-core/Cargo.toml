@@ -1,0 +1,11 @@
+[package]
+name = "adas-core"
+version = "0.1.0"
+description = "The ADAS core process: connects to an adapter and runs one step per host frame (D23)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+adapter-api = { path = "../adapter-api" }
+control = { path = "../control" }

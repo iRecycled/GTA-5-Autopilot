@@ -168,6 +168,18 @@ impl Core {
         &self.tracker
     }
 
+    /// The learned brake gain (m/s² per unit of brake demand).
+    pub fn brake_gain(&self) -> f32 {
+        self.brake_gain
+    }
+
+    /// Starts from a known brake gain (a vehicle profile, D19).
+    pub fn set_brake_gain(&mut self, g: f32) {
+        if g.is_finite() && (3.0..=150.0).contains(&g) {
+            self.brake_gain = g;
+        }
+    }
+
     pub fn aeb_activations(&self) -> u32 {
         self.aeb.activations
     }

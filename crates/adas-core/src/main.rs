@@ -16,7 +16,48 @@ use std::sync::atomic::Ordering;
 use adapter_api::shm::{DEFAULT_NAME, SharedLink};
 use adapter_api::{CONTRACT_VERSION, Header, MsgKind, sample_flags, str_of, wall_time_ns};
 use adas_core::{Core, Event, Feature, Inputs, Stick};
-use record::{Recorder, Stick3};
+use record::{Profile, Recorder, Stick3};
+
+/// `config/vehicles/<host>/<model>.toml` (D19): a file-system-safe slug.
+fn slug(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn profile_path(host: &str, vehicle: &str) -> PathBuf {
+    PathBuf::from("config").join("vehicles").join(slug(host)).join(format!("{}.toml", slug(vehicle)))
+}
+
+/// Reads `brake_gain = <x>` from a profile file.
+fn load_brake_gain(path: &std::path::Path) -> Option<f32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        (k.trim() == "brake_gain").then(|| v.trim().parse().ok()).flatten()
+    })
+}
+
+fn save_profile(path: &std::path::Path, host: &str, vehicle: &str, brake_gain: f32) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(
+        path,
+        format!(
+            "# Vehicle profile (D19) for {vehicle} on {host}.\n\
+             # Learned on line by adas-core; edit by hand only with the core stopped.\n\n\
+             # Deceleration per unit of brake demand (m/s^2).\n\
+             brake_gain = {brake_gain:.3}\n"
+        ),
+    )
+}
 
 /// Keyboard state from a low-level keyboard hook. `GetAsyncKeyState` doesn't
 /// see keys while GTA has focus (its raw input stops other processes' key
@@ -194,6 +235,9 @@ fn main() {
     let mut seen_writes = link.sample.writes();
     let mut info_writes = 0u32;
     let mut layout_seq = 0u32;
+    // The vehicle profile in use: (path, host, vehicle, saved brake gain).
+    let mut profile: Option<(PathBuf, String, String, f32)> = None;
+    let mut last_profile_check = 0u64;
 
     // Recording: the whole core run, from its first sample, so a replay can
     // rebuild the perception state as well (the tracker's history starts
@@ -255,6 +299,23 @@ fn main() {
                 let _ = r.info(&info);
             }
             println!("adapter: {} / {}; sensor layout published ({} sensors)", str_of(&info.host), str_of(&info.vehicle), l.count);
+            // A new vehicle: start from its profile, if there is one.
+            let (host, vehicle) = (str_of(&info.host).to_string(), str_of(&info.vehicle).to_string());
+            if profile.as_ref().is_none_or(|p| p.1 != host || p.2 != vehicle) {
+                let path = profile_path(&host, &vehicle);
+                match load_brake_gain(&path) {
+                    Some(g) => {
+                        core.set_brake_gain(g);
+                        if let Some(r) = recorder.as_mut() {
+                            let _ = r.profile(&Profile { brake_gain: g, ..Default::default() }, wall_time_ns());
+                        }
+                        println!("profile {}: brake gain {g:.2}", path.display());
+                    }
+                    None => println!("no profile at {} yet; learning", path.display()),
+                }
+                let g = core.brake_gain();
+                profile = Some((path, host, vehicle, g));
+            }
         }
 
         let (_, actors) = link.actors.read();
@@ -293,6 +354,23 @@ fn main() {
         {
             eprintln!("recording failed: {e}");
             recorder = None;
+        }
+
+        // Save the profile when the learned brake gain has drifted (every 10 s at most).
+        if t1.saturating_sub(last_profile_check) > 10_000_000_000 {
+            last_profile_check = t1;
+            if let Some((path, host, vehicle, saved)) = profile.as_mut() {
+                let g = core.brake_gain();
+                if (g - *saved).abs() > 0.03 * saved.abs().max(1.0) {
+                    match save_profile(path, host, vehicle, g) {
+                        Ok(()) => {
+                            println!("profile {}: brake gain {g:.2} saved", path.display());
+                            *saved = g;
+                        }
+                        Err(e) => eprintln!("cannot save {}: {e}", path.display()),
+                    }
+                }
+            }
         }
 
         one_way.push(t1.saturating_sub(s.header.wall_time_ns));

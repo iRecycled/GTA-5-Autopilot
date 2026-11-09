@@ -29,6 +29,17 @@ unsafe impl Raw for VehicleSample {}
 unsafe impl Raw for Command {}
 unsafe impl Raw for AdapterInfo {}
 unsafe impl Raw for Stick3 {}
+unsafe impl Raw for Profile {}
+
+/// A vehicle profile as applied to the core (D19), recorded so a replay
+/// applies it at the same step.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Profile {
+    /// Brake gain (m/s² per unit of brake demand).
+    pub brake_gain: f32,
+    pub _reserved: [f32; 3],
+}
 
 /// The test driver's stick as recorded: throttle, brake, steer.
 #[repr(C)]
@@ -77,6 +88,7 @@ fn actors_from(b: &[u8]) -> Option<ActorList> {
 }
 
 struct Channels {
+    profile: u16,
     sample: u16,
     actors: u16,
     stick: u16,
@@ -107,6 +119,7 @@ impl Recorder {
             w.add_channel(s, topic, ENCODING, &BTreeMap::new()).map_err(err)
         };
         let ch = Channels {
+            profile: chan("profile", "adas.Profile")?,
             sample: chan("sample", "adas.VehicleSample")?,
             actors: chan("actors", "adas.ActorList")?,
             stick: chan("stick", "adas.Stick")?,
@@ -123,6 +136,10 @@ impl Recorder {
         self.seq = self.seq.wrapping_add(1);
         let h = mcap::records::MessageHeader { channel_id: channel, sequence: self.seq, log_time: t_ns, publish_time: t_ns };
         self.w.write_to_known_channel(&h, data).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    pub fn profile(&mut self, p: &Profile, t_ns: u64) -> io::Result<()> {
+        self.put(self.ch.profile, t_ns, bytes_of(p))
     }
 
     pub fn info(&mut self, i: &AdapterInfo) -> io::Result<()> {
@@ -156,6 +173,8 @@ pub struct Frame {
     /// Adapter info that arrived just before this step (the core applies it
     /// before stepping).
     pub info: Option<AdapterInfo>,
+    /// A vehicle profile applied just before this step.
+    pub profile: Option<Profile>,
     pub sample: VehicleSample,
     pub actors: ActorList,
     pub stick: Option<Stick3>,
@@ -197,6 +216,7 @@ impl Recording {
         let mut frames: Vec<Frame> = Vec::new();
         let mut truncated = false;
         let mut pending_info: Option<AdapterInfo> = None;
+        let mut pending_profile: Option<Profile> = None;
         for m in mcap::MessageStream::new(&data).map_err(|e| bad(e.to_string()))? {
             let m = match m {
                 Ok(m) => m,
@@ -210,6 +230,7 @@ impl Recording {
             match m.channel.topic.as_str() {
                 "sample" => frames.push(Frame {
                     info: pending_info.take(),
+                    profile: pending_profile.take(),
                     sample: from_bytes(&m.data).ok_or_else(|| bad("bad sample".into()))?,
                     actors: ActorList::default(),
                     stick: None,
@@ -230,6 +251,7 @@ impl Recording {
                         f.command = from_bytes(&m.data);
                     }
                 }
+                "profile" => pending_profile = from_bytes(&m.data),
                 "info" => {
                     let i: Option<AdapterInfo> = from_bytes(&m.data);
                     if info.is_none() {

@@ -62,6 +62,9 @@ fn replay(path: &Path, csv: Option<&PathBuf>, candump: Option<&PathBuf>) -> Resu
             core.set_info(info);
             front = info.box_max[0];
         }
+        if let Some(p) = &f.profile {
+            core.set_brake_gain(p.brake_gain);
+        }
         let stick = f.stick.map(|s| Stick { throttle: s.throttle, brake: s.brake, steer: s.steer });
         let (c, _) = core.step(Inputs { sample: &f.sample, actors: &f.actors, stick });
         if let Some(w) = dump.as_mut() {

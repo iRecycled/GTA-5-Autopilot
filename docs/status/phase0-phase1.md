@@ -60,7 +60,8 @@ Driving it:
 | --- | --- |
 | ACC following a lead at 12 m/s | Settled at a **2.03–2.05 s** time gap (target 2.0 s) |
 | The lead brakes hard (session 1) | ACC alone brought the car smoothly to a near-stop behind it, with no AEB needed |
-| **AEB: stationary car from 50 km/h (gate: 10/10)** | **10/10** with the current tuning (13 stops in all, none hit). Stopped 6.6–7.6 m short at 5.1 m/s² average, about 1.8 s before impact. Each core run's first stop peaks at about 13.7 m/s² before the brake gain is learned; the later stops peak at 6.8 m/s² |
+| **AEB: stationary car from 50 km/h (gate: 10/10)** | **10/10** with the current tuning (15 stops in all, none hit). Stopped 6.6–7.6 m short at 5.1 m/s² average, about 1.8 s before impact. Peak deceleration is 6.8–6.9 m/s² |
+| Vehicle profile (D19) | The learned brake gain (43.3 m/s² per unit for the Sultan) is saved to `config/vehicles/<host>/<model>.toml` and loaded at the next start. Without it, the first stop of a session peaked at 13.7 m/s²; with it, 6.9 m/s² |
 
 ### What the GTA runs taught (all fixed)
 
@@ -80,7 +81,6 @@ Driving it:
 
 ## Open items
 
-- **The first AEB stop of a session is harsher** (13.7 m/s² peak), because the brake gain is learned from scratch each run. Saving the learned gain per vehicle would fix that: a `config/vehicles/gta/<model>.toml` profile (D19).
 - **Recordings end "early"** because the core is always killed. A clean shutdown would finish the file (the reader already copes).
 - **No test driver at the wheel.** ACC tests in GTA run unsteered on the airport taxiway (about 450 m usable), so a lead can drift out of line. Lane keeping (Phase 3) removes this; until then, keep runs short or let a human steer.
 - **Static obstacles.** The actor-list radar doesn't see buildings, fences or the end of the taxiway. That's expected for D25; camera and lidar sensing (Phase 5) cover it.

@@ -56,6 +56,8 @@ fn replay(path: &Path, csv: Option<&PathBuf>, candump: Option<&PathBuf>) -> Resu
         None => None,
     };
     let (mut compared, mut diffs) = (0usize, 0usize);
+    // How big the differences are: quantisation, or changed behaviour?
+    let (mut d_thr, mut d_brk, mut d_steer, mut d_flags) = (0f32, 0f32, 0f32, 0usize);
     let mut front = rec.info.map(|i| i.box_max[0]).unwrap_or(2.3);
     for (i, f) in rec.frames.iter().enumerate() {
         if let Some(info) = &f.info {
@@ -84,6 +86,11 @@ fn replay(path: &Path, csv: Option<&PathBuf>, candump: Option<&PathBuf>) -> Resu
                 let ok = same(&c, live);
                 if !ok {
                     diffs += 1;
+                    let d = |a: f32, b: f32| if a.is_finite() && b.is_finite() { (a - b).abs() } else { 0.0 };
+                    d_thr = d_thr.max(d(c.throttle, live.throttle));
+                    d_brk = d_brk.max(d(c.brake, live.brake));
+                    d_steer = d_steer.max(d(c.steer_angle, live.steer_angle));
+                    d_flags += (c.flags != live.flags) as usize;
                     if diffs <= 3 {
                         eprintln!(
                             "  step {i} (frame {}): live flags {} thr {} brk {} steer {} | replay flags {} thr {} brk {} steer {}",
@@ -119,6 +126,9 @@ fn replay(path: &Path, csv: Option<&PathBuf>, candump: Option<&PathBuf>) -> Resu
                 ok as u8
             );
         }
+    }
+    if diffs > 0 {
+        eprintln!("  largest differences: throttle {d_thr:.5}, brake {d_brk:.5}, steer {d_steer:.5} rad; flags differ in {d_flags} steps");
     }
     Ok((compared, diffs))
 }

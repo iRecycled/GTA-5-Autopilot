@@ -1,0 +1,25 @@
+# Following at the time gap, the radar's frames stop for 2 s (blocked, or its
+# ECU fails). Within 0.5 s ACC disengages and says why: "radar blocked". The
+# driver (who here never touches the pedals) coasts; nothing is hit.
+name = "Fault: the radar goes silent while following"
+feature = "acc"
+duration = 30.0
+
+[ego]
+speed_kph = 90
+engage_at = 0.5
+set_kph = 100
+
+[[actor]]
+s = 60
+speed_kph = 80
+
+[[fault]]
+bus = "adas"
+kind = "drop"
+from = 15.0
+until = 17.0
+
+[pass]
+unavailable = "radar blocked"
+max_aeb = 0

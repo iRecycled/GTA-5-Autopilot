@@ -11,7 +11,11 @@
 //! features see what a real ADAS ECU sees. Then perception (tracker → lead
 //! selection) and AEB run whether or not anything is engaged; the engaged
 //! feature (ACC, the speed profile or the test driver) runs on top; AEB wins.
+//! The ADAS ECU sends its requests back on chassis CAN (`ACC_CONTROL`,
+//! `PRE_COLLISION_2`, `STEERING_LTA`), and the actuator ECUs (`actuators`)
+//! turn them into the pedals, hold and steering the host applies.
 
+pub mod actuators;
 pub mod degrade;
 pub mod features;
 pub mod layout;
@@ -61,9 +65,13 @@ pub enum Event {
     Unavailable(degrade::Reason),
 }
 
-/// Deceleration that counts as an impact (m/s², about 1.5 g). Hard braking on
-/// good tyres stays below about 1.1 g.
-const IMPACT_DECEL: f32 = 15.0;
+/// An impact, as crash sensing judges one: more than `IMPACT_DV` of speed
+/// lost within `IMPACT_WINDOW_US` (a mean of over 15 m/s², about 1.5 g).
+/// Hard braking on good tyres stays below about 1.1 g, so it loses about
+/// 1.1 m/s in that time. A one-frame glitch in the host's speed (a game
+/// stalling while it loads a model) loses far less, so it doesn't count.
+const IMPACT_DV: f32 = 1.5;
+const IMPACT_WINDOW_US: u64 = 100_000;
 
 /// Half a lane for in-path decisions (m).
 const HALF_LANE: f32 = 1.8;
@@ -87,27 +95,49 @@ pub struct Core {
     /// Longitudinal acceleration estimated from speed (m/s², low-passed).
     a_est: f32,
     prev_speed: Option<f32>,
-    /// The AEB deceleration loop's integral (brake demand).
-    aeb_i: f32,
+    powertrain: actuators::Powertrain,
+    eps: actuators::Eps,
     /// The host's brake gain, learned on line: deceleration per unit of brake
     /// demand (m/s²). Hosts differ a lot (sim 8, GTA about 80 at light
     /// braking); this is the D19 vehicle profile, learned rather than tuned.
     brake_gain: f32,
     prev_brake: f32,
-    prev_speed_for_impact: Option<f32>,
+    /// Recent (game time µs, speed), for impact detection.
+    impact_window: std::collections::VecDeque<(u64, f32)>,
     vehicle: vbus::Vehicle,
     /// Frames of the last chassis frame and the last radar scan (D21 health).
     chassis_last: Option<u64>,
+    /// Valid chassis frames counted at the last step (health counts only
+    /// frames that pass their checksums).
+    chassis_seen: u64,
     radar_last: Option<u64>,
     scan_arrived: bool,
     avail: degrade::Availability,
 }
 
 /// Starting guess for the brake gain (m/s² per unit of brake demand); learned
-/// from then on. The deceleration loop's integral covers the rest.
+/// from then on. The brake ECU's deceleration loop covers the rest.
 const BRAKE_GAIN_INIT: f32 = 8.0;
-/// Integral gain of the AEB deceleration loop (demand per m/s²·s).
-const AEB_KI: f32 = 0.35;
+/// The brake gain is learned only while the demand asks for less than this
+/// (m/s²): well inside the tyres' grip.
+const GAIN_LEARN_MAX_DECEL: f32 = 6.0;
+
+/// One step of on-line brake-gain learning from what last frame's brake
+/// demand achieved. Only in the brakes' linear range: when the demand asks
+/// for more than the tyres can give, grip sets the deceleration and the gain
+/// would be learned far too low.
+fn learn_brake_gain(gain: f32, prev_brake: f32, speed: f32, a_est: f32, dt: f32) -> f32 {
+    let linear = prev_brake * gain < GAIN_LEARN_MAX_DECEL;
+    if prev_brake >= 0.03 && linear && speed > 2.0 && a_est < -0.5 {
+        let g = (-a_est / prev_brake).clamp(3.0, 150.0);
+        gain + (g - gain) * (dt / 0.5).min(1.0)
+    } else {
+        gain
+    }
+}
+
+/// Acceleration per unit of throttle demand (m/s²), the calibration's guess.
+const THROTTLE_GAIN: f32 = 4.0;
 
 impl Core {
     /// `initial_request`: the engage-request flag as first seen, so a request
@@ -140,12 +170,14 @@ impl Core {
             hud: Hud::default(),
             a_est: 0.0,
             prev_speed: None,
-            aeb_i: 0.0,
+            powertrain: actuators::Powertrain::new(),
+            eps: actuators::Eps::new(),
             brake_gain: BRAKE_GAIN_INIT,
             prev_brake: 0.0,
-            prev_speed_for_impact: None,
+            impact_window: std::collections::VecDeque::new(),
             vehicle: vbus::Vehicle::new(can::Delivery::Reactive),
             chassis_last: None,
+            chassis_seen: 0,
             radar_last: None,
             scan_arrived: false,
             avail: degrade::evaluate(None, degrade::Health::default()),
@@ -228,9 +260,10 @@ impl Core {
         // --- What may run (D21) ---
         let frame = host.header.frame;
         if !paused {
-            if self.vehicle.last_frames.iter().any(|(b, _)| *b == "chassis") || self.chassis_last.is_none() {
+            if self.vehicle.ego.frames > self.chassis_seen || self.chassis_last.is_none() {
                 self.chassis_last = Some(frame);
             }
+            self.chassis_seen = self.vehicle.ego.frames;
             if self.scan_arrived || (self.radar_last.is_none() && self.info.is_some()) {
                 self.radar_last = Some(frame);
             }
@@ -255,15 +288,26 @@ impl Core {
                 self.a_est += (a - self.a_est) * (dt / 0.08).min(1.0);
             }
             self.prev_speed = Some(s.speed);
-            if self.prev_brake >= 0.03 && s.speed > 2.0 && self.a_est < -0.5 {
-                let g = (-self.a_est / self.prev_brake).clamp(3.0, 150.0);
-                self.brake_gain += (g - self.brake_gain) * (dt / 0.5).min(1.0);
-            }
+            self.brake_gain = learn_brake_gain(self.brake_gain, self.prev_brake, s.speed, self.a_est, dt);
         }
 
         // An impact cancels everything, as a crash signal does on a real car.
-        let impact = dt > 0.0 && !paused && self.prev_speed_for_impact.is_some_and(|p| (p - s.speed) / dt > IMPACT_DECEL);
-        self.prev_speed_for_impact = (!paused).then_some(s.speed);
+        let impact = if paused {
+            self.impact_window.clear();
+            false
+        } else {
+            let now = host.header.game_time_us;
+            while self.impact_window.front().is_some_and(|&(t, _)| now.saturating_sub(t) > IMPACT_WINDOW_US) {
+                self.impact_window.pop_front();
+            }
+            let peak = self.impact_window.iter().map(|&(_, v)| v).fold(s.speed, f32::max);
+            self.impact_window.push_back((now, s.speed));
+            let hit = dt > 0.0 && peak - s.speed > IMPACT_DV;
+            if hit {
+                self.impact_window.clear();
+            }
+            hit
+        };
 
 
         // --- AEB (always) ---
@@ -358,30 +402,47 @@ impl Core {
             }
         }
 
-        // --- Arbitration: AEB wins ---
+        // --- Arbitration: AEB wins (in the brake ECU) ---
+        let gains = actuators::Gains { throttle: THROTTLE_GAIN, brake: self.brake_gain };
+        let mut req = actuators::AdasRequest::default();
+        if cmd.flags & command_flags::ENGAGED != 0 {
+            req.acc_active = true;
+            req.accel = gains.to_accel(cmd.throttle, cmd.brake);
+            req.hold = cmd.flags & command_flags::HOLD != 0;
+            req.steer_request = cmd.flags & command_flags::STEER != 0;
+            req.steer_angle = cmd.steer_angle;
+        }
         if let Some(a) = aeb {
             if a.warn {
                 cmd.flags |= command_flags::FCW;
             }
             if a.decel > 0.0 {
-                // Track the requested deceleration on the host's brakes.
-                let brake = if a.decel.is_finite() {
-                    self.aeb_i = (self.aeb_i + AEB_KI * (a.decel + self.a_est) * dt).clamp(-0.6, 0.6);
-                    (a.decel / self.brake_gain + self.aeb_i).clamp(0.02, 1.0)
-                } else {
-                    1.0
-                };
                 cmd.flags |= command_flags::AEB;
-                cmd.throttle = 0.0;
-                cmd.brake = cmd.brake.max(brake);
-                cmd.flags &= !command_flags::HOLD;
-            } else {
-                self.aeb_i = 0.0;
+                req.aeb_decel = a.decel;
             }
             if a.hold {
-                cmd.flags |= command_flags::AEB | command_flags::HOLD;
-                cmd.throttle = 0.0;
-                cmd.brake = 0.0;
+                cmd.flags |= command_flags::AEB;
+                req.aeb_hold = true;
+            }
+        }
+
+        // --- Actuation over chassis CAN ---
+        cmd.throttle = 0.0;
+        cmd.brake = 0.0;
+        cmd.steer_angle = 0.0;
+        cmd.flags &= !(command_flags::HOLD | command_flags::STEER);
+        if !paused && dt > 0.0 {
+            let t = host.header.game_time_us as f64 / 1e6;
+            let (accel_rx, steer_rx) = self.vehicle.actuate(t, &req);
+            let (throttle, brake, hold) = self.powertrain.step(&accel_rx, gains, self.a_est, dt);
+            cmd.throttle = throttle;
+            cmd.brake = brake;
+            if hold {
+                cmd.flags |= command_flags::HOLD;
+            }
+            if let Some(a) = self.eps.step(&steer_rx, self.vehicle.ego.steer_angle, dt) {
+                cmd.flags |= command_flags::STEER;
+                cmd.steer_angle = a;
             }
         }
 
@@ -567,12 +628,27 @@ mod tests {
     }
 
     #[test]
+    fn the_brake_gain_is_learned_only_inside_grip() {
+        // Brakes give 40 m/s² per unit: 0.1 of brake measures 4 m/s².
+        let mut g = 8.0;
+        for _ in 0..200 {
+            g = learn_brake_gain(g, 0.1, 15.0, -4.0, 1.0 / 72.0);
+        }
+        assert!((g - 40.0).abs() < 1.0, "learned {g}");
+        // Full braking measures the tyres' 9 m/s², not the brakes: no change.
+        for _ in 0..200 {
+            g = learn_brake_gain(g, 1.0, 15.0, -9.0, 1.0 / 72.0);
+        }
+        assert!((g - 40.0).abs() < 1.0, "full braking taught {g}");
+    }
+
+    #[test]
     fn an_impact_cancels_engagement() {
         let mut core = Core::new(Feature::Acc(Default::default()), false);
         core.set_info(&full_info());
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 13.5);
         step(&mut core, 2, sample_flags::ENGAGE_REQUEST, 13.5);
-        // 13.5 → 5.3 m/s in one frame: about 490 m/s², an impact.
+        // 13.5 → 5.3 m/s in one frame: an impact.
         let (c, e) = step(&mut core, 3, sample_flags::ENGAGE_REQUEST, 5.3);
         assert_eq!(e, Event::Impact);
         assert_eq!((c.flags, c.throttle), (0, 0.0));
@@ -580,8 +656,18 @@ mod tests {
         let mut core = Core::new(Feature::Acc(Default::default()), false);
         core.set_info(&full_info());
         step(&mut core, 1, sample_flags::ENGAGE_REQUEST, 20.0);
-        let (_, e) = step(&mut core, 2, sample_flags::ENGAGE_REQUEST, 20.0 - 8.0 * 0.016_667);
-        assert_ne!(e, Event::Impact);
+        for i in 2..40 {
+            let (_, e) = step(&mut core, i, sample_flags::ENGAGE_REQUEST, 20.0 - 11.0 * 0.016_667 * (i - 1) as f32);
+            assert_ne!(e, Event::Impact, "hard braking at step {i}");
+        }
+        // A one-frame glitch, as when GTA stalls loading a model: 0.24 m/s
+        // in one frame (about 15 m/s²), then back to normal.
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        core.set_info(&full_info());
+        for (i, v) in [(1, 13.88), (2, 13.88), (3, 13.64), (4, 13.6), (5, 13.6)] {
+            let (_, e) = step(&mut core, i, sample_flags::ENGAGE_REQUEST, v);
+            assert_ne!(e, Event::Impact, "glitch at step {i}");
+        }
     }
 
     #[test]

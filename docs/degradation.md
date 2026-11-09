@@ -13,9 +13,9 @@ One table, from each missing adapter capability or sensor fault to the features 
 | **Chassis CAN silent** for over 0.25 s (18 frames) | ✗ | ✗ | ✗ | ✗ | ✗ | "vehicle data lost" |
 | **Radar silent** for over 0.5 s (36 frames, 10 scans) | ✗ | ✗ | ✗ | — | ✓ | "radar blocked", plus "AEB OFF" |
 
-AEB unavailable shows as **AEB OFF** on the HUD. A lost core, through a crash or a stall, is handled by the adapter's safe state (D24), not by this matrix.
+AEB unavailable shows as **AEB OFF** on the HUD. A lost core, through a crash or a stall, is handled by the adapter's safe state (D24), not by this matrix. Inside the core, the actuator ECUs drop any request they haven't heard again for 0.1 s, so a silent ADAS ECU releases the car.
 
 Not yet in the matrix:
-- bus faults such as bad checksums or counters (counted in `BusStats::errors`, not acted on yet);
+- bus faults short of silence, such as bad checksums or CRC errors: counted (`BusStats::errors`, `crc_errors`); the bad frames are discarded and the last good values held. A bus whose frames all fail counts as silent;
 - weather and dirt on the sensors (Phase 1 error model);
 - the corner radars and ultrasonics (Phase 2).

@@ -9,6 +9,7 @@
 //! The DBC files and the topology are compiled in, so a replay rebuilds the
 //! same bus traffic.
 
+use crate::actuators::{AccelRequest, AdasRequest, FULL_DECEL_SENT, SteerRequest};
 use adapter_api::VehicleSample;
 use can::{Bus, Dbc, Delivery, Frame, Message, Topology, toyota};
 use sensors::{RadarObject, RadarScan};
@@ -44,6 +45,8 @@ pub struct BusStats {
     pub adas_frames: u64,
     /// Frames lost to bad checksums or counters.
     pub errors: u64,
+    /// Frames lost to CAN CRC errors on the wire (both buses).
+    pub crc_errors: u64,
     /// Radar path: frames from a scan's creation to its arrival at the ADAS
     /// ECU (the last scan's value).
     pub radar_latency_frames: u32,
@@ -77,7 +80,18 @@ pub struct Vehicle {
     pub stats: BusStats,
     /// Every frame delivered in the last step: (bus, frame).
     pub last_frames: Vec<(&'static str, Frame)>,
+    lta_counter: u8,
+    /// What the actuator ECUs last received, and when (s).
+    pub accel_rx: AccelRequest,
+    pub steer_rx: SteerRequest,
+    accel_rx_t: f64,
+    pcs_rx_t: f64,
+    steer_rx_t: f64,
 }
+
+/// An actuator ECU drops a request it hasn't heard again for this long (s):
+/// a silent ADAS ECU releases the car.
+pub const ACTUATOR_TIMEOUT: f64 = 0.1;
 
 fn msg<'a>(dbc: &'a Dbc, name: &str) -> &'a Message {
     dbc.message(name).unwrap_or_else(|| panic!("DBC lacks {name}"))
@@ -108,6 +122,12 @@ impl Vehicle {
             sent_scans: Vec::new(),
             stats: BusStats::default(),
             last_frames: Vec::new(),
+            lta_counter: 0,
+            accel_rx: AccelRequest::default(),
+            steer_rx: SteerRequest::default(),
+            accel_rx_t: f64::NEG_INFINITY,
+            pcs_rx_t: f64::NEG_INFINITY,
+            steer_rx_t: f64::NEG_INFINITY,
         }
     }
 
@@ -214,6 +234,108 @@ impl Vehicle {
         arrived
     }
 
+    /// The ADAS ECU's requests at time `t`: `ACC_CONTROL`, `PRE_COLLISION_2`
+    /// and `STEERING_LTA` on chassis CAN, once per host frame. The bus runs
+    /// again and the actuator ECUs read what arrived (in reactive delivery,
+    /// this step's requests; in realistic delivery, after their transmission).
+    /// Returns what the actuator ECUs act on now.
+    pub fn actuate(&mut self, t: f64, r: &AdasRequest) -> (AccelRequest, SteerRequest) {
+        let acc = msg(&self.chassis_dbc, "ACC_CONTROL");
+        let mut d = acc
+            .encode(&[
+                ("ACCEL_CMD", r.accel as f64),
+                ("ACC_TYPE", r.acc_active as u8 as f64),
+                ("PERMIT_BRAKING", 1.0),
+                ("RELEASE_STANDSTILL", if r.hold { 0.0 } else { 1.0 }),
+            ])
+            .expect("ACC_CONTROL");
+        toyota::seal(acc.id, &mut d);
+        let acc_id = acc.id;
+        let pcs = msg(&self.chassis_dbc, "PRE_COLLISION_2");
+        let decel = if r.aeb_decel.is_finite() { r.aeb_decel } else { FULL_DECEL_SENT };
+        let braking = r.aeb_decel > 0.0;
+        let mut p = pcs
+            .encode(&[
+                // Toyota sends the deceleration as a negative acceleration.
+                ("DSS1GDRV", if braking { -decel as f64 } else { 0.0 }),
+                ("IBTRGR", braking as u8 as f64),
+                ("PBATRGR", r.aeb_hold as u8 as f64),
+            ])
+            .expect("PRE_COLLISION_2");
+        toyota::seal(pcs.id, &mut p);
+        let pcs_id = pcs.id;
+        let lta = msg(&self.chassis_dbc, "STEERING_LTA");
+        let sw_deg = if r.steer_request && r.steer_angle.is_finite() { (r.steer_angle * STEERING_RATIO).to_degrees() as f64 } else { 0.0 };
+        let mut l = lta
+            .encode(&[
+                ("STEER_REQUEST", r.steer_request as u8 as f64),
+                ("STEER_REQUEST_2", r.steer_request as u8 as f64),
+                ("LKA_ACTIVE", r.steer_request as u8 as f64),
+                ("SETME_X1", 1.0),
+                ("SETME_X3", 3.0),
+                ("PERCENTAGE", 100.0),
+                ("STEER_ANGLE_CMD", sw_deg),
+                ("COUNTER", (self.lta_counter & 0x3F) as f64),
+            ])
+            .expect("STEERING_LTA");
+        self.lta_counter = self.lta_counter.wrapping_add(1);
+        toyota::seal(lta.id, &mut l);
+        let lta_id = lta.id;
+        self.chassis.send(acc_id, d);
+        self.chassis.send(pcs_id, p);
+        self.chassis.send(lta_id, l);
+        for f in self.chassis.step(t) {
+            self.stats.chassis_frames += 1;
+            self.read_actuation(&f, t);
+            self.last_frames.push(("chassis", f));
+        }
+        // Requests not heard again lapse, each message on its own: losing
+        // ACC's requests must not cancel AEB's.
+        if t - self.accel_rx_t > ACTUATOR_TIMEOUT {
+            (self.accel_rx.acc_active, self.accel_rx.accel, self.accel_rx.hold) = (false, 0.0, false);
+        }
+        if t - self.pcs_rx_t > ACTUATOR_TIMEOUT {
+            (self.accel_rx.aeb_decel, self.accel_rx.aeb_hold) = (0.0, false);
+        }
+        if t - self.steer_rx_t > ACTUATOR_TIMEOUT {
+            self.steer_rx = SteerRequest::default();
+        }
+        (self.accel_rx, self.steer_rx)
+    }
+
+    /// The powertrain/brake ECU and the EPS read their requests.
+    fn read_actuation(&mut self, f: &Frame, t: f64) {
+        let Some(m) = self.chassis_dbc.message_by_id(f.id) else { return };
+        if !matches!(m.name.as_str(), "ACC_CONTROL" | "PRE_COLLISION_2" | "STEERING_LTA") {
+            // Chassis traffic that was still queued: the ADAS ECU reads it too.
+            self.read_chassis(f);
+            return;
+        }
+        if !toyota::verify(f.id, &f.data) {
+            self.stats.errors += 1;
+            return;
+        }
+        let g = |n: &str| m.decode(&f.data, n).unwrap_or(0.0);
+        match m.name.as_str() {
+            "ACC_CONTROL" => {
+                self.accel_rx.acc_active = g("ACC_TYPE") as u8 == 1;
+                self.accel_rx.accel = g("ACCEL_CMD") as f32;
+                self.accel_rx.hold = g("RELEASE_STANDSTILL") < 0.5;
+                self.accel_rx_t = t;
+            }
+            "PRE_COLLISION_2" => {
+                self.accel_rx.aeb_decel = if g("IBTRGR") > 0.5 { (-g("DSS1GDRV")).max(0.0) as f32 } else { 0.0 };
+                self.accel_rx.aeb_hold = g("PBATRGR") as u8 == 1;
+                self.pcs_rx_t = t;
+            }
+            "STEERING_LTA" => {
+                self.steer_rx = SteerRequest { request: g("STEER_REQUEST") > 0.5, sw_deg: g("STEER_ANGLE_CMD") as f32 };
+                self.steer_rx_t = t;
+            }
+            _ => {}
+        }
+    }
+
     fn read_chassis(&mut self, f: &Frame) {
         let Some(m) = self.chassis_dbc.message_by_id(f.id) else { return };
         if m.signal("CHECKSUM").is_some() && !toyota::verify(f.id, &f.data) {
@@ -278,8 +400,25 @@ impl Vehicle {
         None
     }
 
+    /// Injects a fault on `bus` ("chassis" or "adas"), on the message named
+    /// `message` (`None` = every frame on the bus).
+    pub fn inject(&mut self, bus: &str, message: Option<&str>, kind: can::FaultKind, p: f64, from: f64, until: f64) -> Result<(), String> {
+        let (b, dbc) = match bus {
+            "chassis" => (&mut self.chassis, &self.chassis_dbc),
+            "adas" => (&mut self.adas, &self.adas_dbc),
+            _ => return Err(format!("no bus {bus:?} (chassis, adas)")),
+        };
+        let id = match message {
+            Some(m) => Some(dbc.message(m).ok_or(format!("{bus} has no message {m}"))?.id),
+            None => None,
+        };
+        b.inject(can::Fault { id, kind, p, from, until });
+        Ok(())
+    }
+
     /// Bus loads since the last call (resets the windows).
     pub fn take_loads(&mut self) -> (f64, f64) {
+        self.stats.crc_errors = self.chassis.faulted[1] + self.adas.faulted[1];
         self.stats.chassis_load = self.chassis.take_load();
         self.stats.adas_load = self.adas.take_load();
         (self.stats.chassis_load, self.stats.adas_load)
@@ -317,6 +456,21 @@ mod tests {
         let (chassis, _) = v.take_loads();
         // About 360 × 0.24 ms ≈ 8–9 % of a 500 kbit/s bus.
         assert!((0.06..0.12).contains(&chassis), "chassis load {chassis}");
+    }
+
+    #[test]
+    fn corrupted_frames_are_counted_and_ignored() {
+        let mut v = Vehicle::new(Delivery::Reactive);
+        v.inject("chassis", Some("STEER_ANGLE_SENSOR"), can::FaultKind::Corrupt, 1.0, f64::NEG_INFINITY, f64::INFINITY).unwrap();
+        let s = VehicleSample { speed: 10.0, steer_angle: 0.05, ..Default::default() };
+        for i in 0..10 {
+            v.step(i as f64 / 72.0, i, &s, None);
+        }
+        assert!(v.chassis.faulted[1] > 0, "CRC failures injected");
+        assert_eq!(v.ego.steer_angle, 0.0, "a corrupted angle is never used");
+        assert!((v.ego.speed - 10.0).abs() < 0.01, "other messages unaffected");
+        assert!(v.inject("body", None, can::FaultKind::Drop, 1.0, 0.0, 1.0).is_err());
+        assert!(v.inject("adas", Some("NOPE"), can::FaultKind::Drop, 1.0, 0.0, 1.0).is_err());
     }
 
     #[test]

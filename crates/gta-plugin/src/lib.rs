@@ -10,7 +10,7 @@
 //!   fades out over about a second; TAKE OVER shows on the HUD.
 //!
 //! Driver keys: F10 engage / cancel ACC · F3 cancel · Page Up / Page Down set speed ±5 km/h
-//! · Home cycle the time gap. AEB is always armed.
+//! · End cycle the time gap (Home opens the Rockstar overlay). AEB is always armed.
 //! Test keys: F6 60 fps cap · F7 teleport to the next test spot · F8 spawn a
 //! Sultan · F9 GTA AI drives · F11 spawn a lead car ahead (12 m/s) · F5 the
 //! lead brakes hard · F4 spawn a stopped car ahead.
@@ -53,7 +53,7 @@ const VK_F5: i32 = 0x74;
 const VK_F11: i32 = 0x7A;
 const VK_PRIOR: i32 = 0x21;
 const VK_NEXT: i32 = 0x22;
-const VK_HOME: i32 = 0x24;
+const VK_END: i32 = 0x23;
 
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -191,6 +191,8 @@ fn run() {
     let mut fcw_last = false;
     let mut cap60 = false;
     let mut spot = 0usize;
+    // Set once a test tool has been used (F7 or F8): police stay away from then on.
+    let mut test_mode = false;
     let mut test_car = 0i32;
     let mut ai = false;
     let mut engage_req = false;
@@ -252,7 +254,11 @@ fn run() {
             engage_req = false;
             let _ = writeln!(log, "frame {frame}: cancel button");
         }
+        if test_mode {
+            tools::keep_unwanted();
+        }
         if keys.pressed(1, VK_F7) {
+            test_mode = true;
             // Test cars from an earlier test stay behind otherwise.
             tools::clear_lead(&mut lead);
             tools::teleport(ped, veh, spot, &mut log);
@@ -260,6 +266,7 @@ fn run() {
             last_tick = wall_time_ns();
         }
         if keys.pressed(2, VK_F8) {
+            test_mode = true;
             tools::spawn(ped, c"sultan", &mut test_car, &mut log);
             last_tick = wall_time_ns();
         }
@@ -287,7 +294,7 @@ fn run() {
         if keys.pressed(6, VK_NEXT) {
             btn |= buttons::SPEED_DOWN;
         }
-        if keys.pressed(7, VK_HOME) {
+        if keys.pressed(7, VK_END) {
             btn |= buttons::GAP;
         }
         if keys.pressed(8, VK_F11) && in_vehicle {
@@ -628,7 +635,7 @@ fn run() {
                 0.015,
                 0.062,
                 &format!(
-                    "F10 ACC | PgUp/PgDn speed | Home gap | F11 lead | F5 lead brakes | F4 stopped car | F7 tp | F8 car | F9 AI | F6 cap60 {}{warn}",
+                    "F10 ACC | PgUp/PgDn speed | End gap | F11 lead | F5 lead brakes | F4 stopped car | F7 tp | F8 car | F9 AI | F6 cap60 {}{warn}",
                     if cap60 { "ON" } else { "off" }
                 ),
                 (255, 255, 255),

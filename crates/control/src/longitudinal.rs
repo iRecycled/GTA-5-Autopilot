@@ -88,6 +88,9 @@ pub struct Output {
     pub ref_accel: f32,
     /// The raw demand before the pedal split, -1..=1.
     pub demand: f32,
+    /// The acceleration this command asks of the car (m/s²): what an ACC
+    /// sends on the bus (`ACC_CONTROL.ACCEL_CMD`), jerk-limited.
+    pub accel: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,7 +228,7 @@ impl SpeedController {
     }
 
     fn output(&self, throttle: f32, brake: f32, demand: f32, hold: bool) -> Output {
-        Output { throttle, brake, hold, reference: self.reference, ref_accel: self.ref_accel, demand }
+        Output { throttle, brake, hold, reference: self.reference, ref_accel: self.ref_accel, demand, accel: self.a_cmd }
     }
 }
 

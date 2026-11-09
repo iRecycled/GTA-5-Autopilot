@@ -13,6 +13,8 @@
 
 use std::collections::VecDeque;
 
+use crate::fault::{Fault, FaultKind, Rng};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
     Reactive,
@@ -37,6 +39,8 @@ pub struct Frame {
     pub queued: f64,
     /// Time it was delivered (s), set by the bus.
     pub delivered: f64,
+    /// Damaged on the wire: it fails the CAN CRC and every receiver discards it.
+    pub crc_error: bool,
 }
 
 /// A frame's length in bits: (at the nominal rate, at the data rate).
@@ -160,11 +164,43 @@ pub struct Bus {
     busy_time: f64,
     since: f64,
     pub delivered_total: u64,
+    faults: Vec<Fault>,
+    rng: Rng,
+    /// Frames held back by a delay fault: (release time, frame).
+    delayed: Vec<(f64, Frame)>,
+    /// Frames the faults dropped, corrupted and delayed so far.
+    pub faulted: [u64; 3],
 }
 
 impl Bus {
     pub fn new(cfg: BusConfig) -> Self {
-        Self { cfg, queue: VecDeque::new(), now: 0.0, busy_until: 0.0, busy_time: 0.0, since: 0.0, delivered_total: 0 }
+        let rng = Rng::seeded(&cfg.name);
+        Self {
+            cfg,
+            queue: VecDeque::new(),
+            now: 0.0,
+            busy_until: 0.0,
+            busy_time: 0.0,
+            since: 0.0,
+            delivered_total: 0,
+            faults: Vec::new(),
+            rng,
+            delayed: Vec::new(),
+            faulted: [0; 3],
+        }
+    }
+
+    /// Adds a fault; every fault that matches a frame applies, in order.
+    pub fn inject(&mut self, f: Fault) {
+        self.faults.push(f);
+    }
+
+    pub fn clear_faults(&mut self) {
+        self.faults.clear();
+    }
+
+    pub fn faults(&self) -> &[Fault] {
+        &self.faults
     }
 
     /// Transmission time of a frame on this bus (s).
@@ -173,12 +209,55 @@ impl Bus {
         n as f64 / self.cfg.nominal_bps as f64 + self.cfg.data_bps.map(|r| d as f64 / r as f64).unwrap_or(0.0)
     }
 
-    pub fn send(&mut self, id: u32, data: Vec<u8>) {
-        self.queue.push_back(Frame { id, data, queued: self.now, delivered: f64::NAN });
+    pub fn send(&mut self, id: u32, mut data: Vec<u8>) {
+        let mut delay = 0.0;
+        let mut crc_error = false;
+        for f in &self.faults {
+            if !f.matches(id, self.now) || self.rng.next_f64() >= f.p {
+                continue;
+            }
+            match f.kind {
+                FaultKind::Drop => {
+                    self.faulted[0] += 1;
+                    return;
+                }
+                FaultKind::Corrupt => {
+                    // One bit flipped on the wire.
+                    if let Some(b) = data.first_mut() {
+                        *b ^= 0x01;
+                    }
+                    crc_error = true;
+                    self.faulted[1] += 1;
+                }
+                FaultKind::Delay(d) => {
+                    delay += d;
+                    self.faulted[2] += 1;
+                }
+            }
+        }
+        let frame = Frame { id, data, queued: self.now, delivered: f64::NAN, crc_error };
+        if delay > 0.0 {
+            self.delayed.push((self.now + delay, frame));
+        } else {
+            self.queue.push_back(frame);
+        }
     }
 
     /// Advances to time `t` (s); returns the frames delivered, in bus order.
     pub fn step(&mut self, t: f64) -> Vec<Frame> {
+        // Delayed frames whose time has come join the queue.
+        if !self.delayed.is_empty() {
+            let mut i = 0;
+            while i < self.delayed.len() {
+                if self.delayed[i].0 <= t {
+                    let (at, mut f) = self.delayed.remove(i);
+                    f.queued = at;
+                    self.queue.push_back(f);
+                } else {
+                    i += 1;
+                }
+            }
+        }
         let mut out = Vec::new();
         // Arbitration: whenever the bus is free, the lowest waiting id goes.
         let mut clock = self.busy_until.max(self.now);
@@ -208,8 +287,12 @@ impl Bus {
                 Delivery::Reactive => t,
                 Delivery::Realistic => end,
             };
-            self.delivered_total += 1;
-            out.push(f);
+            // A frame that fails its CRC took its bus time, but nobody gets it.
+            // (Real controllers send an error frame and retry; not modelled.)
+            if !f.crc_error {
+                self.delivered_total += 1;
+                out.push(f);
+            }
         }
         self.busy_until = clock;
         self.now = t;
@@ -227,7 +310,7 @@ impl Bus {
     }
 
     pub fn backlog(&self) -> usize {
-        self.queue.len()
+        self.queue.len() + self.delayed.len()
     }
 }
 
@@ -293,6 +376,48 @@ mod tests {
         b.send(0x100, vec![0; 8]);
         assert!(b.step(0.000_1).is_empty(), "delivered before its last bit");
         assert_eq!(b.step(0.001).len(), 1);
+    }
+
+    #[test]
+    fn faults_drop_corrupt_and_delay() {
+        let mut b = classic(Delivery::Reactive);
+        b.inject(Fault::always(Some(0x100), FaultKind::Drop));
+        b.inject(Fault::always(Some(0x200), FaultKind::Corrupt));
+        b.inject(Fault::always(Some(0x300), FaultKind::Delay(0.05)));
+        b.send(0x100, vec![0; 8]);
+        b.send(0x200, vec![0; 8]);
+        b.send(0x300, vec![0; 8]);
+        b.send(0x400, vec![0; 8]);
+        let out = b.step(0.01);
+        let ids: Vec<u32> = out.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![0x400], "dropped, corrupted (CRC) and delayed frames missing");
+        assert!(b.take_load() > 0.0);
+        assert!(b.step(0.04).is_empty());
+        let late = b.step(0.06);
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].id, 0x300);
+        assert_eq!(b.faulted, [1, 1, 1]);
+    }
+
+    #[test]
+    fn faults_respect_probability_window_and_are_deterministic() {
+        let run = || {
+            let mut b = classic(Delivery::Reactive);
+            b.inject(Fault { id: None, kind: FaultKind::Drop, p: 0.3, from: 1.0, until: 2.0 });
+            let mut got = Vec::new();
+            for i in 0..300 {
+                let t = i as f64 * 0.01;
+                b.send(0x100, vec![0; 8]);
+                got.push(!b.step(t).is_empty());
+            }
+            got
+        };
+        let a = run();
+        assert_eq!(a, run(), "same draws every run");
+        // Nothing lost outside the window; about 30 % inside it.
+        assert!(a[..100].iter().all(|&x| x) && a[201..].iter().all(|&x| x));
+        let lost = a[101..201].iter().filter(|&&x| !x).count();
+        assert!((15..=45).contains(&lost), "{lost} of 100 lost");
     }
 
     #[test]

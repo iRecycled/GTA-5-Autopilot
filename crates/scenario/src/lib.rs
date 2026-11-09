@@ -5,11 +5,14 @@
 //! A scenario may repeat (`[repeat] count = 10`) with the first actor's start
 //! position spread over `vary_s` metres, so a gate like "AEB stops in 10 of
 //! 10 runs" is checked over different geometries and sensor noise.
+//!
+//! `[[fault]]` tables inject bus faults (drop, corrupt or delay frames) on
+//! the virtual vehicle's buses, by message, with a probability and a window.
 
 use std::path::Path;
 
 use adapter_api::{Command, buttons, command_flags, hud_flags, sample_flags};
-use adas_core::{Core, Feature, Inputs};
+use adas_core::{Core, Event as CoreEvent, Feature, Inputs};
 use serde::Deserialize;
 use sim::{ActorSpec, EgoParams, Event, Road, World};
 
@@ -28,7 +31,27 @@ pub struct Scenario {
     pub actor: Vec<ActorToml>,
     #[serde(default)]
     pub repeat: Repeat,
+    #[serde(default)]
+    pub fault: Vec<FaultToml>,
     pub pass: Pass,
+}
+
+/// A bus fault for the whole run or a window of it.
+#[derive(Debug, Deserialize)]
+pub struct FaultToml {
+    /// "chassis" or "adas".
+    pub bus: String,
+    /// A message name from the bus's DBC; omit for every frame on the bus.
+    pub message: Option<String>,
+    /// "drop", "corrupt" or "delay".
+    pub kind: String,
+    /// Delay for "delay" (s).
+    pub delay: Option<f64>,
+    /// Probability per frame (default 1).
+    pub p: Option<f64>,
+    /// Window (s); default the whole run.
+    pub from: Option<f64>,
+    pub until: Option<f64>,
 }
 
 fn default_fps() -> f32 {
@@ -119,6 +142,12 @@ pub struct Pass {
     pub end_speed_below: Option<f32>,
     /// The ego car must end above this speed (m/s): it resumed.
     pub end_speed_above: Option<f32>,
+    /// A feature must have been reported unavailable for this reason (the
+    /// HUD text, e.g. "radar blocked").
+    pub unavailable: Option<String>,
+    /// No feature may be reported unavailable.
+    #[serde(default)]
+    pub stays_available: bool,
 }
 
 fn yes() -> bool {
@@ -136,6 +165,10 @@ pub struct Report {
     pub min_ttc: f32,
     pub end_speed: f32,
     pub end_gap: f32,
+    /// Unavailability reasons reported during the run (HUD text).
+    pub unavailable: Vec<String>,
+    /// Bus frames lost to checksum failures.
+    pub bus_errors: u64,
     pub failures: Vec<String>,
 }
 
@@ -195,6 +228,17 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
     let acc = sc.feature == "acc";
     let mut core = Core::new(feature, false);
     core.set_info(&world.info());
+    for f in &sc.fault {
+        let kind = match (f.kind.as_str(), f.delay) {
+            ("drop", _) => can::FaultKind::Drop,
+            ("corrupt", _) => can::FaultKind::Corrupt,
+            ("delay", Some(d)) => can::FaultKind::Delay(d),
+            (k, _) => panic!("{}: fault kind {k:?} (drop, corrupt, or delay with `delay`)", sc.name),
+        };
+        core.vehicle_mut()
+            .inject(&f.bus, f.message.as_deref(), kind, f.p.unwrap_or(1.0), f.from.unwrap_or(f64::NEG_INFINITY), f.until.unwrap_or(f64::INFINITY))
+            .unwrap_or_else(|e| panic!("{}: {e}", sc.name));
+    }
     let cruise = kph(sc.ego.speed_kph);
 
     let mut rep = Report { run, min_ttc: f32::INFINITY, ..Default::default() };
@@ -230,7 +274,12 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
         let driver_throttle = if acc || aeb_seen { 0.0 } else { (0.3 * (cruise - world.v) + 0.05).clamp(0.0, 0.6) };
         s.driver_throttle = driver_throttle;
         let a = world.actors(core.layout());
-        let (cmd, _) = core.step(Inputs { sample: &s, actors: &a, stick: None });
+        let (cmd, ev) = core.step(Inputs { sample: &s, actors: &a, stick: None });
+        if let CoreEvent::Unavailable(r) = ev
+            && !rep.unavailable.iter().any(|u| u == r.text())
+        {
+            rep.unavailable.push(r.text().to_string());
+        }
         let aeb_on = cmd.flags & command_flags::AEB != 0;
         aeb_seen |= aeb_on;
         let applied = if cmd.flags & (command_flags::ENGAGED | command_flags::AEB) != 0 {
@@ -279,6 +328,7 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
         }
     }
     rep.aeb = core.aeb_activations();
+    rep.bus_errors = core.vehicle().stats.errors;
     rep.end_speed = world.v;
     rep.end_gap = world.gap_ahead().map(|g| g.0).unwrap_or(f32::INFINITY);
 
@@ -328,6 +378,14 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
         && rep.end_speed <= v
     {
         fail(format!("end speed {:.2} ≤ {v} m/s", rep.end_speed));
+    }
+    if let Some(u) = &p.unavailable
+        && !rep.unavailable.iter().any(|x| x == u)
+    {
+        fail(format!("never reported unavailable for {u:?} (got {:?})", rep.unavailable));
+    }
+    if p.stays_available && !rep.unavailable.is_empty() {
+        fail(format!("reported unavailable: {:?}", rep.unavailable));
     }
     let _ = a_hist;
     rep

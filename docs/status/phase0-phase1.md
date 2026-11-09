@@ -28,7 +28,7 @@ This report covers the work since spike S3/S6: the Phase 0 build, and the first 
 
 Driving it:
 - `cargo xtask deploy` installs the adapter, and `adas-core --feature acc` runs the core.
-- In the car: **F10** engages ACC, **F3** cancels, **Page Up / Page Down** change the set speed by ±5 km/h, and **Home** cycles the time gap. AEB is always armed.
+- In the car: **F10** engages ACC, **F3** cancels, **Page Up / Page Down** change the set speed by ±5 km/h, and **End** cycles the time gap (not Home: that opens the Rockstar overlay). AEB is always armed.
 - Test keys: **F11** spawns a lead car, **F5** makes it brake hard, and **F4** spawns a stopped car.
 
 ## Phase 0 gate
@@ -43,7 +43,7 @@ Driving it:
 
 ## Phase 1 so far
 
-### In the simulator (`cargo test -p scenario`): 41/41 runs pass, with every input through the buses
+### In the simulator (`cargo test -p scenario`): 46/46 runs pass, with every input and every command through the buses
 
 | Scenario | Runs | Result |
 | --- | --- | --- |
@@ -77,7 +77,10 @@ Driving it:
   The adapter now checks a memory region once and caches it, then writes directly at 0.2 µs per steering frame.
 - **GTA's own AI shares the raycast pool.** When an async ray can't start, sync rays fill in.
 - **`GetAsyncKeyState` doesn't work in another process while GTA has focus.** The core's test driver uses a low-level keyboard hook instead.
-- **An impact while ACC was engaged.** In one GTA run the unsteered car drifted out of line with its lead and ran into the end of the taxiway, which the actor-list radar can't see. ACC then held full throttle at a standstill. An impact-level deceleration (beyond 1.5 g) now cancels everything, as an airbag controller's crash signal would.
+- **An impact while ACC was engaged.** In one GTA run the unsteered car drifted out of line with its lead and ran into the end of the taxiway, which the actor-list radar can't see. ACC then held full throttle at a standstill. An impact now cancels everything, as an airbag controller's crash signal would.
+- **A false impact.** Spawning a car stalls GTA for about 70 ms, and in that frame the reported speed dropped 0.24 m/s in 14 ms of game time (17 m/s²). The first impact check (any frame beyond 1.5 g) took that for a crash and cancelled ACC. Impacts are now judged as crash sensing does, by speed lost: more than 1.5 m/s within 0.1 s. Hard braking loses about 1.1 m/s in that time; the glitch, 0.24.
+- **The brake-gain learner learned from full braking.** At full brake the tyres, not the brakes, set the deceleration, so one AEB stop taught a gain of 26 instead of 43 and saved it to the profile. The gain is now learned only while the demand asks for less than 6 m/s², inside grip.
+- **Police at the airport.** The taxiway is a restricted area; a one-off wanted-level clear at teleport didn't hold. Once a test tool is used (F7, F8), the adapter now keeps the wanted level at zero and the police ignoring the player.
 
 ## Open items
 
@@ -94,11 +97,23 @@ Driving it:
   - **ADAS ECU:** reads both buses.
   - **Load:** the chassis bus runs at about 8–9% load.
   - **Radar path:** a scan arrives in the same or the next frame, within the 2-frame gate.
+  - **Actuation over the bus (D28).** Commands no longer go from the features to the adapter directly. The ADAS ECU sends three messages on chassis CAN, as a TSS2 car's ADAS does:
+    - `ACC_CONTROL`, the acceleration request (0.001 m/s² steps) and the standstill hold;
+    - `PRE_COLLISION_2`, AEB's deceleration request;
+    - `STEERING_LTA`, the steering-wheel angle request.
+
+    Two actuator ECUs act on them:
+    - the **powertrain/brake ECU** turns the acceleration into pedals through the car's calibration (the vehicle profile), runs AEB's closed deceleration loop and holds the car at a standstill;
+    - the **EPS** steers the road wheels within its rate (0.8 rad/s) and range (0.6 rad) limits, starting from the measured angle so engaging doesn't jerk the wheel.
+
+    Requests not heard again for 0.1 s lapse, so a silent ADAS ECU releases the car. All the scenarios still pass. Replaying the old GTA drive through the new path changes pedals by at most 0.00012, which is the bus resolution, and changes no flags.
+  - **Fault injection.** Each bus can drop, corrupt (a CAN CRC error: the frame takes its bus time and nobody receives it) or delay frames, by message, with a probability and a time window. Faults are deterministic (seeded per bus), so a faulted run replays exactly. Scenarios script them with `[[fault]]` tables, and health checks now count only valid frames. Three fault scenarios pass:
+    - **radar silent for 2 s while following:** ACC disengages with "radar blocked";
+    - **20% CRC errors on chassis CAN plus a radar 40 ms late:** ACC follows as before (time-gap error 0.01–0.02 s) and stays available;
+    - **`ACC_CONTROL` lost while the lead brakes hard:** AEB's own message still gets through and stops the car 6.1 m short. This scenario found a bug: losing `ACC_CONTROL` timed out AEB's request too. Each message now has its own timeout.
+  - **candump export:** `replay --candump` writes the regenerated traffic, including the actuation frames, in `candump -L` format.
 - **Still to do in Phase 1:**
-  - actuation over the bus (`ACC_CONTROL` acceleration requests, `STEERING_LTA`, and an actuator ECU with the EPS model); commands still go to the adapter directly;
   - DBC code generation (the runtime DBC is used instead);
-  - fault injection;
   - a live CAN trace and bus-load view;
   - D11 takeover escalation;
-  - the egui panel and Rerun views;
-  - candump export.
+  - the egui panel and Rerun views.

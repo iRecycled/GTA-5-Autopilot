@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 adapter-api = { path = "../adapter-api" }
 adas-core = { path = "../adas-core" }
+can = { path = "../can" }
 sim = { path = "../sim" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

@@ -1,0 +1,36 @@
+# A noisy chassis bus: 20 % of its frames fail the CAN CRC, and the radar
+# path runs 40 ms late. Nobody receives the bad frames; the ADAS ECU holds the last
+# good values; ACC follows as well as ever and stays available.
+name = "Fault: CRC errors on chassis CAN and a late radar"
+feature = "acc"
+duration = 60.0
+
+[ego]
+speed_kph = 90
+engage_at = 0.5
+set_kph = 100
+
+[[actor]]
+s = 90
+speed_kph = 80
+
+[[fault]]
+bus = "chassis"
+kind = "corrupt"
+p = 0.2
+
+[[fault]]
+bus = "adas"
+kind = "delay"
+delay = 0.04
+
+[repeat]
+count = 3
+vary_s = 40
+
+[pass]
+max_jerk = 2.5
+gap_error_s = 0.3
+steady = [40.0, 60.0]
+max_aeb = 0
+stays_available = true

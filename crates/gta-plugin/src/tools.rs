@@ -38,6 +38,20 @@ pub fn spot_count() -> usize {
     if u.is_empty() { SPOTS.len() } else { u.len() }
 }
 
+/// While testing: no police. The airport is a restricted area, and a one-off
+/// clear at teleport doesn't stop the wanted level coming back.
+pub fn keep_unwanted() {
+    unsafe {
+        let player: i32 = invoke!(n::PLAYER_ID);
+        let level: i32 = invoke!(n::GET_PLAYER_WANTED_LEVEL, player);
+        if level > 0 {
+            let () = invoke!(n::CLEAR_PLAYER_WANTED_LEVEL, player);
+        }
+        let () = invoke!(n::SET_MAX_WANTED_LEVEL, 0i32);
+        let () = invoke!(n::SET_POLICE_IGNORE_PLAYER, player, true);
+    }
+}
+
 pub fn teleport(ped: i32, veh: i32, idx: usize, log: &mut impl Write) {
     let user = user_spots();
     let (name, x, y, z, h, snap) = if user.is_empty() {

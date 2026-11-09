@@ -10,9 +10,11 @@
 
 pub mod bus;
 pub mod dbc;
+pub mod fault;
 pub mod topology;
 pub mod toyota;
 
 pub use bus::{Bus, BusConfig, Delivery, Frame};
 pub use dbc::{Dbc, Message, Signal};
+pub use fault::{Fault, FaultKind};
 pub use topology::Topology;

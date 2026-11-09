@@ -155,6 +155,17 @@ impl Ret for bool {
         unsafe { *(p as *const i32) != 0 }
     }
 }
+impl Ret for u32 {
+    unsafe fn read(p: *const u64) -> Self {
+        unsafe { *(p as *const u32) }
+    }
+}
+/// Natives returning `const char*` (may be null).
+impl Ret for *const c_char {
+    unsafe fn read(p: *const u64) -> Self {
+        unsafe { *(p as *const *const c_char) }
+    }
+}
 impl Ret for f32 {
     unsafe fn read(p: *const u64) -> Self {
         unsafe { *(p as *const f32) }

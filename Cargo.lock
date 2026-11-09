@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "s45-vehicle"
+version = "0.1.0"
+dependencies = [
+ "shv-sys",
+]
+
+[[package]]
 name = "shv-sys"
 version = "0.1.0"
 

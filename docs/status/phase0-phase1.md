@@ -15,7 +15,10 @@ This report covers the work since spike S3/S6: the Phase 0 build, and the first 
 | `fusion` | A Kalman filter per track, track confirmation and deletion, and lead selection along the predicted path |
 | `features` | ACC (set speed, time gap, stop-and-go, gentle handling of cut-ins), plus FCW and staged AEB |
 | `adas-core` | `Core::step`, which is deterministic. **Every input goes through the virtual vehicle's two buses** (`vbus`). Perception and AEB run every frame, and the engaged feature runs on top. It also has engagement rules, impact detection and an online-learned brake gain. Binaries: `adas-core` (live) and `replay` |
-| `can` | DBC parsing, Intel and Motorola packing, Toyota checksums, the topology reader, and a bus timing model (real bitstream, FD data phase, arbitration, load, reactive and realistic delivery) |
+| `can` | DBC parsing, Intel and Motorola packing, Toyota checksums, the topology reader, a bus timing model (real bitstream, FD data phase, arbitration, load, reactive and realistic delivery), and DBC-to-Rust code generation |
+| `telemetry` | The core's live stream to the viewers (UDP on localhost) and the panel's fault-injection messages; the same packets make a telemetry file |
+| `panel` | `adas-panel`, the engineering panel (egui): live CAN trace, bus load per network, latency, vehicle state, fault injection |
+| `viz` | `adas-viz`, the Rerun views: bird's-eye view, vehicle-state plots, bus load, CAN trace; live or over a recording |
 | `record` | MCAP recordings of each whole core run. They survive the recorder being killed |
 | `sim` | A closed-loop simulator that speaks the same contract: a road with a bend, a powertrain, brakes, scripted actors and occlusion |
 | `scenario` | `scenarios/*.toml` with pass metrics, run by `cargo test` |
@@ -30,6 +33,13 @@ Driving it:
 - `cargo xtask deploy` installs the adapter, and `adas-core --feature acc` runs the core.
 - In the car: **F10** engages ACC, **F3** cancels, **Page Up / Page Down** change the set speed by ±5 km/h, and **End** cycles the time gap (not Home: that opens the Rockstar overlay). AEB is always armed.
 - Test keys: **F11** spawns a lead car, **F5** makes it brake hard, and **F4** spawns a stopped car.
+
+Watching it:
+- `adas-panel` (`cargo run --release -p panel`) is the engineering panel. Start it before or after the core.
+- `adas-viz` (`cargo run --release -p viz`) opens the Rerun views live. The viewer comes from `pip install --user rerun-sdk==0.42.0`; `adas-viz` finds it there.
+- Offline:
+  - `adas-viz --replay X.mcap` runs the core over a recorded drive and logs all of it (`--save X.rrd` writes a file instead);
+  - `replay X.mcap --udp` plays a recorded drive into both viewers at its own pace.
 
 ## Phase 0 gate
 
@@ -112,8 +122,44 @@ Driving it:
     - **20% CRC errors on chassis CAN plus a radar 40 ms late:** ACC follows as before (time-gap error 0.01–0.02 s) and stays available;
     - **`ACC_CONTROL` lost while the lead brakes hard:** AEB's own message still gets through and stops the car 6.1 m short. This scenario found a bug: losing `ACC_CONTROL` timed out AEB's request too. Each message now has its own timeout.
   - **candump export:** `replay --candump` writes the regenerated traffic, including the actuation frames, in `candump -L` format.
+  - **DBC code generation.** `can::codegen` turns a DBC into one Rust struct per message. Each struct has typed fields (one-bit flags are `bool`), `ID` and `LEN`, and straight-line shift-and-mask packing. `adas-core`'s `build.rs` generates both vehicle DBCs, and the bus code now uses these types instead of looking signals up by name.
+    - A test checks generated against run-time packing on all 62 messages, both ways, with random payloads and out-of-range values.
+    - Three GTA drives (32,400 steps) replayed through the generated code give byte-identical bus traffic and commands.
+  - **A bus bug the trace found.** The chassis ECU sent only `KINEMATICS`' yaw rate, so its `ACCEL_X` and `ACCEL_Y` went out as raw 0, which decodes to −18.4 m/s². They now carry real values: the change in speed per frame, and v·ω. Nothing reads them yet: replayed commands are unchanged, and only `KINEMATICS` frames differ in the candump.
+- **Views: done.**
+  - **Telemetry.** After the command is out, the core sends each step to the viewers over UDP on localhost:
+    - vehicle state;
+    - HUD;
+    - command;
+    - tracks with the lead and threat marked;
+    - host actors;
+    - per-bus counters (cumulative busy time, frames, faults, active faults);
+    - that step's CAN frames;
+    - events.
+
+    Sending never blocks and costs the core nothing when no viewer listens. In a fake-host run, sample-to-command time was p50 29 µs and p99 49 µs with telemetry on.
+  - **Engineering panel (`adas-panel`, egui).**
+    - CAN trace: either one row per message (count, rate, latest bytes, the selected message's decoded signals) or a scrolling trace with non-zero signals.
+    - A bus-load plot per network over two minutes, and per-bus counters (delivered, dropped, CRC errors, delayed, backlog, checksum errors).
+    - Latency percentiles, vehicle and HUD state, and an event log.
+    - **Fault injection:** drop, CRC-error or delay one message or a whole bus, with a probability and a duration, then clear.
+  - **Faults from the panel replay exactly.** The core applies them before the next step and records them on a new `fault` channel; `replay` applies them at the same step. End-to-end check: a fake host drove the real `adas-core`, a panel-style control dropped every ADAS frame for 2 s, and ACC went unavailable ("radar blocked") 35 frames later. The recording replays identically (1,440 steps).
+  - **Rerun views (`adas-viz`, the `viz` crate, Rerun 0.42 Rust SDK).**
+    - A bird's-eye view: ego, tracks coloured by lead and threat with velocity arrows, host actors as outlines.
+    - Plots: speed (host, chassis CAN, set, lead), acceleration, pedals (command and driver), lead gap and TTC, bus load per network, latency.
+    - The CAN trace per bus, decoded with the generated message types, and the events.
+    - It runs live, over a recording (`--replay`, the core runs in-process: the regression drive's 6,264 steps log in 0.6 s), or from a telemetry file, and can save an `.rrd`.
+    - The VS 2022 Build Tools are now installed, so the workspace links with MSVC and crates with C code (such as Rerun's `ring`) build.
+- **GTA regression drive, re-recorded** (`recordings/regression/gta-acc-follow-brake-aeb-sultan.mcap`, 6,264 steps, with actuation over the bus). It covers four things:
+  - **Following:** ACC settles behind a lead at 31 m and 43 km/h, and End changes the gap to 2.5 s.
+  - **The lead brakes hard:** ACC alone stops 9 m behind it, with no AEB needed.
+  - **A stopped car:** AEB brakes from 50 km/h at a TTC of 1.8 s and stops short.
+  - **Police:** none appear.
+
+  `cargo xtask test` passes. Two earlier takes were discarded:
+  - in one, the unsteered car drifted off the taxiway during a long follow, lost the lead and hit the fence;
+  - in the other, F7 teleported to downtown instead of the airport, because the plugin keeps the spot index across core runs.
+
+  The test script now checks the adapter log and presses F7 until it reaches the airport.
 - **Still to do in Phase 1:**
-  - DBC code generation (the runtime DBC is used instead);
-  - a live CAN trace and bus-load view;
-  - D11 takeover escalation;
-  - the egui panel and Rerun views.
+  - D11 takeover escalation (waits for lane keeping).

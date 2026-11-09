@@ -1,16 +1,18 @@
-//! Spikes S4/S5: find the steering angle in vehicle memory, test pedal
+//! Spikes S4/S5 (see docs/spikes/s45-results.md): find the steering angle in vehicle memory, test pedal
 //! injection through blocked controls, and test whether a written steering
 //! value holds. Throwaway code.
 //!
-//! Keys (sit in a car, stationary for F9):
-//! - F8  spawn a test car (Sultan) and put the player in it; player invincible.
-//! - F9  steering sweep: blocks the player's steering, injects a sine steering
-//!   input for 6 s, snapshots 12 KB of the vehicle struct every frame, then
-//!   ranks every float field by correlation with the input (background thread).
-//! - F10 pedal test: 3 s injected throttle, 3 s injected brake, 3 s blocked
-//!   with nothing injected. Logs what the car and the blocked controls report.
-//! - F11 write-hold test: writes 0.5 into the best steering candidate every
-//!   frame for 3 s and logs what is read back on the next frame.
+//! Keys:
+//! - F7  teleport to the test area in `adas-logs/teleport.txt` ("x y z heading",
+//!   default: airport tarmac); turns the wanted level off for testing.
+//! - F8  spawn the next test car (Sultan, Baller, Futo, Mule) and put the player
+//!   in it; player invincible; the previous test car is deleted.
+//! - F9  steering sweep (stationary): injects a sine steering input and ranks
+//!   every float field of the vehicle struct by correlation (background thread).
+//! - F10 pedal test (see `Mode::Pedals`).
+//! - F11 drive test: speed up to 10 m/s, track a steering-angle command three
+//!   ways, brake to a stop, try three standstill holds; snapshots the wheel
+//!   structs to find wheel speeds; logs RPM and gear from natives.
 //!
 //! Output: `<game folder>/adas-logs/s45-<unix time>-*.{log,csv,txt}`.
 
@@ -41,6 +43,7 @@ unsafe extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
 }
 
+const VK_F7: i32 = 0x76;
 const VK_F8: i32 = 0x77;
 const VK_F9: i32 = 0x78;
 const VK_F10: i32 = 0x79;
@@ -83,6 +86,20 @@ mod n {
     pub const SET_PED_INTO_VEHICLE: u64 = 0xF75B0D629E1C063D;
     pub const SET_ENTITY_INVINCIBLE: u64 = 0x3882114BDE571AD4;
     pub const GET_ENTITY_ROTATION_VELOCITY: u64 = 0x213B91045D09B983;
+    pub const GET_ENTITY_SPEED_VECTOR: u64 = 0x9A8D700A51CB7B0D;
+    pub const SET_ENTITY_COORDS: u64 = 0x06843DA7060A026B;
+    pub const SET_ENTITY_HEADING: u64 = 0x8E2530AA8ADA980E;
+    pub const GET_GROUND_Z_FOR_3D_COORD: u64 = 0xC906A7DAB05C8D2B;
+    pub const REQUEST_COLLISION_AT_COORD: u64 = 0x07503F7948F491A7;
+    pub const SET_MAX_WANTED_LEVEL: u64 = 0xAA5F02DB48D704B9;
+    pub const CLEAR_PLAYER_WANTED_LEVEL: u64 = 0xB302540597885499;
+    pub const PLAYER_ID: u64 = 0x4F8644AF03D0E0D6;
+    pub const SET_ENTITY_AS_MISSION_ENTITY: u64 = 0xAD738C3085FE7E11;
+    pub const DELETE_VEHICLE: u64 = 0xEA386986E786A54F;
+    pub const SET_VEHICLE_HANDBRAKE: u64 = 0x684785568EF26A22;
+    pub const SET_VEHICLE_BRAKE: u64 = 0xE4E2FD323574965C;
+    pub const GET_VEHICLE_CURRENT_REV_RATIO: u64 = 0xF9DDA40BC293A61E;
+    pub const GET_VEHICLE_CURRENT_DRIVE_GEAR: u64 = 0x56185A25D45A0DCD;
 }
 
 /// Steering fields found by the F9 sweep on build 1158.13 (Sultan):
@@ -91,16 +108,16 @@ const STEER_INPUT_OFFSET: usize = 0x9D4;
 const STEER_ANGLE_OFFSET: usize = 0x9DC;
 /// Injected control values have a 25% deadzone: throttle = (v - 0.25) / 0.75.
 /// 0.45 gives about 0.27 throttle, enough to creep.
-const HOLD_CREEP_THROTTLE: f32 = 0.45;
-/// Phase 3 steers through the control instead, for comparison.
-const HOLD_STEER_CONTROL: f32 = 0.5;
+const CREEP_INJECT: f32 = 0.45;
+const TEST_MODELS: [&CStr; 4] = [c"sultan", c"baller", c"futo", c"mule"];
+const WHEEL_BYTES: usize = 0x400;
 
 /// Test tooling: spawns a car 3 m ahead and puts the player in the driver's
 /// seat; also makes the player invincible so fights or crashes don't end a test.
 /// Yields the fiber while the model streams in.
-fn spawn_test_car(ped: i32, log: &mut impl Write) {
+fn spawn_test_car(ped: i32, name: &CStr, prev: &mut i32, log: &mut impl Write) {
     unsafe {
-        let model: u32 = invoke!(n::GET_HASH_KEY, c"sultan");
+        let model: u32 = invoke!(n::GET_HASH_KEY, name);
         let () = invoke!(n::REQUEST_MODEL, model);
         let mut waited = 0;
         loop {
@@ -123,7 +140,12 @@ fn spawn_test_car(ped: i32, log: &mut impl Write) {
         let () = invoke!(n::SET_PED_INTO_VEHICLE, ped, veh, -1i32);
         let () = invoke!(n::SET_ENTITY_INVINCIBLE, ped, true, false);
         let () = invoke!(n::SET_MODEL_AS_NO_LONGER_NEEDED, model);
-        let _ = writeln!(log, "SPAWN sultan handle {veh} after {waited} frames; player invincible");
+        if *prev != 0 {
+            let () = invoke!(n::SET_ENTITY_AS_MISSION_ENTITY, *prev, true, true);
+            let () = invoke!(n::DELETE_VEHICLE, prev as *mut i32);
+        }
+        *prev = veh;
+        let _ = writeln!(log, "SPAWN {} handle {veh} after {waited} frames; player invincible", name.to_string_lossy());
     }
 }
 
@@ -141,12 +163,6 @@ const SWEEP_SECONDS: f64 = 3.0 * SWEEP_PHASE_S;
 const SWEEP_PERIOD_S: f64 = 2.0;
 const MAX_LAG_FRAMES: usize = 20;
 const PEDAL_PHASE_S: f64 = 3.0;
-/// Write-hold phases, 3 s each: 0 = write the angle field, 1 = write the input
-/// field, 2 = no write (baseline), 3 = steer through the injected control.
-/// The car creeps on injected throttle throughout.
-const HOLD_PHASE_S: f64 = 3.0;
-const HOLD_VALUE: f32 = 0.3;
-
 // ---- DLL entry ----
 
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
@@ -207,7 +223,7 @@ fn run_stem() -> String {
 }
 
 struct Keys {
-    prev: [bool; 4],
+    prev: [bool; 5],
 }
 
 impl Keys {
@@ -385,7 +401,162 @@ enum Mode {
     Idle,
     Sweep { t: f64, frames: Vec<SweepFrame>, prev: Option<(u8, f32, f32, f32)>, base: usize },
     Pedals { t: f64, csv: BufWriter<File> },
-    Hold { t: f64, base: usize, csv: BufWriter<File> },
+    Drive(Box<Drive>),
+}
+
+// ---- Drive test ----
+
+/// Drive-test phases and their maximum length in seconds.
+const DRIVE_PHASES: [(&str, f64); 10] = [
+    ("ramp", 4.0),              // speed up to 10 m/s, steering written to 0
+    ("track-write", 5.0),       // V0: write the steering input only (feed-forward)
+    ("settle", 1.5),
+    ("track-write+ctl", 5.0),   // V1: write + inject the matching steering control
+    ("settle", 1.5),
+    ("track-closed", 5.0),      // V2: V1 + integral correction on the measured angle
+    ("stop", 6.0),              // injected brake until < 0.3 m/s
+    ("hold-handbrake", 2.0),    // SET_VEHICLE_HANDBRAKE, creep throttle against it
+    ("hold-brake-native", 2.0), // SET_VEHICLE_BRAKE, creep throttle against it
+    ("no-hold", 2.0),           // creep throttle, nothing holding (baseline)
+];
+const DRIVE_TARGET_MPS: f32 = 10.0;
+
+struct Drive {
+    phase: usize,
+    tp: f64,
+    t: f64,
+    base: usize,
+    csv: BufWriter<File>,
+    ratio: f32,
+    integ: f32,
+    prev_cmd: f32,
+    /// Candidate wheel arrays: (offset in the vehicle struct, wheel pointers).
+    wheels: Vec<(usize, Vec<usize>)>,
+    /// Per frame while moving: speed and one concatenated snapshot of all wheels.
+    wheel_frames: Vec<(f32, Vec<u8>)>,
+}
+
+/// Steering-angle command (rad, ISO 8855: left positive) at `tp` seconds into
+/// a tracking phase: a left step, a right step, then a 0.8 Hz sine.
+fn angle_profile(tp: f64) -> f32 {
+    if tp < 1.5 {
+        0.04
+    } else if tp < 3.0 {
+        -0.04
+    } else {
+        (0.06 * (2.0 * std::f64::consts::PI * 0.8 * (tp - 3.0)).sin()) as f32
+    }
+}
+
+fn read_u64(addr: usize) -> Option<u64> {
+    let mut b = [0u8; 8];
+    read_mem(addr, &mut b).then(|| u64::from_le_bytes(b))
+}
+
+fn read_u32(addr: usize) -> Option<u32> {
+    let mut b = [0u8; 4];
+    read_mem(addr, &mut b).then(|| u32::from_le_bytes(b))
+}
+
+fn plausible_ptr(p: u64) -> bool {
+    (0x1_0000..0x7FFF_FFFF_FFFF).contains(&p) && p.is_multiple_of(8)
+}
+
+/// Looks for (pointer, count) pairs in the vehicle struct whose pointer leads to
+/// `count` distinct, readable blocks: the shape of a wheel array.
+fn find_wheel_arrays(base: usize) -> Vec<(usize, Vec<usize>)> {
+    let mut out = Vec::new();
+    let mut probe = vec![0u8; WHEEL_BYTES];
+    for off in (0..SNAP_BYTES - 16).step_by(8) {
+        let (Some(p), Some(count)) = (read_u64(base + off), read_u32(base + off + 8)) else { continue };
+        if !(2..=8).contains(&count) || !plausible_ptr(p) {
+            continue;
+        }
+        let mut ptrs = Vec::new();
+        for i in 0..count as usize {
+            match read_u64(p as usize + i * 8) {
+                Some(w) if plausible_ptr(w) && !ptrs.contains(&(w as usize)) && read_mem(w as usize, &mut probe) => ptrs.push(w as usize),
+                _ => break,
+            }
+        }
+        if ptrs.len() == count as usize {
+            out.push((off, ptrs));
+        }
+        if out.len() >= 6 {
+            break;
+        }
+    }
+    out
+}
+
+/// For each wheel of each candidate array, the float fields that track the
+/// vehicle speed; `k` is the least-squares slope field/speed (about ±1/r for an
+/// angular speed in rad/s, ±1 for a linear speed).
+fn analyse_wheels(wheels: &[(usize, Vec<usize>)], frames: &[(f32, Vec<u8>)], report: &std::path::Path) {
+    let Ok(f) = File::create(report) else { return };
+    let mut w = BufWriter::new(f);
+    let speed: Vec<f32> = frames.iter().map(|f| f.0).collect();
+    let (lo, hi) = speed.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    let _ = writeln!(w, "{} frames, speed {lo:.2}..{hi:.2} m/s", frames.len());
+    let mut slot = 0usize;
+    for (arr_off, ptrs) in wheels {
+        let _ = writeln!(w, "== array at vehicle+0x{arr_off:X}: {} wheels", ptrs.len());
+        for (wi, ptr) in ptrs.iter().enumerate() {
+            let mut hits = Vec::new();
+            for o in (0..WHEEL_BYTES).step_by(4) {
+                let at = slot * WHEEL_BYTES + o;
+                let series: Vec<f32> = frames.iter().map(|f| f32::from_le_bytes([f.1[at], f.1[at + 1], f.1[at + 2], f.1[at + 3]])).collect();
+                if series.iter().any(|v| !v.is_finite() || v.abs() > 1.0e4) {
+                    continue;
+                }
+                let r = pearson(&series, &speed);
+                if r.abs() >= 0.9 {
+                    let (sxy, sxx) = series.iter().zip(&speed).fold((0f64, 0f64), |(a, b), (&y, &x)| (a + (x * y) as f64, b + (x * x) as f64));
+                    hits.push((o, r, (sxy / sxx.max(1e-9)) as f32));
+                }
+            }
+            hits.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+            let _ = writeln!(w, "-- wheel {wi} (0x{ptr:X}): {} fields with |r| >= 0.9", hits.len());
+            for (o, r, k) in hits.iter().take(12) {
+                let _ = writeln!(w, "   +0x{o:03X}  r {r:+.4}  k {k:+.4}");
+            }
+            slot += 1;
+        }
+    }
+}
+
+/// Test tooling: moves the player (or their car) to the spot in
+/// `adas-logs/teleport.txt`, or to the airport tarmac.
+fn teleport(ped: i32, veh: i32, log: &mut impl Write) {
+    let cfg = std::fs::read_to_string(log_dir().join("teleport.txt")).unwrap_or_default();
+    let v: Vec<f32> = cfg.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+    let (x, y, z, h) = if v.len() >= 4 { (v[0], v[1], v[2], v[3]) } else { (-1336.0, -3044.0, 13.9, 330.0) };
+    let e = if veh != 0 { veh } else { ped };
+    unsafe {
+        let () = invoke!(n::SET_MAX_WANTED_LEVEL, 0i32);
+        let player: i32 = invoke!(n::PLAYER_ID);
+        let () = invoke!(n::CLEAR_PLAYER_WANTED_LEVEL, player);
+        let () = invoke!(n::SET_ENTITY_COORDS, e, x, y, z + 1.0, false, false, false, true);
+        for _ in 0..60 {
+            let () = invoke!(n::REQUEST_COLLISION_AT_COORD, x, y, z);
+            shv_sys::scriptWait(0);
+        }
+        let mut gz = z;
+        let found: bool = invoke!(n::GET_GROUND_Z_FOR_3D_COORD, x, y, z + 50.0, &mut gz as *mut f32, false, false);
+        let () = invoke!(n::SET_ENTITY_COORDS, e, x, y, if found { gz + 0.5 } else { z + 0.5 }, false, false, false, true);
+        let () = invoke!(n::SET_ENTITY_HEADING, e, h);
+        if veh != 0 {
+            let _: bool = invoke!(n::SET_VEHICLE_ON_GROUND_PROPERLY, veh, 5.0f32);
+        }
+        let _ = writeln!(log, "TELEPORT to {x} {y} (ground found {found}, z {gz:.2}) heading {h}; wanted level off");
+    }
+}
+
+fn vehicle_name(veh: i32) -> (u32, String) {
+    let model: u32 = unsafe { invoke!(n::GET_ENTITY_MODEL, veh) };
+    let name_ptr: *const core::ffi::c_char = unsafe { invoke!(n::GET_DISPLAY_NAME_FROM_VEHICLE_MODEL, model) };
+    let name = if name_ptr.is_null() { "?".into() } else { unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy().into_owned() };
+    (model, name)
 }
 
 // ---- The spike ----
@@ -394,14 +565,16 @@ fn run() {
     let dir = log_dir();
     let stem = run_stem();
     let mut log = BufWriter::new(File::create(dir.join(format!("{stem}.log"))).expect("create log"));
-    let _ = writeln!(log, "S4/S5 spike started. F9 sweep, F10 pedals, F11 write-hold");
+    let _ = writeln!(log, "S4/S5 spike started. F7 teleport, F8 next car, F9 sweep, F10 pedals, F11 drive test");
     let _ = log.flush();
 
-    let mut keys = Keys { prev: [false; 4] };
+    let mut keys = Keys { prev: [false; 5] };
     let mut mode = Mode::Idle;
     let status: Arc<Mutex<String>> = Arc::new(Mutex::new("idle".into()));
     let angle_offset: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
     let mut run_no = 0u32;
+    let mut next_model = 0usize;
+    let mut test_car = 0i32;
 
     loop {
         let ped: i32 = unsafe { invoke!(n::PLAYER_PED_ID) };
@@ -412,18 +585,22 @@ fn run() {
         let speed: f32 = if in_vehicle { unsafe { invoke!(n::GET_ENTITY_SPEED, veh) } } else { 0.0 };
         let base = if in_vehicle { unsafe { shv_sys::getScriptHandleBaseAddress(veh) as usize } } else { 0 };
 
-        if keys.pressed(3, VK_F8) && matches!(mode, Mode::Idle) {
-            spawn_test_car(ped, &mut log);
+        let idle = matches!(mode, Mode::Idle);
+        if keys.pressed(4, VK_F7) && idle {
+            teleport(ped, veh, &mut log);
+        }
+        if keys.pressed(3, VK_F8) && idle {
+            let name = TEST_MODELS[next_model % TEST_MODELS.len()];
+            next_model += 1;
+            spawn_test_car(ped, name, &mut test_car, &mut log);
         }
         let f9 = keys.pressed(0, VK_F9);
         let f10 = keys.pressed(1, VK_F10);
         let f11 = keys.pressed(2, VK_F11);
 
-        if matches!(mode, Mode::Idle) && in_vehicle && base != 0 {
+        if idle && in_vehicle && base != 0 {
             if f9 {
-                let model: u32 = unsafe { invoke!(n::GET_ENTITY_MODEL, veh) };
-                let name_ptr: *const core::ffi::c_char = unsafe { invoke!(n::GET_DISPLAY_NAME_FROM_VEHICLE_MODEL, model) };
-                let name = if name_ptr.is_null() { "?".into() } else { unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy().into_owned() };
+                let (model, name) = vehicle_name(veh);
                 let _ = writeln!(log, "frame {frame}: SWEEP start, vehicle {name} (model 0x{model:08X}), base 0x{base:X}, speed {speed:.2} m/s");
                 *status.lock().unwrap() = format!("sweeping ({name})");
                 mode = Mode::Sweep { t: 0.0, frames: Vec::new(), prev: None, base };
@@ -440,12 +617,32 @@ fn run() {
                 mode = Mode::Pedals { t: 0.0, csv };
             } else if f11 {
                 run_no += 1;
-                let f = File::create(dir.join(format!("{stem}-hold-{run_no}.csv"))).expect("create hold csv");
+                let (model, name) = vehicle_name(veh);
+                let f = File::create(dir.join(format!("{stem}-drive-{run_no}.csv"))).expect("create drive csv");
                 let mut csv = BufWriter::new(f);
-                let _ = writeln!(csv, "frame,t_s,phase,read_input_9D4,read_angle_9DC,wrote,yaw_rate,speed_mps");
-                let _ = writeln!(log, "frame {frame}: HOLD start (file hold-{run_no})");
-                *status.lock().unwrap() = "write-hold test".into();
-                mode = Mode::Hold { t: 0.0, base, csv };
+                let _ = writeln!(
+                    csv,
+                    "frame,t_s,phase,name,cmd,wrote,ctl,read_in,read_ang,ratio,yaw_rate,speed_mps,vx_rel,vy_rel,thr_inj,brk_inj,veh_throttle,rev_ratio,gear,w0_b0,w1_b0,w2_b0,w3_b0,w0_170,w1_170,w2_170,w3_170"
+                );
+                let wheels = find_wheel_arrays(base);
+                let _ = writeln!(log, "frame {frame}: DRIVE start, vehicle {name} (model 0x{model:08X}), file drive-{run_no}; wheel-array candidates:");
+                for (off, ptrs) in &wheels {
+                    let list: Vec<String> = ptrs.iter().map(|p| format!("0x{p:X}")).collect();
+                    let _ = writeln!(log, "  vehicle+0x{off:X}: {} -> {}", ptrs.len(), list.join(" "));
+                }
+                *status.lock().unwrap() = format!("drive test ({name})");
+                mode = Mode::Drive(Box::new(Drive {
+                    phase: 0,
+                    tp: 0.0,
+                    t: 0.0,
+                    base,
+                    csv,
+                    ratio: 0.6,
+                    integ: 0.0,
+                    prev_cmd: 0.0,
+                    wheels,
+                    wheel_frames: Vec::new(),
+                }));
             }
         }
 
@@ -539,39 +736,117 @@ fn run() {
                     Mode::Pedals { t, csv }
                 }
             }
-            Mode::Hold { mut t, base: hold_base, mut csv } => {
-                if !in_vehicle || base != hold_base {
-                    let _ = writeln!(log, "frame {frame}: HOLD aborted (left vehicle)");
+            Mode::Drive(mut d) => {
+                if !in_vehicle || base != d.base {
+                    let _ = writeln!(log, "frame {frame}: DRIVE aborted (left vehicle)");
+                    *status.lock().unwrap() = "drive aborted".into();
                     Mode::Idle
                 } else {
-                    let phase = (t / HOLD_PHASE_S) as u32;
-                    // Values the game left after last frame, before we write.
+                    let (pname, plen) = DRIVE_PHASES[d.phase];
+                    // What the game made of last frame's commands.
                     let r_in = read_f32(base + STEER_INPUT_OFFSET).unwrap_or(f32::NAN);
                     let r_ang = read_f32(base + STEER_ANGLE_OFFSET).unwrap_or(f32::NAN);
-                    let wrote = match phase {
-                        0 => write_f32(base + STEER_ANGLE_OFFSET, HOLD_VALUE).then_some(STEER_ANGLE_OFFSET),
-                        1 => write_f32(base + STEER_INPUT_OFFSET, HOLD_VALUE).then_some(STEER_INPUT_OFFSET),
-                        _ => None,
-                    };
-                    let _: bool = unsafe { invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_ACCELERATE, HOLD_CREEP_THROTTLE) };
-                    if phase == 3 {
-                        let _: bool = unsafe { invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_MOVE_LR, HOLD_STEER_CONTROL) };
+                    if r_in.abs() > 0.05 && r_ang.is_finite() {
+                        d.ratio += 0.1 * (r_ang / r_in - d.ratio);
+                    }
+                    let tracking = matches!(d.phase, 1 | 3 | 5);
+                    let cmd = if tracking { angle_profile(d.tp) } else { 0.0 };
+                    if d.phase == 5 {
+                        d.integ = (d.integ + 0.3 * (d.prev_cmd - r_ang) / d.ratio).clamp(-0.3, 0.3);
+                    } else if !tracking {
+                        d.integ = 0.0;
+                    }
+                    let mut wrote = f32::NAN;
+                    let mut ctl = 0.0f32;
+                    if d.phase <= 6 {
+                        let w = (cmd / d.ratio + d.integ).clamp(-1.0, 1.0);
+                        write_f32(base + STEER_INPUT_OFFSET, w);
+                        wrote = w;
+                        if matches!(d.phase, 3..=5) {
+                            // MOVE_LR is right-positive; the input field is left-positive.
+                            ctl = -w;
+                            let _: bool = unsafe { invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_MOVE_LR, ctl) };
+                        }
+                    }
+                    // Pedals.
+                    let (mut thr, mut brk) = (0.0f32, 0.0f32);
+                    match d.phase {
+                        0..=5 => {
+                            let u = (0.3 + 0.15 * (DRIVE_TARGET_MPS - speed)).clamp(0.0, 1.0);
+                            if u > 0.01 {
+                                thr = 0.25 + 0.75 * u;
+                            }
+                        }
+                        6 => brk = 1.0,
+                        _ => thr = CREEP_INJECT,
+                    }
+                    unsafe {
+                        if thr > 0.0 {
+                            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_ACCELERATE, thr);
+                        }
+                        if brk > 0.0 {
+                            let _: bool = invoke!(n::SET_CONTROL_VALUE_NEXT_FRAME, PLAYER_CONTROL, INPUT_VEH_BRAKE, brk);
+                        }
+                        let () = invoke!(n::SET_VEHICLE_HANDBRAKE, veh, d.phase == 7);
+                        let () = invoke!(n::SET_VEHICLE_BRAKE, veh, d.phase == 8);
                     }
                     let rot: shv_sys::Vector3 = unsafe { invoke!(n::GET_ENTITY_ROTATION_VELOCITY, veh) };
+                    let vel: shv_sys::Vector3 = unsafe { invoke!(n::GET_ENTITY_SPEED_VECTOR, veh, true) };
+                    let veh_thr: f32 = unsafe { invoke!(n::VEHICLE_THROTTLE, veh) };
+                    let rev: f32 = unsafe { invoke!(n::GET_VEHICLE_CURRENT_REV_RATIO, veh) };
+                    let gear: i32 = unsafe { invoke!(n::GET_VEHICLE_CURRENT_DRIVE_GEAR, veh) };
+                    let mut wf = [f32::NAN; 8];
+                    if let Some((_, ptrs)) = d.wheels.first() {
+                        for (i, &p) in ptrs.iter().take(4).enumerate() {
+                            wf[i] = read_f32(p + 0xB0).unwrap_or(f32::NAN);
+                            wf[4 + i] = read_f32(p + 0x170).unwrap_or(f32::NAN);
+                        }
+                    }
+                    let wcols: Vec<String> = wf.iter().map(|v| format!("{v:.3}")).collect();
                     let _ = writeln!(
-                        csv,
-                        "{frame},{t:.3},{phase},{r_in:.4},{r_ang:.4},{},{:.4},{speed:.3}",
-                        wrote.map(|o| format!("0x{o:X}")).unwrap_or("-".into()),
-                        rot.z
+                        d.csv,
+                        "{frame},{:.3},{},{pname},{cmd:.4},{wrote:.4},{ctl:.4},{r_in:.4},{r_ang:.4},{:.4},{:.4},{speed:.3},{:.3},{:.3},{thr:.3},{brk:.2},{veh_thr:.3},{rev:.3},{gear},{}",
+                        d.t, d.phase, d.ratio, rot.z, vel.x, vel.y, wcols.join(",")
                     );
-                    t += dt as f64;
-                    if t >= 4.0 * HOLD_PHASE_S {
-                        let _ = csv.flush();
-                        let _ = writeln!(log, "frame {frame}: HOLD done");
-                        *status.lock().unwrap() = "write-hold done".into();
+                    if d.phase <= 6 && !d.wheels.is_empty() {
+                        let mut snap = Vec::with_capacity(WHEEL_BYTES * 16);
+                        let mut chunk = vec![0u8; WHEEL_BYTES];
+                        for (_, ptrs) in &d.wheels {
+                            for &p in ptrs {
+                                if !read_mem(p, &mut chunk) {
+                                    chunk.fill(0);
+                                }
+                                snap.extend_from_slice(&chunk);
+                            }
+                        }
+                        d.wheel_frames.push((speed, snap));
+                    }
+                    d.prev_cmd = cmd;
+                    d.t += dt as f64;
+                    d.tp += dt as f64;
+                    let stop_done = d.phase == 6 && speed < 0.3 && d.tp > 0.3;
+                    if d.tp >= plen || stop_done {
+                        d.phase += 1;
+                        d.tp = 0.0;
+                    }
+                    *status.lock().unwrap() = format!("drive: {pname}");
+                    if d.phase >= DRIVE_PHASES.len() {
+                        unsafe {
+                            let () = invoke!(n::SET_VEHICLE_HANDBRAKE, veh, false);
+                            let () = invoke!(n::SET_VEHICLE_BRAKE, veh, false);
+                        }
+                        let _ = d.csv.flush();
+                        let _ = writeln!(log, "frame {frame}: DRIVE done; {} wheel frames, analysing in background", d.wheel_frames.len());
+                        let st = status.clone();
+                        let report = dir.join(format!("{stem}-wheels-{run_no}.txt"));
+                        let Drive { wheels, wheel_frames, .. } = *d;
+                        std::thread::spawn(move || {
+                            analyse_wheels(&wheels, &wheel_frames, &report);
+                            *st.lock().unwrap() = "drive test done".into();
+                        });
                         Mode::Idle
                     } else {
-                        Mode::Hold { t, base: hold_base, csv }
+                        Mode::Drive(d)
                     }
                 }
             }
@@ -581,9 +856,9 @@ fn run() {
         // --- HUD ---
         let st = status.lock().unwrap().clone();
         unsafe {
-            let () = invoke!(n::DRAW_RECT, 0.22f32, 0.05f32, 0.42f32, 0.08f32, 0i32, 0i32, 0i32, 160i32, false);
+            let () = invoke!(n::DRAW_RECT, 0.24f32, 0.05f32, 0.46f32, 0.08f32, 0i32, 0i32, 0i32, 160i32, false);
             draw_text(0.015, 0.015, &format!("ADAS S4/S5  |  {:.1} km/h  |  {st}", speed * 3.6));
-            draw_text(0.015, 0.040, "F8 spawn car  |  F9 steering sweep (stationary)  |  F10 pedals  |  F11 write-hold");
+            draw_text(0.015, 0.040, "F7 teleport  |  F8 next car  |  F9 sweep (stationary)  |  F10 pedals  |  F11 drive test");
         }
 
         unsafe { shv_sys::scriptWait(0) };

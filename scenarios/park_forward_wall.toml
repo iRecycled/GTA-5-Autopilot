@@ -1,0 +1,22 @@
+# Driving forward at 6 km/h toward a wall 2 to 4 m ahead (a parking bay's end).
+name = "Park assist: driving forward toward a wall"
+feature = "none"
+duration = 10.0
+
+[ego]
+speed_kph = 6
+
+[[obstacle]]
+s = 5.55
+length = 0.4
+width = 8.0
+
+[repeat]
+count = 10
+vary_obstacle = 2
+
+[pass]
+min_park = 1
+min_clearance = 0.3
+end_speed_below = 0.1
+max_aeb = 0

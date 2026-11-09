@@ -1,0 +1,12 @@
+# Reversing for a minute with nothing behind: ghost echoes must not brake.
+name = "Park assist: no braking with nothing there"
+feature = "none"
+duration = 60.0
+
+[ego]
+speed_kph = 5
+gear = "reverse"
+
+[pass]
+max_park = 0
+max_rcta = 0

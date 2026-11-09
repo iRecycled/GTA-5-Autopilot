@@ -1,0 +1,19 @@
+# Phase 2: park assist stops the car at least 0.3 m short of an obstacle. A
+# van is parked broadside 4 m behind the rear bumper; the driver reverses
+# toward it at about 5 km/h and doesn't brake.
+name = "Park assist: reversing toward a parked van"
+steps = [
+  "obstacle behind 4",
+  "sleep 1",
+  "creep back 1.5 15",
+  "wait event:park assist braking 12",
+  "wait stopped 5",
+  "drive 0 0 0 0.1",
+  "sleep 1",
+]
+
+[pass]
+max_aeb = 0
+min_park = 1
+min_room = 0.3
+events = ["park assist braking"]

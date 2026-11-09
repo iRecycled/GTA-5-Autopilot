@@ -13,3 +13,4 @@ can = { path = "../can" }
 sim = { path = "../sim" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+features = { path = "../features" }

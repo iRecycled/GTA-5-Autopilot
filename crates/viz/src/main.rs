@@ -29,6 +29,11 @@ use telemetry::{BUS_NAMES, CanFrame, Packet, Step, track_flags};
 const BUS_COLORS: [[u8; 3]; 2] = [[90, 160, 255], [255, 150, 60]];
 const LOAD_WINDOW_S: f64 = 0.25;
 const HUD_BITS: [&str; 9] = ["ACC", "FOLLOW", "LEAD", "FCW", "AEB", "HOLD", "OVERRIDE", "UNAVAIL", "AEB-OFF"];
+/// `adapter_api::surround_flags`, bit by bit.
+const SURROUND_BITS: [&str; 14] = [
+    "BSD", "BSD-L", "BSD-R", "BSD-WARN-L", "BSD-WARN-R", "RCTA", "RCTA-L", "RCTA-R", "RCTA-BRAKE", "PARK", "PARK-BRAKE", "BSD-OFF", "RCTA-OFF",
+    "PARK-OFF",
+];
 
 fn rgb(c: [u8; 3]) -> Color {
     Color::from_rgb(c[0], c[1], c[2])
@@ -171,6 +176,17 @@ impl Logger {
         let strips: Vec<Vec<[f32; 2]>> = s.actors.iter().map(|a| outline(a.x, a.y, a.yaw, a.length, a.width)).collect();
         self.rec.log("bev/actors", &LineStrips2D::new(strips).with_colors([Color::from_rgb(130, 130, 130)]).with_radii([0.08]))?;
         let color = |f: u8| {
+            if f & track_flags::SURROUND != 0 {
+                return if f & track_flags::CROSSING != 0 {
+                    Color::from_rgb(230, 90, 230)
+                } else if f & track_flags::BLIND_SPOT != 0 {
+                    Color::from_rgb(255, 140, 40)
+                } else if f & track_flags::CONFIRMED != 0 {
+                    Color::from_rgb(90, 190, 255)
+                } else {
+                    Color::from_rgb(70, 100, 130)
+                };
+            }
             if f & track_flags::THREAT != 0 {
                 Color::from_rgb(240, 90, 90)
             } else if f & track_flags::LEAD != 0 {
@@ -201,8 +217,48 @@ impl Logger {
         self.rec.log("bev/tracks", &Boxes2D::from_centers_and_half_sizes(centers.clone(), halves).with_colors(colors.clone()).with_labels(labels))?;
         let vectors: Vec<[f32; 2]> = s.tracks.iter().map(|t| bev(t.vx, t.vy)).collect();
         self.rec.log("bev/velocity", &Arrows2D::from_vectors(vectors).with_origins(centers).with_colors(colors))?;
-        let hud: Vec<&str> = HUD_BITS.iter().enumerate().filter(|(i, _)| s.hud_flags >> i & 1 == 1).map(|(_, n)| *n).collect();
+        self.surround(s)?;
+        let mut hud: Vec<&str> = HUD_BITS.iter().enumerate().filter(|(i, _)| s.hud_flags >> i & 1 == 1).map(|(_, n)| *n).collect();
+        hud.extend(SURROUND_BITS.iter().enumerate().filter(|(i, _)| s.surround_flags >> i & 1 == 1).map(|(_, n)| *n));
         self.rec.log("bev/hud", &TextLog::new(if hud.is_empty() { "-".to_string() } else { hud.join(" ") }))
+    }
+
+    /// BSD zones (lit while occupied) and park assist arcs.
+    fn surround(&self, s: &Step) -> rerun::RecordingStreamResult<()> {
+        use adapter_api::surround_flags as sf;
+        if !s.ego_rear.is_finite() {
+            return Ok(());
+        }
+        let c = features::BsdConfig::default();
+        let (front, rear, left, right) = (s.ego_front, s.ego_rear, s.ego_left, s.ego_right);
+        let (x0, x1) = (rear - c.back, front - c.front_inset);
+        let zone = |y0: f32, y1: f32| vec![bev(x0, y0), bev(x1, y0), bev(x1, y1), bev(x0, y1), bev(x0, y0)];
+        let lit = |on: bool| if on { Color::from_rgb(255, 140, 40) } else { Color::from_rgb(70, 70, 70) };
+        let active = s.surround_flags & sf::BSD_ACTIVE != 0;
+        self.rec.log(
+            "bev/bsd_zones",
+            &LineStrips2D::new([zone(left + c.lat_near, left + c.lat_far), zone(right - c.lat_near, right - c.lat_far)])
+                .with_colors([lit(s.surround_flags & sf::BSD_LEFT != 0), lit(s.surround_flags & sf::BSD_RIGHT != 0)])
+                .with_radii([if active { 0.06 } else { 0.02 }]),
+        )?;
+        // Park assist: an arc at each sensor's distance, coloured by it.
+        let fans = adas_core::layout::default_fans([rear, right, 0.0], [front, left, 1.5]);
+        let mut arcs = Vec::new();
+        let mut colors = Vec::new();
+        for (f, &d) in fans.as_slice().iter().zip(&s.park) {
+            if !d.is_finite() {
+                continue;
+            }
+            let pts = (0..=8)
+                .map(|k| {
+                    let a = f.facing - f.half_spread + 2.0 * f.half_spread * k as f32 / 8.0;
+                    bev(f.x + d * a.cos(), f.y + d * a.sin())
+                })
+                .collect::<Vec<_>>();
+            arcs.push(pts);
+            colors.push(if d < 0.4 { Color::from_rgb(240, 60, 60) } else if d < 1.0 { Color::from_rgb(255, 200, 60) } else { Color::from_rgb(120, 220, 120) });
+        }
+        self.rec.log("bev/park", &LineStrips2D::new(arcs).with_colors(colors).with_radii([0.05]))
     }
 
     fn frames(&self, frame: u64, frames: &[CanFrame]) -> rerun::RecordingStreamResult<()> {
@@ -275,7 +331,7 @@ fn replay(log: &mut Logger, path: &Path) -> Result<usize, String> {
             log.event(f.sample.header.frame, &format!("fault: {fault:?}")).map_err(err)?;
         }
         let stick = f.stick.map(|s| Stick { throttle: s.throttle, brake: s.brake, steer: s.steer });
-        let (c, event) = core.step(Inputs { sample: &f.sample, actors: &f.actors, stick });
+        let (c, event) = core.step(Inputs { sample: &f.sample, actors: &f.actors, ranges: f.ranges.as_ref(), stick });
         log.step(&telem::step(&core, &f.sample, &f.actors, &c, 0, 0)).map_err(err)?;
         log.frames(f.sample.header.frame, &telem::frames(&core)).map_err(err)?;
         if event != adas_core::Event::None {

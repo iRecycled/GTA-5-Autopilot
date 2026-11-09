@@ -1,0 +1,37 @@
+# Phase 2 gate: RCTA brakes for crossing traffic in 10 of 10 runs. The ego
+# car reverses out of a parking space between two parked cars at 6 km/h; a
+# car drives across behind it at 15 km/h, coming from the right. The driver
+# doesn't react. RCTA must warn, then brake, and the car must not be hit.
+name = "RCTA: reversing out into crossing traffic from the right"
+feature = "none"
+duration = 12.0
+
+[ego]
+speed_kph = 6
+gear = "reverse"
+
+[[actor]]
+s = -8.5
+d = -20
+heading = 90
+speed_kph = 15
+
+# The neighbours either side.
+[[actor]]
+s = 0
+d = 2.8
+speed_kph = 0
+[[actor]]
+s = 0
+d = -2.8
+speed_kph = 0
+
+[repeat]
+count = 10
+vary_s = 2
+vary_d = 8
+
+[pass]
+min_rcta = 1
+rcta_warns_first = true
+max_aeb = 0

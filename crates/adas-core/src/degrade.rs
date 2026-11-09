@@ -21,6 +21,16 @@ pub enum Reason {
     ChassisSilent,
     /// No radar scan for a while.
     RadarSilent,
+    /// A rear corner radar has sent nothing for a while.
+    SideRadarSilent,
+    /// The host gives no range fans: no parking sensors.
+    NoRangeFans,
+    /// A parking sensor reports no data, or the park ECU is silent.
+    ParkSensorFault,
+    /// The host doesn't say when reverse is selected.
+    NoGear,
+    /// ACC doesn't run in reverse.
+    Reversing,
 }
 
 impl Reason {
@@ -34,6 +44,11 @@ impl Reason {
             Reason::NoSteer => "no steering control on this host",
             Reason::ChassisSilent => "vehicle data lost",
             Reason::RadarSilent => "radar blocked",
+            Reason::SideRadarSilent => "side radar blocked",
+            Reason::NoRangeFans => "no parking sensors on this host",
+            Reason::ParkSensorFault => "parking sensor fault",
+            Reason::NoGear => "no gear signal on this host",
+            Reason::Reversing => "not available in reverse",
         }
     }
 
@@ -48,6 +63,11 @@ impl Reason {
             Reason::NoSteer => m::NO_STEERING,
             Reason::ChassisSilent => m::VEHICLE_DATA_LOST,
             Reason::RadarSilent => m::RADAR_BLOCKED,
+            Reason::SideRadarSilent => m::SIDE_RADAR_BLOCKED,
+            Reason::NoRangeFans => m::NO_PARK_SENSORS,
+            Reason::ParkSensorFault => m::PARK_SENSOR_FAULT,
+            Reason::NoGear => m::NO_GEAR,
+            Reason::Reversing => m::REVERSING,
         }
     }
 }
@@ -66,6 +86,15 @@ pub struct Availability {
     /// The radar has no line-of-sight checks: everything in its beam counts as
     /// visible (occlusion isn't modelled). A degradation, not a loss.
     pub los_degraded: bool,
+    /// Blind spot detection.
+    pub bsd: Result<(), Reason>,
+    /// Rear cross-traffic alert.
+    pub rcta: Result<(), Reason>,
+    /// Park assist.
+    pub park: Result<(), Reason>,
+    /// The surround features may brake (the host has pedal control); else
+    /// they only warn.
+    pub surround_brake: bool,
 }
 
 /// Without stop-and-go, ACC works only above this speed (m/s), as on cars
@@ -82,16 +111,39 @@ pub struct Health {
     pub chassis_age: u64,
     /// Frames since the last radar scan arrived (`u64::MAX` = never).
     pub radar_age: u64,
+    /// The same for the rear corner radars (left, right).
+    pub rear_corner_age: [u64; 2],
+    /// The parking sensors are running (the core asked for them), and their
+    /// last cycle's age (frames) and whether a sensor gave no data.
+    pub park_running: bool,
+    pub park_age: u64,
+    pub park_fault: bool,
 }
+
+/// The park ECU sends every 40 ms; this much silence is a fault (frames).
+pub const PARK_TIMEOUT_FRAMES: u64 = 18; // 0.25 s at 72 fps
 
 pub fn evaluate(info: Option<&AdapterInfo>, h: Health) -> Availability {
     let Some(info) = info else {
         let no = Err(Reason::NoAdapterInfo);
-        return Availability { acc: no, stop_and_go: false, aeb: no, steer: no, drive: no, los_degraded: false };
+        return Availability {
+            acc: no,
+            stop_and_go: false,
+            aeb: no,
+            steer: no,
+            drive: no,
+            los_degraded: false,
+            bsd: no,
+            rcta: no,
+            park: no,
+            surround_brake: false,
+        };
     };
     let has = |c: u32| info.capabilities & c != 0;
     let chassis_ok = h.chassis_age <= CHASSIS_TIMEOUT_FRAMES;
     let radar_ok = h.radar_age <= RADAR_TIMEOUT_FRAMES;
+    let rear_ok = h.rear_corner_age.iter().all(|&a| a <= RADAR_TIMEOUT_FRAMES);
+    let park_ok = !h.park_running || (h.park_age <= PARK_TIMEOUT_FRAMES && !h.park_fault);
 
     // The matrix: first unmet requirement wins.
     let need = |reqs: &[(bool, Reason)]| reqs.iter().find(|(ok, _)| !ok).map_or(Ok(()), |(_, r)| Err(*r));
@@ -108,6 +160,15 @@ pub fn evaluate(info: Option<&AdapterInfo>, h: Health) -> Availability {
         steer: need(&[(has(caps::STEER), Reason::NoSteer), (chassis_ok, Reason::ChassisSilent)]),
         drive: need(&[(has(caps::PEDALS), Reason::NoPedals), (chassis_ok, Reason::ChassisSilent)]),
         los_degraded: !has(caps::LINE_OF_SIGHT),
+        bsd: need(&[(has(caps::ACTORS), Reason::NoActors), (chassis_ok, Reason::ChassisSilent), (rear_ok, Reason::SideRadarSilent)]),
+        rcta: need(&[
+            (has(caps::ACTORS), Reason::NoActors),
+            (has(caps::GEAR), Reason::NoGear),
+            (chassis_ok, Reason::ChassisSilent),
+            (rear_ok, Reason::SideRadarSilent),
+        ]),
+        park: need(&[(has(caps::RANGE_FANS), Reason::NoRangeFans), (chassis_ok, Reason::ChassisSilent), (park_ok, Reason::ParkSensorFault)]),
+        surround_brake: has(caps::PEDALS),
     }
 }
 
@@ -118,8 +179,8 @@ mod tests {
     fn info(c: u32) -> AdapterInfo {
         AdapterInfo { capabilities: c, ..Default::default() }
     }
-    const ALL: u32 = caps::STEER | caps::PEDALS | caps::HOLD | caps::ACTORS | caps::LINE_OF_SIGHT;
-    const OK: Health = Health { chassis_age: 0, radar_age: 0 };
+    const ALL: u32 = caps::STEER | caps::PEDALS | caps::HOLD | caps::ACTORS | caps::LINE_OF_SIGHT | caps::RANGE_FANS | caps::GEAR;
+    const OK: Health = Health { chassis_age: 0, radar_age: 0, rear_corner_age: [0, 0], park_running: true, park_age: 0, park_fault: false };
 
     #[test]
     fn everything_available_with_full_capabilities() {
@@ -137,10 +198,28 @@ mod tests {
         assert!(no_hold.acc.is_ok() && !no_hold.stop_and_go);
         assert_eq!(evaluate(Some(&info(ALL & !caps::STEER)), OK).steer, Err(Reason::NoSteer));
         assert!(evaluate(Some(&info(ALL & !caps::LINE_OF_SIGHT)), OK).los_degraded);
-        let silent = evaluate(Some(&info(ALL)), Health { chassis_age: 100, radar_age: 0 });
+        let silent = evaluate(Some(&info(ALL)), Health { chassis_age: 100, ..OK });
         assert_eq!((silent.acc, silent.steer), (Err(Reason::ChassisSilent), Err(Reason::ChassisSilent)));
-        let blind = evaluate(Some(&info(ALL)), Health { chassis_age: 0, radar_age: 100 });
+        let blind = evaluate(Some(&info(ALL)), Health { radar_age: 100, ..OK });
         assert_eq!(blind.aeb, Err(Reason::RadarSilent));
         assert!(blind.steer.is_ok(), "steering doesn't need the radar");
+        assert!(blind.bsd.is_ok() && blind.rcta.is_ok(), "nor do the surround features");
+    }
+
+    #[test]
+    fn the_surround_rows() {
+        let a = evaluate(Some(&info(ALL)), OK);
+        assert_eq!((a.bsd, a.rcta, a.park), (Ok(()), Ok(()), Ok(())));
+        assert!(a.surround_brake);
+        let side = evaluate(Some(&info(ALL)), Health { rear_corner_age: [0, 100], ..OK });
+        assert_eq!((side.bsd, side.rcta), (Err(Reason::SideRadarSilent), Err(Reason::SideRadarSilent)));
+        assert!(side.acc.is_ok() && side.park.is_ok());
+        assert_eq!(evaluate(Some(&info(ALL & !caps::GEAR)), OK).rcta, Err(Reason::NoGear));
+        assert_eq!(evaluate(Some(&info(ALL & !caps::RANGE_FANS)), OK).park, Err(Reason::NoRangeFans));
+        assert_eq!(evaluate(Some(&info(ALL)), Health { park_fault: true, ..OK }).park, Err(Reason::ParkSensorFault));
+        // Not running (at speed): an old cycle isn't a fault.
+        assert!(evaluate(Some(&info(ALL)), Health { park_running: false, park_age: 9999, ..OK }).park.is_ok());
+        // No pedals: warn only.
+        assert!(!evaluate(Some(&info(ALL & !caps::PEDALS)), OK).surround_brake);
     }
 }

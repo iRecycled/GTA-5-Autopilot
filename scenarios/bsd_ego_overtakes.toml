@@ -1,0 +1,24 @@
+# The ego car passes a much slower car (100 vs 70 km/h): it drops behind on
+# its own, so BSD must not light up for it, even with the signal on.
+name = "BSD: no alert for a car the ego car passes"
+feature = "none"
+duration = 15.0
+
+[ego]
+speed_kph = 100
+[[ego.signal]]
+t = 3.0
+side = "left"
+
+[[actor]]
+s = 40
+lane = 1
+speed_kph = 70
+
+[repeat]
+count = 5
+vary_s = 20
+
+[pass]
+max_bsd_false = 0
+max_aeb = 0

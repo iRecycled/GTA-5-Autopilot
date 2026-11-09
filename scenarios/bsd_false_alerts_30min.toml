@@ -1,0 +1,38 @@
+# Phase 2 gate: at most 1 false BSD alert in 30 minutes. A 100 km/h drive in
+# four-lane traffic: faster cars on the left, slower and similar-speed cars on
+# the right, parked cars on the shoulder. Every vehicle truly in a blind spot
+# must also be reported.
+name = "BSD: 30 minutes in traffic"
+feature = "none"
+duration = 1800.0
+
+[ego]
+speed_kph = 100
+
+[traffic]
+seed = 17
+[[traffic.lane]]
+lane = 1
+speed_kph = 112
+spread_kph = 12
+gap = 70
+[[traffic.lane]]
+lane = 2
+speed_kph = 122
+spread_kph = 10
+gap = 90
+[[traffic.lane]]
+lane = -1
+speed_kph = 88
+spread_kph = 10
+gap = 60
+[[traffic.lane]]
+# The shoulder: parked cars.
+lane = -1.9
+speed_kph = 0
+gap = 45
+
+[pass]
+bsd_detect = "left"
+max_bsd_false = 1
+max_aeb = 0

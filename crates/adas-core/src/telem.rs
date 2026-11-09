@@ -90,6 +90,7 @@ pub fn step(core: &Core, s: &VehicleSample, actors: &ActorList, cmd: &Command, l
                 }
                 Track { id: t.id, x: t.x(), y: t.y(), vx: t.vx(), vy: t.vy(), half_length: t.half_length, width: t.width, flags }
             })
+            .chain(surround_tracks(core))
             .collect(),
         actors: actors
             .as_slice()
@@ -97,7 +98,38 @@ pub fn step(core: &Core, s: &VehicleSample, actors: &ActorList, cmd: &Command, l
             .map(|a| telemetry::Actor { id: a.id, kind: a.kind as u8, x: a.x, y: a.y, yaw: a.yaw, length: a.length, width: a.width, vx: a.vx })
             .collect(),
         ego_front: core.info().map(|i| i.box_max[0]).unwrap_or(f32::NAN),
+        ego_rear: core.info().map(|i| i.box_min[0]).unwrap_or(f32::NAN),
+        ego_left: core.info().map(|i| i.box_max[1]).unwrap_or(f32::NAN),
+        ego_right: core.info().map(|i| i.box_min[1]).unwrap_or(f32::NAN),
+        surround_flags: hud.surround,
+        park: hud.park,
+        park_tone: hud.park_tone,
+        rcta_activations: core.surround_activations().0,
+        park_activations: core.surround_activations().1,
+        corner_latency_frames: v.stats.corner_latency_frames,
     }
+}
+
+/// The surround tracks, flagged for the views.
+fn surround_tracks(core: &Core) -> Vec<Track> {
+    let ego = core.surround_ego();
+    let (bsd, rcta) = (::features::BsdConfig::default(), ::features::RctaConfig::default());
+    core.surround_tracks()
+        .iter()
+        .map(|t| {
+            let mut flags = track_flags::SURROUND;
+            if t.confirmed {
+                flags |= track_flags::CONFIRMED;
+            }
+            if ::features::bsd::bsd_side(&bsd, &ego, t).is_some() {
+                flags |= track_flags::BLIND_SPOT;
+            }
+            if ego.reverse && ::features::rcta::crossing(&rcta, &ego, t).is_some() {
+                flags |= track_flags::CROSSING;
+            }
+            Track { id: t.id, x: t.x(), y: t.y(), vx: t.vx(), vy: t.vy(), half_length: t.half_length, width: t.width, flags }
+        })
+        .collect()
 }
 
 /// The CAN frames of the step the core just ran.

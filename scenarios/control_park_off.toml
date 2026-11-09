@@ -1,0 +1,24 @@
+# Control run for park_reverse_wall: the same runs with park assist off
+# must all hit the wall. (The setup is identical; see that file.)
+name = "Control: park assist off, reversing into a wall ends in a collision"
+feature = "none"
+duration = 10.0
+disabled = ["park"]
+
+[ego]
+speed_kph = 7
+gear = "reverse"
+
+[[obstacle]]
+# Wall face 4 m behind the bumper (centre 0.2 m further).
+s = -6.55
+length = 0.4
+width = 8.0
+
+[repeat]
+count = 10
+vary_obstacle = 3
+
+[pass]
+no_collision = false
+collision = true

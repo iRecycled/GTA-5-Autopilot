@@ -1,0 +1,20 @@
+# Phase 2: BSD sees a car overtaking on the left and warns when the driver
+# signals into it. ACC holds 50 km/h; a car comes up from 25 m behind in the
+# left lane at 70 km/h.
+name = "BSD: a car overtakes on the left"
+steps = [
+  "engage",
+  "set 50",
+  "wait speed>=45 25",
+  "overtake left 25 70",
+  "wait event:BSD: vehicle in the left blind spot 8",
+  "signal left",
+  "wait event:BSD warning 3",
+  "signal off",
+  "sleep 3",
+]
+
+[pass]
+max_aeb = 0
+events = ["left blind spot", "BSD warning: signalling left"]
+no_events = ["right blind spot"]

@@ -252,6 +252,9 @@ fn main() {
     let mut seen_writes = link.sample.writes();
     let mut info_writes = 0u32;
     let mut layout_seq = 0u32;
+    let mut fans_sent = adapter_api::FanLayout::default();
+    // A fresh core: no fans until it asks (an old layout may be in the link).
+    link.fans.write(&fans_sent);
     // The vehicle profile in use: (path, host, vehicle, saved brake gain).
     let mut profile: Option<(PathBuf, String, String, f32)> = None;
     let mut last_profile_check = 0u64;
@@ -303,6 +306,7 @@ fn main() {
     let mut gaps = 0u32;
     let mut window_start = wall_time_ns();
     let mut aeb_logged = false;
+    let mut prev_surround = 0u32;
 
     loop {
         if spin {
@@ -361,6 +365,9 @@ fn main() {
         }
 
         let (_, actors) = link.actors.read();
+        // The range fans' answers, while the adapter gives them.
+        let (_, ranges) = link.ranges.read();
+        let ranges = (ranges.count > 0).then_some(ranges);
         let dt = if last_game_us == 0 { 0.0 } else { s.header.game_time_us.saturating_sub(last_game_us) as f32 / 1e6 };
         last_game_us = s.header.game_time_us;
         let stick = test_driver.then(|| stick_src.read(dt.clamp(0.0, 0.1)));
@@ -385,7 +392,7 @@ fn main() {
             }
         }
 
-        let (mut cmd, event) = core.step(Inputs { sample: &s, actors: &actors, stick });
+        let (mut cmd, event) = core.step(Inputs { sample: &s, actors: &actors, ranges: ranges.as_ref(), stick });
         cmd_seq = cmd_seq.wrapping_add(1);
         cmd.answers_seq = s.header.seq;
         let t1 = wall_time_ns();
@@ -393,6 +400,14 @@ fn main() {
         link.command.write(&cmd);
 
         // Everything below is off the critical path (the command is out).
+        // The range fans: republished when the layout or its ACTIVE flag changes.
+        if *core.fans() != fans_sent {
+            fans_sent = *core.fans();
+            layout_seq += 1;
+            let mut f = fans_sent;
+            f.header = Header { kind: MsgKind::FanLayout, version: CONTRACT_VERSION, seq: layout_seq, wall_time_ns: wall_time_ns(), ..Default::default() };
+            link.fans.write(&f);
+        }
         let mut hud = *core.hud();
         hud.header = Header { kind: MsgKind::Hud, version: CONTRACT_VERSION, seq: cmd_seq, frame: s.header.frame, game_time_us: s.header.game_time_us, wall_time_ns: wall_time_ns() };
         link.hud.write(&hud);
@@ -415,7 +430,29 @@ fn main() {
             println!("{t}");
             events.push(t);
         }
-        if cmd.flags & adapter_api::command_flags::AEB != 0 && cmd.brake > 0.0 && !aeb_logged {
+        // The surround features, as they start to act.
+        {
+            use adapter_api::surround_flags as sf;
+            for (bit, what) in [
+                (sf::BSD_LEFT, "BSD: vehicle in the left blind spot"),
+                (sf::BSD_RIGHT, "BSD: vehicle in the right blind spot"),
+                (sf::BSD_WARN_LEFT, "BSD warning: signalling left into an occupied lane"),
+                (sf::BSD_WARN_RIGHT, "BSD warning: signalling right into an occupied lane"),
+                (sf::RCTA_LEFT, "RCTA: cross traffic from the left"),
+                (sf::RCTA_RIGHT, "RCTA: cross traffic from the right"),
+                (sf::RCTA_BRAKE, "RCTA braking"),
+                (sf::PARK_BRAKE, "park assist braking"),
+            ] {
+                if hud.surround & bit != 0 && prev_surround & bit == 0 {
+                    let t = format!("{what} at frame {} ({:.1} km/h)", s.header.frame, s.speed * 3.6);
+                    println!("{t}");
+                    events.push(t);
+                }
+            }
+            prev_surround = hud.surround;
+        }
+        let surround_braking = hud.surround & (adapter_api::surround_flags::RCTA_BRAKE | adapter_api::surround_flags::PARK_BRAKE) != 0;
+        if cmd.flags & adapter_api::command_flags::AEB != 0 && cmd.brake > 0.0 && !aeb_logged && !surround_braking {
             let t = format!("AEB braking at frame {} ({:.1} m/s, ttc {:.2} s, brake {:.2})", s.header.frame, s.speed, hud.ttc, cmd.brake);
             println!("{t}");
             events.push(t);
@@ -424,7 +461,7 @@ fn main() {
             aeb_logged = false;
         }
         if let Some(r) = recorder.as_mut()
-            && let Err(e) = r.step(&s, &actors, stick3, &cmd)
+            && let Err(e) = r.step(&s, &actors, ranges.as_ref(), stick3, &cmd)
         {
             eprintln!("recording failed: {e}");
             recorder = None;

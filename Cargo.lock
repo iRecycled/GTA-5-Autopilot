@@ -1375,6 +1375,7 @@ name = "features"
 version = "0.1.0"
 dependencies = [
  "fusion",
+ "sensors",
 ]
 
 [[package]]
@@ -1743,6 +1744,7 @@ dependencies = [
 name = "gta-test"
 version = "0.1.0"
 dependencies = [
+ "adapter-api",
  "serde",
  "telemetry",
  "toml",
@@ -4951,6 +4953,7 @@ dependencies = [
  "adapter-api",
  "adas-core",
  "can",
+ "features",
  "serde",
  "sim",
  "toml",
@@ -5021,6 +5024,7 @@ name = "sensors"
 version = "0.1.0"
 dependencies = [
  "adapter-api",
+ "geom",
 ]
 
 [[package]]
@@ -5879,6 +5883,7 @@ version = "0.1.0"
 dependencies = [
  "adapter-api",
  "adas-core",
+ "features",
  "record",
  "rerun",
  "telemetry",

@@ -10,6 +10,9 @@
 
 use sensors::RadarScan;
 
+pub mod surround;
+pub use surround::{SurroundConfig, SurroundTrack, SurroundTracker};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrackerConfig {
     /// Process noise: unmodelled acceleration (m/s², 1σ).
@@ -31,7 +34,7 @@ impl Default for TrackerConfig {
 
 /// A 1-D constant-velocity Kalman filter: state (p, v), covariance P.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Kf {
+pub(crate) struct Kf {
     p: f32,
     v: f32,
     pp: f32,
@@ -40,10 +43,10 @@ struct Kf {
 }
 
 impl Kf {
-    fn new(p: f32, v: f32, rp: f32, rv: f32) -> Self {
+    pub(crate) fn new(p: f32, v: f32, rp: f32, rv: f32) -> Self {
         Self { p, v, pp: rp, pv: 0.0, vv: rv }
     }
-    fn predict(&mut self, dt: f32, q: f32) {
+    pub(crate) fn predict(&mut self, dt: f32, q: f32) {
         self.p += self.v * dt;
         let (pp, pv, vv) = (self.pp, self.pv, self.vv);
         // P = F P Fᵀ + Q, with Q for white acceleration noise of variance q.
@@ -52,7 +55,7 @@ impl Kf {
         self.vv = vv + q * dt * dt;
     }
     /// Measures position and velocity directly (H = I).
-    fn update(&mut self, zp: f32, zv: f32, rp: f32, rv: f32) {
+    pub(crate) fn update(&mut self, zp: f32, zv: f32, rp: f32, rv: f32) {
         let (pp, pv, vv) = (self.pp, self.pv, self.vv);
         // S = P + R; K = P S⁻¹ (2×2).
         let (s11, s12, s22) = (pp + rp, pv, vv + rv);

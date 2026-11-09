@@ -15,7 +15,25 @@ One table, from each missing adapter capability or sensor fault to the features 
 
 AEB unavailable shows as **AEB OFF** on the HUD. A lost core, through a crash or a stall, is handled by the adapter's safe state (D24), not by this matrix. Inside the core, the actuator ECUs drop any request they haven't heard again for 0.1 s, so a silent ADAS ECU releases the car.
 
+## Surround features (Phase 2)
+
+BSD, RCTA and park assist aren't engaged: they run whenever they are available, as AEB does. Unavailable, they show greyed out with an "OFF" mark on the HUD (`surround_flags::BSD_OFF`, `RCTA_OFF`, `PARK_OFF`).
+
+| Condition | BSD | RCTA | Park assist | HUD shows |
+| --- | --- | --- | --- | --- |
+| Host lacks **actors** (`caps::ACTORS`) | ✗ | ✗ | — | BSD OFF, RCTA OFF |
+| Host lacks **gear** (`caps::GEAR`): it can't say when reverse is selected | — | ✗ | — | RCTA OFF |
+| Host lacks **range fans** (`caps::RANGE_FANS`): no parking sensors | — | — | ✗ | PARK OFF |
+| Host lacks **turn signals** (`caps::TURN_SIGNALS`) | icons only, no signal warning | — | — | nothing |
+| Host lacks **pedals** (`caps::PEDALS`) | — | warns, doesn't brake | shows and sounds, doesn't brake | nothing |
+| **Chassis CAN silent** for over 0.25 s | ✗ | ✗ | ✗ | all three OFF |
+| A **rear corner radar** silent for over 0.5 s (36 frames) | ✗ | ✗ | — | BSD OFF, RCTA OFF ("side radar blocked") |
+| A **parking sensor** gives no data, or the park ECU is silent for over 0.25 s, while the sensors run | — | — | ✗ | PARK OFF ("parking sensor fault") |
+
+The parking sensors run only below 18 km/h (off again above 20 km/h), as on real cars; at speed an old park cycle isn't a fault. For the first 0.5 s after they start, missing data isn't a fault either: the host needs a few frames to answer the fans. A front corner radar going silent costs BSD only some of its view ahead of the B-pillar, so it isn't a row of its own.
+
+ACC is also unavailable **in reverse** ("not available in reverse"), and AEB ignores what is ahead while reversing.
+
 Not yet in the matrix:
 - bus faults short of silence, such as bad checksums or CRC errors: counted (`BusStats::errors`, `crc_errors`); the bad frames are discarded and the last good values held. A bus whose frames all fail counts as silent;
-- weather and dirt on the sensors (Phase 1 error model);
-- the corner radars and ultrasonics (Phase 2).
+- weather and dirt on the sensors (Phase 1 error model).

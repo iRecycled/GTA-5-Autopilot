@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 adapter-api = { path = "../adapter-api" }
+geom = { path = "../geom" }

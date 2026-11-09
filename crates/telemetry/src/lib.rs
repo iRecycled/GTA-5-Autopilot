@@ -74,7 +74,7 @@ pub struct Track {
     pub vy: f32,
     pub half_length: f32,
     pub width: f32,
-    /// Bit 0 confirmed, 1 follow lead, 2 collision threat.
+    /// [`track_flags`].
     pub flags: u8,
 }
 
@@ -82,6 +82,12 @@ pub mod track_flags {
     pub const CONFIRMED: u8 = 1;
     pub const LEAD: u8 = 2;
     pub const THREAT: u8 = 4;
+    /// From the corner radars (surround tracker), not the front radar.
+    pub const SURROUND: u8 = 8;
+    /// In a blind-spot zone (lit by BSD).
+    pub const BLIND_SPOT: u8 = 16;
+    /// Crossing behind the car (RCTA).
+    pub const CROSSING: u8 = 32;
 }
 
 /// Ground truth from the host, for the bird's-eye view only.
@@ -148,6 +154,20 @@ pub struct Step {
     pub actors: Vec<Actor>,
     /// The ego car's front edge from its reference point (m), for gaps.
     pub ego_front: f32,
+    // Phase 2 (appended; older streams decode without them).
+    /// The rest of the ego box: rear, left, right edges (m).
+    pub ego_rear: f32,
+    pub ego_left: f32,
+    pub ego_right: f32,
+    /// `adapter_api::surround_flags`.
+    pub surround_flags: u32,
+    /// Park assist distances (m; infinite = clear, NaN = not shown) and tone.
+    pub park: [f32; 12],
+    pub park_tone: f32,
+    /// RCTA and park assist brake activations so far.
+    pub rcta_activations: u32,
+    pub park_activations: u32,
+    pub corner_latency_frames: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -409,6 +429,17 @@ fn encode_step(w: &mut W, s: &Step) {
         }
     }
     w.f32(s.ego_front);
+    for v in [s.ego_rear, s.ego_left, s.ego_right] {
+        w.f32(v);
+    }
+    w.u32(s.surround_flags);
+    for v in s.park {
+        w.f32(v);
+    }
+    w.f32(s.park_tone);
+    w.u32(s.rcta_activations);
+    w.u32(s.park_activations);
+    w.u32(s.corner_latency_frames);
 }
 
 fn decode_step(r: &mut R) -> Option<Step> {
@@ -465,6 +496,21 @@ fn decode_step(r: &mut R) -> Option<Step> {
         s.actors.push(a);
     }
     s.ego_front = r.f32()?;
+    s.park = [f32::NAN; 12];
+    // Phase 2 fields, if present.
+    if r.i < r.b.len() {
+        for v in [&mut s.ego_rear, &mut s.ego_left, &mut s.ego_right] {
+            *v = r.f32()?;
+        }
+        s.surround_flags = r.u32()?;
+        for v in &mut s.park {
+            *v = r.f32()?;
+        }
+        s.park_tone = r.f32()?;
+        s.rcta_activations = r.u32()?;
+        s.park_activations = r.u32()?;
+        s.corner_latency_frames = r.u32()?;
+    }
     Some(s)
 }
 
@@ -601,6 +647,23 @@ mod tests {
         s.tracks.push(Track { id: 7, x: 30.0, y: -0.4, vx: 10.0, vy: 0.0, half_length: 2.2, width: 1.9, flags: track_flags::CONFIRMED | track_flags::LEAD });
         s.actors.push(Actor { id: 9, kind: 1, x: 32.2, y: -0.4, yaw: 0.01, length: 4.5, width: 1.9, vx: 10.0 });
         s
+    }
+
+    #[test]
+    fn phase_2_fields_round_trip_and_older_steps_still_decode() {
+        let mut s = step();
+        s.surround_flags = 0b101;
+        s.park[3] = 0.85;
+        s.park_activations = 2;
+        s.ego_rear = -2.35;
+        let b = Packet::Step(Box::new(s)).encode();
+        let Some(Packet::Step(back)) = Packet::decode(&b) else { panic!("decodes") };
+        assert_eq!((back.surround_flags, back.park[3], back.park_activations, back.ego_rear), (0b101, 0.85, 2, -2.35));
+        // A Phase 1 step: everything up to `ego_front`.
+        let old = &b[..b.len() - (4 * 3 + 4 + 48 + 4 + 12)];
+        let Some(Packet::Step(back)) = Packet::decode(old) else { panic!("an older step decodes") };
+        assert_eq!(back.surround_flags, 0);
+        assert!(back.park.iter().all(|d| d.is_nan()));
     }
 
     #[test]

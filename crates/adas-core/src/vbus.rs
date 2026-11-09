@@ -11,9 +11,51 @@
 
 use crate::actuators::{AccelRequest, AdasRequest, FULL_DECEL_SENT, SteerRequest};
 use crate::msgs::{adas, chassis};
-use adapter_api::VehicleSample;
+use adapter_api::{VehicleSample, sample_flags};
 use can::{Bus, CanMessage, Delivery, Frame, Topology, toyota};
-use sensors::{RadarObject, RadarScan};
+use sensors::{RadarObject, RadarScan, ULTRASONIC_COUNT, UltrasonicScan};
+
+/// The four corner radars' (status, object) message ids, in layout order:
+/// front left, front right, rear left, rear right.
+pub const CORNER_IDS: [(u32, u32); 4] = [
+    (adas::CradarFlStatus::ID, adas::CradarFlObject::ID),
+    (adas::CradarFrStatus::ID, adas::CradarFrObject::ID),
+    (adas::CradarRlStatus::ID, adas::CradarRlObject::ID),
+    (adas::CradarRrStatus::ID, adas::CradarRrObject::ID),
+];
+
+/// Park sensor distances on the bus: no echo, and no data (a sensor fault).
+const PARK_NO_ECHO: f64 = 10.23;
+const PARK_NO_DATA: f64 = 10.22;
+
+/// One bumper's park sensor frame: its cycle counter and six distances (m).
+type ParkHalf = (u8, [f32; 6]);
+
+/// The turn signal as the ADAS ECU reads it from chassis CAN.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Turn {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+/// What the sensor ECUs have to send this step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SensorOut<'a> {
+    pub front: Option<&'a RadarScan>,
+    /// Corner radars, in [`CORNER_IDS`] order.
+    pub corners: [Option<&'a RadarScan>; 4],
+    pub park: Option<&'a UltrasonicScan>,
+}
+
+/// What reached the ADAS ECU this step.
+#[derive(Clone, Debug, Default)]
+pub struct Arrived {
+    pub front: Option<RadarScan>,
+    pub corners: [Option<RadarScan>; 4],
+    pub park: Option<UltrasonicScan>,
+}
 
 const TOPOLOGY: &str = include_str!("../../../config/topology.toml");
 
@@ -31,8 +73,19 @@ pub struct EgoBus {
     pub steer_angle: f32,
     pub brake_pressed: bool,
     pub gas_pressed: bool,
+    /// Reverse selected, from GEAR_PACKET.
+    pub reverse: bool,
+    /// The turn signal, from BLINKERS_STATE.
+    pub turn: Turn,
     /// Frames received so far (0 = nothing yet).
     pub frames: u64,
+}
+
+impl EgoBus {
+    /// Speed along the car's x axis (m/s): negative in reverse.
+    pub fn vx(&self) -> f32 {
+        if self.reverse { -self.speed } else { self.speed }
+    }
 }
 
 /// Per-bus statistics.
@@ -49,6 +102,8 @@ pub struct BusStats {
     /// Radar path: frames from a scan's creation to its arrival at the ADAS
     /// ECU (the last scan's value).
     pub radar_latency_frames: u32,
+    /// The same for the corner radars (the worst of the last scans).
+    pub corner_latency_frames: u32,
 }
 
 struct Periodic {
@@ -72,6 +127,14 @@ pub struct Vehicle {
     adas_counter: u8,
     pub ego: EgoBus,
     pending: Option<Pending>,
+    /// Per corner radar: its rolling counter, the scan being received, and
+    /// the scans sent (scan counter, frame) for latency.
+    corner_counter: [u8; 4],
+    corner_pending: [Option<Pending>; 4],
+    corner_sent: [Vec<(u32, u64)>; 4],
+    park_counter: u8,
+    /// The park ECU's frames received so far this cycle (front, rear).
+    park_rx: (Option<ParkHalf>, Option<ParkHalf>),
     /// Scans whose creation frame is known, by scan counter (for latency).
     sent_scans: Vec<(u32, u64)>,
     pub stats: BusStats,
@@ -122,10 +185,17 @@ impl Vehicle {
                 p(chassis::Speed::ID, 50.0),
                 p(chassis::BrakeModule::ID, 40.0),
                 p(chassis::PcmCruise::ID, 33.0),
+                p(chassis::GearPacket::ID, 20.0),
+                p(chassis::BlinkersState::ID, 10.0),
             ],
             adas_counter: 0,
             ego: EgoBus::default(),
             pending: None,
+            corner_counter: [0; 4],
+            corner_pending: Default::default(),
+            corner_sent: Default::default(),
+            park_counter: 0,
+            park_rx: (None, None),
             sent_scans: Vec::new(),
             stats: BusStats::default(),
             last_frames: Vec::new(),
@@ -177,6 +247,17 @@ impl Vehicle {
                     chassis::Speed::ID => sealed(&chassis::Speed { speed: kph, ..Default::default() }),
                     chassis::BrakeModule::ID => sealed(&chassis::BrakeModule { brake_pressed: s.driver_brake > 0.1, ..Default::default() }),
                     chassis::PcmCruise::ID => sealed(&chassis::PcmCruise { gas_released: s.driver_throttle.partial_cmp(&0.05) != Some(std::cmp::Ordering::Greater), ..Default::default() }),
+                    // GEAR: 0 "D", 16 "R" (TSS2's values).
+                    chassis::GearPacket::ID => sealed(&chassis::GearPacket {
+                        gear: if s.flags & sample_flags::REVERSE != 0 { 16.0 } else { 0.0 },
+                        drive_engaged: s.flags & sample_flags::REVERSE == 0,
+                        ..Default::default()
+                    }),
+                    // TURN_SIGNALS: 1 "left", 2 "right", 3 "none".
+                    chassis::BlinkersState::ID => {
+                        let (l, r) = (s.flags & sample_flags::TURN_LEFT != 0, s.flags & sample_flags::TURN_RIGHT != 0);
+                        sealed(&chassis::BlinkersState { turn_signals: if l { 1.0 } else if r { 2.0 } else { 3.0 }, ..Default::default() })
+                    }
                     _ => unreachable!(),
                 };
                 p.counter = p.counter.wrapping_add(1);
@@ -230,16 +311,84 @@ impl Vehicle {
         }
     }
 
-    /// One host frame at time `t` (s): chassis ECUs publish, the radar ECU
-    /// publishes a scan if it has one, both buses run, and the ADAS ECU reads
-    /// what arrived. Returns a complete radar scan if one arrived.
+    /// A corner radar ECU: a status frame and one frame per object, on its own ids.
+    fn publish_corner(&mut self, k: usize, scan: &RadarScan, frame: u64) {
+        let (status_id, object_id) = CORNER_IDS[k];
+        let objects = &scan.objects[..scan.objects.len().min(32)];
+        let mut next_counter = || {
+            let c = self.corner_counter[k];
+            self.corner_counter[k] = c.wrapping_add(1);
+            c as f64
+        };
+        let status = [("SCAN_COUNTER", (scan.scan & 0xFFFF) as f64), ("NUM_OBJECTS", objects.len() as f64), ("COUNTER", next_counter())];
+        let mut frames = vec![(status_id, adas::encode_signals(status_id, &status).expect("corner status"))];
+        for (slot, o) in objects.iter().enumerate() {
+            let v = [
+                ("SLOT", slot as f64),
+                ("TRACK_ID", (o.id & 0xFFFF) as f64),
+                ("DIST_X", o.x as f64),
+                ("DIST_Y", o.y as f64),
+                ("VEL_X", o.vx as f64),
+                ("VEL_Y", o.vy as f64),
+                ("WIDTH", o.width as f64),
+                ("HALF_LENGTH", o.half_length as f64),
+                ("STATIONARY", o.stationary as u8 as f64),
+                ("EXIST_PROB", 0.95),
+                ("COUNTER", next_counter()),
+            ];
+            frames.push((object_id, adas::encode_signals(object_id, &v).expect("corner object")));
+        }
+        for (id, mut d) in frames {
+            toyota::seal(id, &mut d);
+            self.adas.send(id, d);
+        }
+        let sent = &mut self.corner_sent[k];
+        sent.push((scan.scan & 0xFFFF, frame));
+        if sent.len() > 16 {
+            sent.remove(0);
+        }
+    }
+
+    /// The park ECU: one frame per bumper per cycle.
+    fn publish_park(&mut self, scan: &UltrasonicScan) {
+        for (id, half) in [(adas::ParkSensorsFront::ID, &scan.dist[..6]), (adas::ParkSensorsRear::ID, &scan.dist[6..])] {
+            let enc = |d: f32| if d.is_nan() { PARK_NO_DATA } else if d.is_infinite() { PARK_NO_ECHO } else { (d as f64).min(PARK_NO_DATA - 0.01) };
+            let names = ["DIST_1", "DIST_2", "DIST_3", "DIST_4", "DIST_5", "DIST_6"];
+            let mut v: Vec<(&str, f64)> = names.iter().zip(half).map(|(n, d)| (*n, enc(*d))).collect();
+            v.push(("CYCLE", (scan.cycle & 0xFF) as f64));
+            v.push(("ACTIVE", 1.0));
+            v.push(("COUNTER", self.park_counter as f64));
+            self.park_counter = self.park_counter.wrapping_add(1);
+            let mut d = adas::encode_signals(id, &v).expect("park sensors");
+            toyota::seal(id, &mut d);
+            self.adas.send(id, d);
+        }
+    }
+
+    /// One host frame at time `t` (s): chassis ECUs publish, the front radar
+    /// ECU publishes a scan if it has one, both buses run, and the ADAS ECU
+    /// reads what arrived. Returns a complete front radar scan if one arrived.
     pub fn step(&mut self, t: f64, frame: u64, s: &VehicleSample, scan: Option<&RadarScan>) -> Option<RadarScan> {
+        self.step_all(t, frame, s, &SensorOut { front: scan, ..Default::default() }).front
+    }
+
+    /// As [`Vehicle::step`], with every sensor ECU: the front and corner
+    /// radars and the park ECU.
+    pub fn step_all(&mut self, t: f64, frame: u64, s: &VehicleSample, out: &SensorOut) -> Arrived {
         self.publish_chassis(t, s);
-        if let Some(sc) = scan {
+        if let Some(sc) = out.front {
             self.publish_radar(sc, frame);
         }
+        for (k, sc) in out.corners.iter().enumerate() {
+            if let Some(sc) = sc {
+                self.publish_corner(k, sc, frame);
+            }
+        }
+        if let Some(p) = out.park {
+            self.publish_park(p);
+        }
         self.last_frames.clear();
-        let mut arrived = None;
+        let mut arrived = Arrived::default();
         for f in self.chassis.step(t) {
             self.stats.chassis_frames += 1;
             self.read_chassis(&f);
@@ -247,12 +396,91 @@ impl Vehicle {
         }
         for f in self.adas.step(t) {
             self.stats.adas_frames += 1;
-            if let Some(sc) = self.read_adas(&f, frame) {
-                arrived = Some(sc);
+            if let Some(k) = CORNER_IDS.iter().position(|&(st, ob)| f.id == st || f.id == ob) {
+                if let Some(sc) = self.read_corner(k, &f, frame) {
+                    arrived.corners[k] = Some(sc);
+                }
+            } else if f.id == adas::ParkSensorsFront::ID || f.id == adas::ParkSensorsRear::ID {
+                if let Some(p) = self.read_park(&f) {
+                    arrived.park = Some(p);
+                }
+            } else if let Some(sc) = self.read_adas(&f, frame) {
+                arrived.front = Some(sc);
             }
             self.last_frames.push(("adas", f));
         }
         arrived
+    }
+
+    fn read_corner(&mut self, k: usize, f: &Frame, frame: u64) -> Option<RadarScan> {
+        if !toyota::verify(f.id, &f.data) {
+            self.stats.errors += 1;
+            return None;
+        }
+        let sig = adas::decode_signals(f.id, &f.data)?;
+        let get = |n: &str| sig.iter().find(|(s, _)| *s == n).map_or(0.0, |(_, v)| *v);
+        if f.id == CORNER_IDS[k].0 {
+            let expected = get("NUM_OBJECTS") as usize;
+            self.corner_pending[k] = Some(Pending { scan: get("SCAN_COUNTER") as u32, frame, expected, objects: Vec::with_capacity(expected) });
+        } else if let Some(p) = self.corner_pending[k].as_mut() {
+            p.objects.push(RadarObject {
+                id: get("TRACK_ID") as u32,
+                x: get("DIST_X") as f32,
+                y: get("DIST_Y") as f32,
+                vx: get("VEL_X") as f32,
+                vy: get("VEL_Y") as f32,
+                width: get("WIDTH") as f32,
+                half_length: get("HALF_LENGTH") as f32,
+                stationary: get("STATIONARY") > 0.5,
+                clutter: false,
+            });
+        }
+        if self.corner_pending[k].as_ref().is_some_and(|p| p.objects.len() >= p.expected) {
+            let p = self.corner_pending[k].take().expect("pending corner scan");
+            if let Some(&(_, sent)) = self.corner_sent[k].iter().find(|(s, _)| *s == p.scan) {
+                let lat = frame.saturating_sub(sent) as u32;
+                self.stats.corner_latency_frames = if k == 0 { lat } else { self.stats.corner_latency_frames.max(lat) };
+            }
+            return Some(RadarScan { scan: p.scan, objects: p.objects });
+        }
+        None
+    }
+
+    /// Both bumpers' frames of the same cycle make one scan.
+    fn read_park(&mut self, f: &Frame) -> Option<UltrasonicScan> {
+        if !toyota::verify(f.id, &f.data) {
+            self.stats.errors += 1;
+            return None;
+        }
+        let sig = adas::decode_signals(f.id, &f.data)?;
+        let get = |n: &str| sig.iter().find(|(s, _)| *s == n).map_or(0.0, |(_, v)| *v);
+        let mut d = [0f32; 6];
+        for (i, x) in d.iter_mut().enumerate() {
+            let v = get(["DIST_1", "DIST_2", "DIST_3", "DIST_4", "DIST_5", "DIST_6"][i]);
+            *x = if v >= PARK_NO_ECHO - 0.005 {
+                f32::INFINITY
+            } else if v >= PARK_NO_DATA - 0.005 {
+                f32::NAN
+            } else {
+                v as f32
+            };
+        }
+        let cycle = get("CYCLE") as u8;
+        if f.id == adas::ParkSensorsFront::ID {
+            self.park_rx.0 = Some((cycle, d));
+        } else {
+            self.park_rx.1 = Some((cycle, d));
+        }
+        match self.park_rx {
+            (Some((a, front)), Some((b, rear))) if a == b => {
+                self.park_rx = (None, None);
+                let mut dist = [f32::NAN; ULTRASONIC_COUNT];
+                dist[..6].copy_from_slice(&front);
+                dist[6..].copy_from_slice(&rear);
+                Some(UltrasonicScan { cycle: cycle as u32, dist })
+            }
+            _ => None,
+        }
     }
 
     /// The ADAS ECU's requests at time `t`: `ACC_CONTROL`, `PRE_COLLISION_2`
@@ -362,6 +590,14 @@ impl Vehicle {
             }
             chassis::BrakeModule::ID => self.ego.brake_pressed = chassis::BrakeModule::decode(&f.data).brake_pressed,
             chassis::PcmCruise::ID => self.ego.gas_pressed = !chassis::PcmCruise::decode(&f.data).gas_released,
+            chassis::GearPacket::ID => self.ego.reverse = chassis::GearPacket::decode(&f.data).gear as u8 == 16,
+            chassis::BlinkersState::ID => {
+                self.ego.turn = match chassis::BlinkersState::decode(&f.data).turn_signals as u8 {
+                    1 => Turn::Left,
+                    2 => Turn::Right,
+                    _ => Turn::None,
+                }
+            }
             _ => {}
         }
         self.ego.frames += 1;
@@ -499,8 +735,8 @@ mod tests {
         for i in 0..72 {
             v.step(i as f64 / 72.0, i, &s, None);
         }
-        // 3 × 80 + 50 + 40 + 33 ≈ 363 frames in the first second (±1 per message).
-        assert!((355..=370).contains(&v.stats.chassis_frames), "{} chassis frames", v.stats.chassis_frames);
+        // 3 × 80 + 50 + 40 + 33 + 20 + 10 ≈ 393 frames in the first second (±1 per message).
+        assert!((385..=400).contains(&v.stats.chassis_frames), "{} chassis frames", v.stats.chassis_frames);
         let (chassis, _) = v.take_loads();
         // About 360 × 0.24 ms ≈ 8–9 % of a 500 kbit/s bus.
         assert!((0.06..0.12).contains(&chassis), "chassis load {chassis}");
@@ -526,7 +762,50 @@ mod tests {
         let mut v = Vehicle::new(Delivery::Reactive);
         // The host's clock is already at 775 s when the core starts.
         v.step(775.0, 1, &VehicleSample::default(), None);
-        assert!(v.stats.chassis_frames <= 6, "{} frames in the first step", v.stats.chassis_frames);
+        // One frame per periodic message (eight), not 775 s of backlog.
+        assert!(v.stats.chassis_frames <= 8, "{} frames in the first step", v.stats.chassis_frames);
+    }
+
+    #[test]
+    fn gear_and_turn_signal_cross_chassis_can() {
+        let mut v = Vehicle::new(Delivery::Reactive);
+        let s = VehicleSample { speed: 1.0, flags: sample_flags::REVERSE | sample_flags::TURN_RIGHT, ..Default::default() };
+        for i in 0..10 {
+            v.step(i as f64 / 72.0, i, &s, None);
+        }
+        assert!(v.ego.reverse && v.ego.turn == Turn::Right && v.ego.vx() == -1.0);
+        let s = VehicleSample { flags: sample_flags::TURN_LEFT, ..s };
+        for i in 10..30 {
+            v.step(i as f64 / 72.0, i, &s, None);
+        }
+        assert!(!v.ego.reverse && v.ego.turn == Turn::Left);
+    }
+
+    #[test]
+    fn corner_scans_and_park_distances_cross_the_adas_bus() {
+        let mut v = Vehicle::new(Delivery::Realistic);
+        let obj = |id, x: f32, y: f32| RadarObject { id, x, y, vx: 22.0, vy: -0.5, width: 1.9, half_length: 2.25, stationary: false, clutter: false };
+        let rl = RadarScan { scan: 3, objects: vec![obj(11, -6.5, 2.7), obj(12, -30.0, 3.1)] };
+        let rr = RadarScan { scan: 9, objects: vec![obj(13, -12.0, -3.4)] };
+        let mut dist = [f32::INFINITY; ULTRASONIC_COUNT];
+        dist[2] = 0.87;
+        dist[8] = f32::NAN;
+        let park = UltrasonicScan { cycle: 300, dist };
+        let s = VehicleSample::default();
+        let out = SensorOut { corners: [None, None, Some(&rl), Some(&rr)], park: Some(&park), ..Default::default() };
+        let mut got = v.step_all(0.0, 0, &s, &out);
+        let more = v.step_all(1.0 / 72.0, 1, &s, &SensorOut::default());
+        for k in 0..4 {
+            got.corners[k] = got.corners[k].take().or(more.corners[k].clone());
+        }
+        let park_rx = got.park.or(more.park).expect("park cycle arrived");
+        let back_rl = got.corners[2].as_ref().expect("rear left scan");
+        assert_eq!((back_rl.scan, back_rl.objects.len()), (3, 2));
+        assert!((back_rl.objects[0].x + 6.5).abs() < 0.011 && (back_rl.objects[1].y - 3.1).abs() < 0.011, "signed distances");
+        assert_eq!(got.corners[3].as_ref().unwrap().objects[0].id, 13);
+        assert!(got.corners[0].is_none() && got.corners[1].is_none());
+        assert!((park_rx.dist[2] - 0.87).abs() < 0.006 && park_rx.dist[0].is_infinite() && park_rx.dist[8].is_nan());
+        assert_eq!(v.stats.errors, 0);
     }
 
     #[test]

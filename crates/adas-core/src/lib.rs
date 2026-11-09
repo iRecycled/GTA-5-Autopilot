@@ -24,11 +24,14 @@ pub mod msgs;
 pub mod telem;
 pub mod vbus;
 
-use adapter_api::{ActorList, AdapterInfo, Command, Hud, SensorLayout, VehicleSample, buttons, command_flags, hud_flags, sample_flags};
+use adapter_api::{
+    ActorList, AdapterInfo, Command, FanLayout, Hud, RangeReport, SensorLayout, VehicleSample, buttons, caps, command_flags, fan_flags, hud_flags,
+    sample_flags, surround_flags,
+};
 use control::{Config, SpeedController};
 use features::FeatureState;
-use fusion::{Lead, LeadKind, Tracker, TrackerConfig, select_lead};
-use sensors::{FrontRadar, RadarConfig};
+use fusion::{Lead, LeadKind, SurroundConfig, SurroundTracker, Tracker, TrackerConfig, select_lead};
+use sensors::{FrontRadar, Radar, RadarConfig, RadarScan, UltrasonicConfig, Ultrasonics};
 
 pub use features::{Feature, Stick};
 
@@ -37,8 +40,41 @@ pub use features::{Feature, Stick};
 pub struct Inputs<'a> {
     pub sample: &'a VehicleSample,
     pub actors: &'a ActorList,
+    /// The host's answers to the range fans, while they are active.
+    pub ranges: Option<&'a RangeReport>,
     /// The test driver's stick, when the test-driver feature is running.
     pub stick: Option<Stick>,
+}
+
+/// The parking sensors run below this speed, and stop above the second
+/// (m/s), as on real cars.
+pub const FANS_ON_SPEED: f32 = 18.0 / 3.6;
+pub const FANS_OFF_SPEED: f32 = 20.0 / 3.6;
+/// After the parking sensors start, missing data isn't a fault for this
+/// long (frames): the host needs a few frames to answer.
+const PARK_GRACE_FRAMES: u64 = 36;
+
+/// Which surround features are switched on (the driver's settings; all on
+/// by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Toggles {
+    pub bsd: bool,
+    pub rcta: bool,
+    pub park: bool,
+}
+
+impl Default for Toggles {
+    fn default() -> Self {
+        Self { bsd: true, rcta: true, park: true }
+    }
+}
+
+/// What the surround features did in the last step (for the HUD and views).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Surround {
+    pub bsd: ::features::BsdOut,
+    pub rcta: ::features::RctaOut,
+    pub park: ::features::ParkOut,
 }
 
 /// Engagement state, as a production ADAS shows it.
@@ -136,6 +172,22 @@ pub struct Core {
     driver: driver::DriverMonitor,
     /// A takeover request in progress: (seconds since it started, why).
     takeover: Option<(f32, degrade::Reason)>,
+    // --- Surround (Phase 2) ---
+    corners: [Radar; 4],
+    surround: SurroundTracker,
+    ultrasonics: Ultrasonics,
+    fans: FanLayout,
+    /// Frames since the parking sensors started (`None` = off).
+    fans_on: Option<u64>,
+    bsd: ::features::Bsd,
+    rcta: ::features::Rcta,
+    park: ::features::ParkAssist,
+    /// Frames of the last scan from each corner radar, and of the last park cycle.
+    corner_last: [Option<u64>; 4],
+    park_last: Option<u64>,
+    park_fault: bool,
+    surround_out: Surround,
+    toggles: Toggles,
 }
 
 /// Starting guess for the brake gain (m/s² per unit of brake demand); learned
@@ -207,7 +259,55 @@ impl Core {
             lead_ids: (None, None),
             driver: driver::DriverMonitor::new(),
             takeover: None,
+            corners: core::array::from_fn(|k| Radar::new(RadarConfig::corner(), layout::CORNERS[k])),
+            surround: SurroundTracker::new(SurroundConfig::default()),
+            ultrasonics: Ultrasonics::new(UltrasonicConfig::default()),
+            fans: FanLayout::default(),
+            fans_on: None,
+            bsd: Default::default(),
+            rcta: Default::default(),
+            park: Default::default(),
+            corner_last: [None; 4],
+            park_last: None,
+            park_fault: false,
+            surround_out: Surround::default(),
+            toggles: Toggles::default(),
         }
+    }
+
+    /// Switches surround features on or off.
+    pub fn set_toggles(&mut self, t: Toggles) {
+        self.toggles = t;
+    }
+
+    pub fn toggles(&self) -> Toggles {
+        self.toggles
+    }
+
+    /// The surround tracks (corner radars) after the last step.
+    pub fn surround_tracks(&self) -> &[fusion::SurroundTrack] {
+        self.surround.tracks()
+    }
+
+    /// What BSD, RCTA and park assist did in the last step.
+    pub fn surround(&self) -> &Surround {
+        &self.surround_out
+    }
+
+    /// The standing range fans for the adapter (`fan_flags::ACTIVE` while
+    /// the parking sensors run).
+    pub fn fans(&self) -> &FanLayout {
+        &self.fans
+    }
+
+    /// RCTA and park assist brake activations so far.
+    pub fn surround_activations(&self) -> (u32, u32) {
+        (self.rcta.activations, self.park.activations)
+    }
+
+    /// BSD icon episodes so far (left, right).
+    pub fn bsd_episodes(&self) -> [u32; 2] {
+        self.bsd.episodes
     }
 
     /// The takeover request in progress, if any: (seconds since it started, why).
@@ -236,9 +336,13 @@ impl Core {
     /// The adapter's identity and ego geometry. Rebuilds the sensor layout.
     pub fn set_info(&mut self, info: &AdapterInfo) {
         self.info = Some(*info);
-        // Give the radar its first scans' worth of grace from here.
+        // Give the radars their first scans' worth of grace from here.
         self.radar_last = None;
+        self.corner_last = [None; 4];
         self.layout = layout::default_layout(info.box_min, info.box_max);
+        let flags = self.fans.flags;
+        self.fans = if info.capabilities & caps::RANGE_FANS != 0 { layout::default_fans(info.box_min, info.box_max) } else { FanLayout::default() };
+        self.fans.flags = flags;
     }
 
     /// The adapter's identity and ego geometry, once received.
@@ -295,10 +399,22 @@ impl Core {
         let drv = self.driver.step(host, if paused { 0.0 } else { dt });
         let (cancel, override_) = (drv.brake, drv.gas);
 
+        // The parking sensors run at parking speeds (as the ADAS ECU knows
+        // the speed: from the bus), if the host answers range fans.
+        if !paused && dt > 0.0 {
+            let v = self.vehicle.ego.speed;
+            let on = self.fans.count > 0 && if self.fans_on.is_some() { v <= FANS_OFF_SPEED } else { v < FANS_ON_SPEED };
+            self.fans_on = if on { Some(self.fans_on.map_or(0, |n| n + 1)) } else { None };
+            self.fans.flags = if on { fan_flags::ACTIVE } else { 0 };
+        }
+
         // --- The buses and perception (always) ---
         // From here on the core works on the car as the ADAS ECU sees it on
         // the bus, not on the host's exact values.
-        let (follow, threat, bus_speed, bus_yaw) = self.perceive(host, inp.actors, dt, host.flags & sample_flags::PAUSED != 0);
+        let (follow, threat, bus_speed, bus_yaw, park_cycle) = self.perceive(host, inp.actors, inp.ranges, dt, paused);
+        let reverse = self.vehicle.ego.reverse;
+        // Going backwards, nothing ahead is a collision threat.
+        let threat = threat.filter(|_| !reverse);
         self.lead_ids = (follow.map(|l| l.id), threat.map(|l| l.id));
         let mut view = *host;
         view.speed = bus_speed;
@@ -316,14 +432,38 @@ impl Core {
             if self.scan_arrived || (self.radar_last.is_none() && self.info.is_some()) {
                 self.radar_last = Some(frame);
             }
+            for last in &mut self.corner_last {
+                if last.is_none() && self.info.is_some() {
+                    *last = Some(frame);
+                }
+            }
+            if park_cycle.is_some() || self.fans_on == Some(0) {
+                self.park_last = Some(frame);
+            }
+            if let Some(c) = &park_cycle {
+                self.park_fault = c.iter().any(|d| d.is_nan());
+            }
         }
         let age = |last: Option<u64>| last.map_or(u64::MAX, |l| frame.saturating_sub(l));
-        self.avail = degrade::evaluate(self.info.as_ref(), degrade::Health { chassis_age: age(self.chassis_last), radar_age: age(self.radar_last) });
+        self.avail = degrade::evaluate(
+            self.info.as_ref(),
+            degrade::Health {
+                chassis_age: age(self.chassis_last),
+                radar_age: age(self.radar_last),
+                rear_corner_age: [age(self.corner_last[2]), age(self.corner_last[3])],
+                park_running: self.fans_on.is_some_and(|n| n > PARK_GRACE_FRAMES),
+                park_age: age(self.park_last),
+                park_fault: self.park_fault,
+            },
+        );
         self.radar.ignore_los = self.avail.los_degraded;
+        for r in &mut self.corners {
+            r.ignore_los = self.avail.los_degraded;
+        }
         let feature_ok = match self.feature {
             Feature::Acc(_) => {
                 let too_slow = !self.avail.stop_and_go && s.speed < degrade::ACC_MIN_SPEED;
-                self.avail.acc.and(if too_slow { Err(degrade::Reason::NoHold) } else { Ok(()) })
+                self.avail.acc.and(if too_slow { Err(degrade::Reason::NoHold) } else { Ok(()) }).and(if reverse { Err(degrade::Reason::Reversing) } else { Ok(()) })
             }
             Feature::SpeedProfile(_) => self.avail.drive,
             Feature::TestDriver(_) => self.avail.drive.and(self.avail.steer),
@@ -365,7 +505,12 @@ impl Core {
         } else {
             Some(self.aeb.step(dt, s.speed, threat, s.driver_throttle, s.driver_brake))
         };
-        let aeb_braking = aeb.is_some_and(|a| a.decel > 0.0 || a.hold);
+        // --- BSD, RCTA, park assist (always) ---
+        self.surround_out = self.run_surround(dt, paused, park_cycle.as_ref());
+        let sur = self.surround_out;
+        let auto_decel = if self.avail.surround_brake { sur.rcta.decel.max(sur.park.decel) } else { 0.0 };
+        let auto_hold = self.avail.surround_brake && (sur.rcta.hold || sur.park.hold);
+        let aeb_braking = aeb.is_some_and(|a| a.decel > 0.0 || a.hold) || auto_decel > 0.0 || auto_hold;
 
         // --- Engagement ---
         let mut event = Event::None;
@@ -518,6 +663,15 @@ impl Core {
                 req.aeb_hold = true;
             }
         }
+        // Rear cross-traffic and park assist brake through the same request.
+        if auto_decel > 0.0 {
+            cmd.flags |= command_flags::AEB;
+            req.aeb_decel = req.aeb_decel.max(auto_decel);
+        }
+        if auto_hold && req.aeb_decel <= 0.0 {
+            cmd.flags |= command_flags::AEB;
+            req.aeb_hold = true;
+        }
 
         // --- Actuation over chassis CAN ---
         cmd.throttle = 0.0;
@@ -601,36 +755,129 @@ impl Core {
             lead_speed: follow.map(|l| l.v).unwrap_or(f32::NAN),
             ttc: aeb.map(|a| a.ttc).unwrap_or(f32::INFINITY),
             message,
+            surround: self.surround_flags(),
+            park_tone: if sur.park.active { sur.park.tone } else { 0.0 },
+            park: if sur.park.active { sur.park.dist } else { [f32::NAN; 12] },
         };
         (cmd, event)
+    }
+
+    /// The ego car as the surround features see it (for views).
+    pub fn surround_ego(&self) -> ::features::Ego {
+        self.ego()
+    }
+
+    /// The ego car as the surround features see it: from the bus, and its box.
+    fn ego(&self) -> ::features::Ego {
+        let e = &self.vehicle.ego;
+        let (lo, hi) = self.info.map_or(([-2.35, -0.95, 0.0], [2.35, 0.95, 1.5]), |i| (i.box_min, i.box_max));
+        ::features::Ego {
+            speed: e.speed,
+            reverse: e.reverse,
+            turn_left: e.turn == vbus::Turn::Left,
+            turn_right: e.turn == vbus::Turn::Right,
+            front: hi[0],
+            rear: lo[0],
+            left: hi[1],
+            right: lo[1],
+        }
+    }
+
+    fn run_surround(&mut self, dt: f32, paused: bool, park_cycle: Option<&[f32; 12]>) -> Surround {
+        if paused || dt <= 0.0 || self.info.is_none() {
+            return Surround { park: ::features::ParkOut::default(), ..self.surround_out };
+        }
+        let ego = self.ego();
+        let brake = if self.vehicle.ego.brake_pressed { 1.0 } else { 0.0 };
+        let tracks = self.surround.tracks();
+        let on = self.toggles;
+        let bsd = if on.bsd && self.avail.bsd.is_ok() { self.bsd.step(dt, &ego, tracks) } else { Default::default() };
+        let rcta = if on.rcta && self.avail.rcta.is_ok() { self.rcta.step(dt, &ego, tracks, brake) } else { Default::default() };
+        let park = if on.park && self.avail.park.is_ok() && self.fans_on.is_some() { self.park.step(dt, &ego, park_cycle, brake) } else { Default::default() };
+        Surround { bsd, rcta, park }
+    }
+
+    fn surround_flags(&self) -> u32 {
+        use surround_flags as sf;
+        let s = &self.surround_out;
+        let mut f = 0;
+        let mut set = |on: bool, bit: u32| {
+            if on {
+                f |= bit;
+            }
+        };
+        set(s.bsd.active, sf::BSD_ACTIVE);
+        set(s.bsd.left, sf::BSD_LEFT);
+        set(s.bsd.right, sf::BSD_RIGHT);
+        set(s.bsd.warn_left, sf::BSD_WARN_LEFT);
+        set(s.bsd.warn_right, sf::BSD_WARN_RIGHT);
+        set(s.rcta.active, sf::RCTA_ACTIVE);
+        set(s.rcta.left, sf::RCTA_LEFT);
+        set(s.rcta.right, sf::RCTA_RIGHT);
+        set(s.rcta.decel > 0.0 || s.rcta.hold, sf::RCTA_BRAKE);
+        set(s.park.active, sf::PARK_ACTIVE);
+        set(s.park.decel > 0.0 || s.park.hold, sf::PARK_BRAKE);
+        set(self.avail.bsd.is_err(), sf::BSD_OFF);
+        set(self.avail.rcta.is_err(), sf::RCTA_OFF);
+        set(self.avail.park.is_err(), sf::PARK_OFF);
+        f
     }
 
     /// The buses, then tracker → leads. Returns the leads and the ego speed
     /// and yaw rate as read from chassis CAN. Without adapter info (no ego
     /// geometry, no sensor layout yet) there is no radar.
-    fn perceive(&mut self, s: &VehicleSample, actors: &ActorList, dt: f32, paused: bool) -> (Option<Lead>, Option<Lead>, f32, f32) {
+    /// Also returns the park ECU's cycle, if one arrived.
+    fn perceive(
+        &mut self,
+        s: &VehicleSample,
+        actors: &ActorList,
+        ranges: Option<&RangeReport>,
+        dt: f32,
+        paused: bool,
+    ) -> (Option<Lead>, Option<Lead>, f32, f32, Option<[f32; 12]>) {
         let have_bus = self.vehicle.ego.frames > 0;
         let held = |v: &vbus::Vehicle| if have_bus { (v.ego.speed, v.ego.yaw_rate) } else { (s.speed, s.yaw_rate) };
         self.scan_arrived = false;
         if paused || dt <= 0.0 {
             let (v, w) = held(&self.vehicle);
-            return (None, None, v, w);
+            return (None, None, v, w, None);
         }
-        // The front radar ECU's scan (its sensor model sees the actors).
-        let scan = match (self.info.is_some(), self.layout.as_slice().get(layout::FRONT_RADAR)) {
-            (true, Some(mount)) => self.radar.step(dt, mount, actors, s.header.frame),
+        let frame = s.header.frame;
+        let mounts = self.layout.as_slice();
+        let have_info = self.info.is_some();
+        // The radar ECUs' scans (their sensor models see the actors).
+        let scan = match (have_info, mounts.get(layout::FRONT_RADAR)) {
+            (true, Some(mount)) => self.radar.step(dt, mount, actors, frame),
             _ => None,
         };
+        let mut corner: [Option<RadarScan>; 4] = Default::default();
+        for (k, c) in corner.iter_mut().enumerate() {
+            if let (true, Some(m)) = (have_info, mounts.get(layout::CORNERS[k])) {
+                *c = self.corners[k].step(dt, m, actors, frame);
+            }
+        }
+        // The park ECU, while the parking sensors run.
+        let park = if have_info && self.fans_on.is_some() { self.ultrasonics.step(dt, &self.fans, ranges, frame) } else { None };
         let t = s.header.game_time_us as f64 / 1e6;
-        let arrived = self.vehicle.step(t, s.header.frame, s, scan.as_ref());
-        self.scan_arrived = arrived.is_some();
+        let out = vbus::SensorOut { front: scan.as_ref(), corners: [corner[0].as_ref(), corner[1].as_ref(), corner[2].as_ref(), corner[3].as_ref()], park: park.as_ref() };
+        let arrived = self.vehicle.step_all(t, frame, s, &out);
+        self.scan_arrived = arrived.front.is_some();
         let (v, w) = (self.vehicle.ego.speed, self.vehicle.ego.yaw_rate);
-        let Some(info) = self.info else { return (None, None, v, w) };
-        self.tracker.predict(dt, v, w);
+        // Signed: the frame moves backwards when reversing.
+        let vx = self.vehicle.ego.vx();
+        let Some(info) = self.info else { return (None, None, v, w, None) };
+        self.tracker.predict(dt, vx, w);
         self.since_scan += dt;
-        if let Some(sc) = arrived {
+        if let Some(sc) = arrived.front {
             self.tracker.update(&sc, self.since_scan);
             self.since_scan = 0.0;
+        }
+        self.surround.predict(dt, vx, w);
+        for (k, sc) in arrived.corners.iter().enumerate() {
+            if let Some(sc) = sc {
+                self.corner_last[k] = Some(frame);
+                self.surround.update(k as u8, sc);
+            }
         }
         let front = info.box_max[0];
         let tracks = self.tracker.tracks();
@@ -639,6 +886,7 @@ impl Core {
             select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Collision),
             v,
             w,
+            arrived.park.map(|p| p.dist),
         )
     }
 
@@ -681,7 +929,7 @@ mod tests {
     fn step(core: &mut Core, seq: u32, flags: u32, speed: f32) -> (Command, Event) {
         let s = sample(seq, flags, speed);
         let a = ActorList::default();
-        core.step(Inputs { sample: &s, actors: &a, stick: None })
+        core.step(Inputs { sample: &s, actors: &a, ranges: None, stick: None })
     }
 
     #[test]
@@ -840,7 +1088,7 @@ mod tests {
         assert!(core.takeover().is_some());
         let mut s = sample(seq, sample_flags::ENGAGE_REQUEST, 20.0);
         s.driver_throttle = 0.3;
-        let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), stick: None });
+        let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, stick: None });
         assert_eq!(e, Event::TakenOver);
         assert_eq!(c.flags & command_flags::HAZARDS, 0);
         assert_eq!(core.state(), State::Off);
@@ -854,7 +1102,7 @@ mod tests {
         let mut steered = |seq: u32, driver_steer: f32| {
             let mut s = sample(seq, sample_flags::ENGAGE_REQUEST, 5.0);
             s.driver_steer = driver_steer;
-            let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), stick });
+            let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, stick });
             (c.flags & command_flags::STEER != 0, e)
         };
         let mut seq = 1;
@@ -899,7 +1147,7 @@ mod tests {
         let set0 = core.hud().set_speed;
         let mut s = sample(2, sample_flags::ENGAGE_REQUEST, 20.0);
         s.buttons = buttons::SPEED_UP;
-        core.step(Inputs { sample: &s, actors: &ActorList::default(), stick: None });
+        core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, stick: None });
         assert!((core.hud().set_speed - set0 - 5.0 / 3.6).abs() < 1e-4);
     }
 }

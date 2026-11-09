@@ -13,6 +13,8 @@ pub enum MsgKind {
     SensorLayout = 4,
     AdapterInfo = 5,
     Hud = 6,
+    FanLayout = 7,
+    RangeReport = 8,
 }
 
 /// Common header (layout from `docs/implementation-plan.md`).
@@ -48,6 +50,12 @@ pub mod sample_flags {
     /// The driver inputs come from an analogue device (gamepad, wheel), not
     /// keys: the core debounces steering per device (D11).
     pub const INPUT_ANALOG: u32 = 1 << 4;
+    /// Reverse is selected: the car moves (or will move) backwards; `vx` is
+    /// negative while it does (`caps::GEAR`).
+    pub const REVERSE: u32 = 1 << 5;
+    /// The driver's turn signal is on, left or right (`caps::TURN_SIGNALS`).
+    pub const TURN_LEFT: u32 = 1 << 6;
+    pub const TURN_RIGHT: u32 = 1 << 7;
 }
 
 /// adapter → core, every frame.
@@ -97,8 +105,11 @@ pub mod command_flags {
     pub const HOLD: u32 = 1 << 1;
     /// The core wants to steer (lateral control engaged).
     pub const STEER: u32 = 1 << 2;
-    /// Emergency braking: apply `brake` (and `HOLD` once stopped) even when not
-    /// engaged; it overrides the driver's accelerator.
+    /// Automatic braking (AEB, rear cross-traffic braking, park assist): apply
+    /// `brake` (and `HOLD` once stopped) even when not engaged. It overrides
+    /// the driver's accelerator whichever way the car is moving, so a host
+    /// whose brake control reverses at a standstill must map it. The HUD says
+    /// which feature braked.
     pub const AEB: u32 = 1 << 3;
     /// Forward collision warning: alert the driver (chime and flash).
     pub const FCW: u32 = 1 << 4;
@@ -247,6 +258,96 @@ impl SensorLayout {
     }
 }
 
+/// One ultrasonic-style range sensor: a fan of `rays` rays from one mount,
+/// spread evenly over ±`half_spread` around `facing` (with an odd count, one
+/// ray points along `facing`). The host reports, per ray, the distance to the
+/// first solid thing it hits: vehicles, walls, poles, anything.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RangeFan {
+    /// Mount position in the ego frame (m); `z` is the height of the rays.
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// Fan centre, CCW from forward (rad).
+    pub facing: f32,
+    /// Half the fan's spread (rad).
+    pub half_spread: f32,
+    /// Ray length (m).
+    pub range: f32,
+    /// Rays in the fan, 1..=[`MAX_FAN_RAYS`].
+    pub rays: u32,
+    /// Desired refresh period per ray (frames).
+    pub refresh_frames: f32,
+}
+
+pub const MAX_FANS: usize = 16;
+pub const MAX_FAN_RAYS: usize = 4;
+
+/// Fan layout flags.
+pub mod fan_flags {
+    /// The core wants the fans answered now. Ultrasonics run only at parking
+    /// speeds, so hosts don't spend rays at speed.
+    pub const ACTIVE: u32 = 1 << 0;
+}
+
+/// core → adapter (latest wins): the standing range fans.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FanLayout {
+    pub header: Header,
+    pub count: u32,
+    pub flags: u32,
+    pub fans: [RangeFan; MAX_FANS],
+}
+
+impl FanLayout {
+    pub fn as_slice(&self) -> &[RangeFan] {
+        &self.fans[..(self.count as usize).min(MAX_FANS)]
+    }
+
+    /// The direction of ray `i` of fan `f` (rad, CCW from forward).
+    pub fn ray_angle(f: &RangeFan, i: usize) -> f32 {
+        let n = f.rays.clamp(1, MAX_FAN_RAYS as u32) as usize;
+        if n == 1 { f.facing } else { f.facing - f.half_spread + 2.0 * f.half_spread * i as f32 / (n - 1) as f32 }
+    }
+}
+
+/// One fan's answer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FanResult {
+    /// Distance along each ray to the first hit (m); infinite = nothing within
+    /// range; NaN = not measured.
+    pub hits: [f32; MAX_FAN_RAYS],
+    /// Frames since the oldest ray of this fan was measured.
+    pub age: u32,
+    pub _reserved: u32,
+}
+
+impl Default for FanResult {
+    fn default() -> Self {
+        Self { hits: [f32::NAN; MAX_FAN_RAYS], age: u32::MAX, _reserved: 0 }
+    }
+}
+
+/// adapter → core, every frame while the fans are active: one result per fan
+/// of the current [`FanLayout`], in the same order.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RangeReport {
+    pub header: Header,
+    pub count: u32,
+    pub _reserved: u32,
+    pub fans: [FanResult; MAX_FANS],
+}
+
+impl RangeReport {
+    pub fn as_slice(&self) -> &[FanResult] {
+        &self.fans[..(self.count as usize).min(MAX_FANS)]
+    }
+}
+
 /// Capability bits in [`AdapterInfo::capabilities`].
 pub mod caps {
     pub const STEER: u32 = 1 << 0;
@@ -256,6 +357,12 @@ pub mod caps {
     pub const ACTORS: u32 = 1 << 4;
     pub const LINE_OF_SIGHT: u32 = 1 << 5;
     pub const DRIVER_INPUT: u32 = 1 << 6;
+    /// The host answers the standing range fans ([`FanLayout`], [`RangeReport`]).
+    pub const RANGE_FANS: u32 = 1 << 7;
+    /// The sample carries the turn signal (`sample_flags::TURN_*`).
+    pub const TURN_SIGNALS: u32 = 1 << 8;
+    /// The sample says when reverse is selected (`sample_flags::REVERSE`).
+    pub const GEAR: u32 = 1 << 9;
 }
 
 /// adapter → core (latest wins): who the adapter is and what it can do.
@@ -322,6 +429,42 @@ pub struct Hud {
     pub ttc: f32,
     /// Why the selected feature is unavailable (a [`hud_message`] code; 0 = none).
     pub message: u32,
+    /// Blind spot, cross traffic and park assist ([`surround_flags`]).
+    pub surround: u32,
+    /// Park assist tone: beeps per second (0 = silent, infinite = continuous).
+    pub park_tone: f32,
+    /// Park assist: the distance each ultrasonic sensor reports (m), in the
+    /// core's sensor order (front, left corner to right corner, then rear,
+    /// left corner to right corner); infinite = clear, NaN = not shown.
+    pub park: [f32; 12],
+}
+
+/// Surround flags in [`Hud::surround`]: blind spot (BSD), rear cross traffic
+/// (RCTA) and park assist.
+pub mod surround_flags {
+    /// Blind spot monitoring is active (above its minimum speed).
+    pub const BSD_ACTIVE: u32 = 1 << 0;
+    /// A vehicle in the left / right blind spot: the mirror icon, steady.
+    pub const BSD_LEFT: u32 = 1 << 1;
+    pub const BSD_RIGHT: u32 = 1 << 2;
+    /// Signalling toward an occupied side: flash the icon and chime.
+    pub const BSD_WARN_LEFT: u32 = 1 << 3;
+    pub const BSD_WARN_RIGHT: u32 = 1 << 4;
+    /// Rear cross-traffic alert is active (reversing).
+    pub const RCTA_ACTIVE: u32 = 1 << 5;
+    /// Crossing traffic approaching from the left / right: warn and chime.
+    pub const RCTA_LEFT: u32 = 1 << 6;
+    pub const RCTA_RIGHT: u32 = 1 << 7;
+    /// Rear cross-traffic braking.
+    pub const RCTA_BRAKE: u32 = 1 << 8;
+    /// Park assist is showing its distances (`Hud::park`).
+    pub const PARK_ACTIVE: u32 = 1 << 9;
+    /// Park assist braked for an obstacle.
+    pub const PARK_BRAKE: u32 = 1 << 10;
+    /// Unavailable (D21): shown greyed out with an "off" mark.
+    pub const BSD_OFF: u32 = 1 << 11;
+    pub const RCTA_OFF: u32 = 1 << 12;
+    pub const PARK_OFF: u32 = 1 << 13;
 }
 
 /// HUD message codes (D21): why a feature is unavailable. Adapters show the
@@ -335,6 +478,11 @@ pub mod hud_message {
     pub const NO_STEERING: u32 = 5;
     pub const VEHICLE_DATA_LOST: u32 = 6;
     pub const RADAR_BLOCKED: u32 = 7;
+    pub const SIDE_RADAR_BLOCKED: u32 = 8;
+    pub const NO_PARK_SENSORS: u32 = 9;
+    pub const PARK_SENSOR_FAULT: u32 = 10;
+    pub const NO_GEAR: u32 = 11;
+    pub const REVERSING: u32 = 12;
 
     pub fn text(code: u32) -> &'static str {
         match code {
@@ -345,6 +493,11 @@ pub mod hud_message {
             NO_STEERING => "no steering control on this host",
             VEHICLE_DATA_LOST => "vehicle data lost",
             RADAR_BLOCKED => "radar blocked",
+            SIDE_RADAR_BLOCKED => "side radar blocked",
+            NO_PARK_SENSORS => "no parking sensors on this host",
+            PARK_SENSOR_FAULT => "parking sensor fault",
+            NO_GEAR => "no gear signal on this host",
+            REVERSING => "not available in reverse",
             _ => "",
         }
     }
@@ -385,7 +538,19 @@ mod tests {
         assert_eq!(size_of::<SensorMount>(), 32);
         assert_eq!(size_of::<SensorLayout>(), 32 + 8 + MAX_SENSORS * 32);
         assert_eq!(size_of::<AdapterInfo>(), 32 + 64 + 8 + 24 + 8);
-        assert_eq!(size_of::<Hud>(), 32 + 32);
+        assert_eq!(size_of::<Hud>(), 32 + 32 + 8 + 48);
+        assert_eq!(size_of::<RangeFan>(), 32);
+        assert_eq!(size_of::<FanLayout>(), 32 + 8 + MAX_FANS * 32);
+        assert_eq!(size_of::<FanResult>(), 24);
+        assert_eq!(size_of::<RangeReport>(), 32 + 8 + MAX_FANS * 24);
+    }
+
+    #[test]
+    fn fan_rays_spread_evenly() {
+        let f = RangeFan { facing: 1.0, half_spread: 0.5, rays: 3, ..Default::default() };
+        let a: Vec<f32> = (0..3).map(|i| FanLayout::ray_angle(&f, i)).collect();
+        assert_eq!(a, vec![0.5, 1.0, 1.5]);
+        assert_eq!(FanLayout::ray_angle(&RangeFan { facing: 0.3, rays: 1, ..f }, 0), 0.3);
     }
 
     #[test]

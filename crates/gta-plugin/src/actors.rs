@@ -64,6 +64,19 @@ unsafe fn ray_result(handle: i32) -> (i32, bool, i32) {
     (status, hit != 0, entity)
 }
 
+/// Where a sensor at `mount` sees an actor's box (ego frame): its nearest
+/// point, moved 0.3 m toward the centre so the ray ends inside the actor.
+fn aim_point(c: V2, yaw: f32, length: f32, width: f32, mount: V2) -> V2 {
+    let (s, co) = yaw.sin_cos();
+    let d = mount - c;
+    let (lx, ly) = (co * d.x + s * d.y, -s * d.x + co * d.y);
+    let (cx, cy) = (lx.clamp(-0.5 * length, 0.5 * length), ly.clamp(-0.5 * width, 0.5 * width));
+    let p = V2::new(c.x + co * cx - s * cy, c.y + s * cx + co * cy);
+    let inward = c - p;
+    let l = inward.len();
+    if l > 0.3 { V2::new(p.x + 0.3 * inward.x / l, p.y + 0.3 * inward.y / l) } else { c }
+}
+
 pub fn model_dims(cache: &mut HashMap<u32, (Vector3, Vector3)>, model: u32) -> (Vector3, Vector3) {
     *cache.entry(model).or_insert_with(|| {
         let (mut lo, mut hi) = (Vector3::default(), Vector3::default());
@@ -129,7 +142,7 @@ impl Actors {
 
         // 4. Ego-frame state, sensor coverage and line-of-sight bits.
         let mounts = layout.as_slice();
-        let mut due: Vec<(f32, usize, u8, usize)> = Vec::new(); // (score, actor index, bits, mount)
+        let mut due: Vec<(f32, usize, u8, usize, V2)> = Vec::new(); // (score, actor index, bits, mount, ray target)
         let ego_z = ep.z;
         out.count = near.len() as u32;
         for (i, &(_, v, p)) in near.iter().enumerate() {
@@ -146,17 +159,22 @@ impl Actors {
             let centre = V2::new(p.x + fy * cx + fx * cy, p.y - fx * cx + fy * cy);
             let rel = ego.to_vehicle(centre);
             let vv = ego.rotate_to_vehicle(V2::new(vel.x, vel.y));
+            let (yaw, length, width) = (wrap_pi((h - eh).to_radians()), hi.y - lo.y, hi.x - lo.x);
 
-            // Which sensors cover it, and the nearest one.
+            // Which sensors cover it, and the nearest one. Wide-beam (corner)
+            // sensors see it where its box is nearest them (a car alongside
+            // is in a corner radar's beam even when its centre isn't); the
+            // front radar uses the centre, as in Phase 1.
             let mut bits = 0u8;
-            let mut best: Option<(f32, usize)> = None;
+            let mut best: Option<(f32, usize, V2)> = None;
             for (k, m) in mounts.iter().enumerate() {
-                let (dx, dy) = (rel.x - m.x, rel.y - m.y);
+                let target = if m.half_fov > 0.5 { aim_point(rel, yaw, length, width, V2::new(m.x, m.y)) } else { rel };
+                let (dx, dy) = (target.x - m.x, target.y - m.y);
                 let range = dx.hypot(dy);
                 if range <= m.range && wrap_pi(dy.atan2(dx) - m.facing).abs() <= m.half_fov {
                     bits |= 1 << k;
                     if best.is_none_or(|b| range < b.0) {
-                        best = Some((range, k));
+                        best = Some((range, k, target));
                     }
                 }
             }
@@ -165,13 +183,13 @@ impl Actors {
             if bits != 0 {
                 st.in_view += 1;
                 st.age_max = st.age_max.max(age.min(u16::MAX as u32));
-                if let Some((_, k)) = best
+                if let Some((_, k, target)) = best
                     && !self.pending.iter().any(|q| q.1 == v)
                 {
                     let refresh = mounts[k].refresh_frames.max(1.0);
                     let score = (age.min(10_000) as f32 + 1.0) / refresh;
                     if score >= 1.0 {
-                        due.push((score, i, bits, k));
+                        due.push((score, i, bits, k, target));
                     }
                 }
             }
@@ -185,10 +203,10 @@ impl Actors {
                 z: p.z + (lo.z + hi.z) * 0.5 - ego_z,
                 vx: vv.x,
                 vy: vv.y,
-                yaw: wrap_pi((h - eh).to_radians()),
+                yaw,
                 yaw_rate: rot.z,
-                length: hi.y - lo.y,
-                width: hi.x - lo.x,
+                length,
+                width,
                 height: hi.z - lo.z,
             };
         }
@@ -199,11 +217,11 @@ impl Actors {
         // GTA's own AI shares the async pool: when a start fails, the rest go
         // synchronous (within SYNC_MAX).
         let mut async_left = MAX_IN_FLIGHT.saturating_sub(self.pending.len());
-        for &(score, i, bits, k) in &due {
+        for &(score, i, bits, k, target) in &due {
             let m = mounts[k];
             let from = ego.to_world(V2::new(m.x, m.y));
             let a = out.actors[i];
-            let to = ego.to_world(V2::new(a.x, a.y));
+            let to = ego.to_world(target);
             let (fz, tz) = (ego_z + m.z, ego_z + a.z);
             let id = near[i].1;
             if async_left > 0 {

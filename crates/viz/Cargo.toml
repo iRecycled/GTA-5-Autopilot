@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 adas-core = { path = "../adas-core" }
+features = { path = "../features" }
 adapter-api = { path = "../adapter-api" }
 record = { path = "../record" }
 telemetry = { path = "../telemetry" }

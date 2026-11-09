@@ -281,7 +281,7 @@ Spikes can still reopen a decision; each fallback is named in its row. D22–D29
 | D11 | Engagement and override | openpilot-style rules, thresholds per input device, escalating takeover requests ending in a controlled stop | — | Decided | Phase 1 |
 | D12 | Target PC | Separate gaming PC: RTX 4070 Ti (12 GB) + Ryzen 7 7800X3D | — | Decided | Phase 0 |
 | D13 | openpilot | Borrow its pieces now (bus layouts, rules, tuning); running it whole is a Phase 6 option under WSL2 | — | Decided | Phase 1 |
-| D14 | Release | Private until Phase 2; permissively licensed dependencies only | — | Decided | Phase 2 |
+| D14 | Release | Private until Phase 2; permissively licensed dependencies only. Reviewed at the end of Phase 2 (2026-11-09): stays private for now | — | Decided | Phase 2 |
 | D15 | Steering wheel and pedals | Later; override is designed around a driver-torque signal now | — | Deferred | Phase 6 |
 | D16 | Coordinate frames and units | ISO 8855 (x forward, y left, z up), SI units; converted once inside each adapter | — | Decided | Phase 0 |
 | D17 | Bus topology | One topology file defines every bus, ECU and route | — | Decided | Phase 1 |

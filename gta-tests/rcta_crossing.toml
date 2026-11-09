@@ -1,0 +1,19 @@
+# Phase 2: RCTA brakes for crossing traffic. The driver reverses at about
+# 5 km/h (1.5 m/s); a car crosses 5 m behind the rear bumper at 15 km/h,
+# from 25 m to the right. The driver doesn't react: RCTA must warn, brake and
+# stop the car.
+name = "RCTA: reversing into crossing traffic"
+steps = [
+  "creep back 1.5 14",
+  "wait reverse 5",
+  "cross right 5 15",
+  "wait event:RCTA braking 10",
+  "wait stopped 5",
+  "drive 0 0 0 0.1",
+  "sleep 2",
+]
+
+[pass]
+max_aeb = 0
+min_rcta = 1
+events = ["RCTA: cross traffic from the right", "RCTA braking"]

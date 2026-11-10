@@ -201,9 +201,17 @@ fn gt_room(s: &telemetry::Step, behind: bool) -> f32 {
 fn listen(live: Arc<Mutex<Live>>) {
     let mut rx = telemetry::Receiver::bind(RUNNER_PORT).unwrap_or_else(|e| panic!("cannot listen for telemetry on UDP {RUNNER_PORT}: {e}"));
     std::thread::spawn(move || {
+        // Game time of the last step seen: distance is speed times the game
+        // time between steps, not an assumed frame rate (issue #25). Steps
+        // lost on the way only lengthen the interval; a pause or a reload
+        // (over 0.5 s, or time going back) adds nothing.
+        let mut last_t: Option<f64> = None;
         loop {
             match rx.try_recv() {
                 Some(Packet::Step(s)) => {
+                    let dt = last_t.map_or(0.0, |t0| s.t - t0);
+                    let dt = if (0.0..=0.5).contains(&dt) { dt as f32 } else { 0.0 };
+                    last_t = Some(s.t);
                     let snap = Snap {
                         speed: s.speed,
                         state: s.state,
@@ -217,7 +225,7 @@ fn listen(live: Arc<Mutex<Live>>) {
                         room: gt_room(&s, s.sample_flags & adapter_api::sample_flags::REVERSE != 0),
                         hud_flags: s.hud_flags,
                         lane_offset: s.lane_offset,
-                        distance: s.speed / 72.0,
+                        distance: s.speed * dt,
                     };
                     live.lock().expect("live").snaps.push(snap);
                 }

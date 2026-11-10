@@ -888,6 +888,23 @@ mod tests {
         assert!(o.class == 3 && (o.x - 22.5).abs() < 0.05 && (o.vy - 1.4).abs() < 0.05);
     }
 
+    /// Issue #22: a city corner (R = 40 m, c2 = 1/(2R)) and a car 60 m to
+    /// the side, which the ±50° / 120 m camera sees, cross the bus unclipped.
+    #[test]
+    fn tight_bends_and_wide_objects_are_not_clipped() {
+        let mut v = Vehicle::new(Delivery::Reactive);
+        let mut c = CameraFrame { frame: 7, ..Default::default() };
+        c.lanes[0] = LaneFit { valid: true, c: [1.8, 0.05, 0.0125, -3.0e-4], range: 40.0, kind: 1, quality: 2 };
+        c.lanes[1] = LaneFit { valid: true, c: [-1.8, 0.05, 0.0125, 0.0], range: 40.0, kind: 1, quality: 2 };
+        c.objects.push(CamObject { id: 4, class: 1, x: 90.0, y: 60.0, vx: -3.0, vy: 0.5, width: 1.9, confidence: 0.8 });
+        let got = v.step_all(0.0, 0, &VehicleSample::default(), &SensorOut { camera: Some(&c), ..Default::default() }).camera.expect("a frame");
+        let l = got.lanes[0];
+        assert!((l.c[2] - 0.0125).abs() < 1e-6 && (l.c[3] + 3.0e-4).abs() < 2e-8, "{l:?}");
+        assert!(l.valid && l.kind == 1 && l.quality == 2 && l.range == 40.0);
+        let o = got.objects[0];
+        assert!((o.y - 60.0).abs() < 0.02 && (o.vx + 3.0).abs() < 0.05 && (o.width - 1.9).abs() < 0.05 && (o.confidence - 0.8).abs() < 0.01, "{o:?}");
+    }
+
     #[test]
     fn gear_and_turn_signal_cross_chassis_can() {
         let mut v = Vehicle::new(Delivery::Reactive);

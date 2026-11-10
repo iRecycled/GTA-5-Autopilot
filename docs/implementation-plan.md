@@ -199,8 +199,10 @@ Goal: the car steers itself within its lane, with a camera ECU that already beha
 - [x] Start the core from the game (F2, or F10 with none running)
 
 **Open issues, found driving in GTA:**
-- [ ] Lane centering loses the road and doesn't get back to the lane centre (seen driving manually, 2026-11-09; recording `recordings/1794280513-autopilot.mcap`). Find whether the lane map, the camera's fit or the controller loses it, and make the car recover onto the lane centre
-- [ ] The learned brake gain ran away to 84.7 in that drive (from 43.3; the profile was reset by hand). Learn only from clean, sustained braking by the core, and bound each change
+- [x] Lane centering loses the road and doesn't get back to the lane centre (seen driving manually, 2026-11-09; recording `recordings/1794280513-autopilot.mcap`). Cause: GTA's steering fades with speed (0.75 of the bicycle model at 35 km/h, 0.15 at 120) and one learned gain served all speeds. Fixed in simulation (steering learned per speed, a curvature loop, a GTA-like car in the simulator); to confirm in GTA
+- [x] The learned brake gain ran away (43 to 85; a 9F to 110) while the driver braked over a small demand. Now learned only with the driver off the pedals and the demand steady, slower, and within 1.3x of a saved profile; to confirm in GTA
+- [x] ACC ignored a car already stopped at a stop sign (never seen moving), and AEB braked for it. The camera now confirms stopped radar targets as vehicles, and ACC stops behind them; to confirm in GTA (`gta-tests/acc_stopped_car.toml`)
+- [ ] Re-record the GTA regression drive: the slower brake-gain learning changes its brake commands slightly (at most 0.005)
 - [ ] An impact at 31 km/h in that drive, just after blind-spot alerts on both sides (frame 70431): find out what hit what
 - [ ] Gate runs: GTA traffic stops the 5-minute Sandy Shores drive at junctions (genuine junction AEB stops, and a side-road truck parked with its nose in the lane). Run the gate on the highway loop it names, or on Sandy Shores once the issues above are fixed; pedestrian AEB 10 of 10 and false AEB per 30 min still to be measured in GTA
 

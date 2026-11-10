@@ -37,6 +37,8 @@ pub enum Reason {
     NoLanes,
     /// The lane ends ahead.
     LaneEnds,
+    /// The car isn't in the lane the camera sees (over a line).
+    NotInLane,
     /// The camera has sent nothing for a while.
     CameraSilent,
     /// The driver monitor: hands off the wheel too long.
@@ -62,6 +64,7 @@ impl Reason {
             Reason::NoMap => "no lane data on this host",
             Reason::NoLanes => "lanes not detected",
             Reason::LaneEnds => "lane ends",
+            Reason::NotInLane => "car not in its lane",
             Reason::CameraSilent => "camera blocked",
             Reason::NoAttention => "hands off the wheel too long",
         }
@@ -86,6 +89,7 @@ impl Reason {
             Reason::NoMap => m::NO_MAP,
             Reason::NoLanes => m::NO_LANES,
             Reason::LaneEnds => m::LANE_ENDS,
+            Reason::NotInLane => m::NOT_IN_LANE,
             Reason::CameraSilent => m::CAMERA_BLOCKED,
             Reason::NoAttention => m::NO_ATTENTION,
         }

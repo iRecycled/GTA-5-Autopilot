@@ -92,6 +92,12 @@ pub struct LaneConfig {
     pub lka_time: f32,
     /// A nudge's lateral acceleration cap (m/s²): firm, not a swerve.
     pub lka_lat_accel: f32,
+    /// The lane centre may move this much between camera frames (m); more,
+    /// and the frame is not trusted (the lane flipped to the next one).
+    pub max_jump: f32,
+    /// The car counts as in its lane until its centre is this far beyond a
+    /// line (m).
+    pub out_margin: f32,
     /// The curvature loop: how fast (1/s) the steering scales toward
     /// driving the curvature asked for, the most it may scale either way, and
     /// the smallest curvature it measures by (1/m).
@@ -113,6 +119,8 @@ impl Default for LaneConfig {
             lka_margin: 0.2,
             lka_time: 2.0,
             lka_lat_accel: 1.5,
+            max_jump: 1.0,
+            out_margin: 0.3,
             curvature_rate: 1.0,
             curvature_scale_max: 4.0,
             curvature_min: 2.5e-4,
@@ -125,6 +133,9 @@ impl Default for LaneConfig {
 pub enum LaneIssue {
     NoLanes,
     LaneEnds,
+    /// The car's centre is outside the lane the camera sees: it isn't in
+    /// that lane, so lane centering must not steer for it.
+    NotInLane,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -281,7 +292,12 @@ impl Lanes {
         let c = self.cfg;
         self.since_driver = if driver_steering { 0.0 } else { self.since_driver + dt };
         if let Some(l) = lines {
-            match LanePath::from_lines(l, self.width) {
+            // A lane centre that jumps between frames isn't the same lane: a
+            // car over a line sees the next lane (a GTA drive followed the
+            // oncoming lane's into a lake). The frame counts as unseen; if
+            // the jump stays, the lane is lost, then taken afresh.
+            let jumped = |p: &LanePath| self.path.is_some_and(|q| (p.c[0] - q.c[0]).abs() > c.max_jump);
+            match LanePath::from_lines(l, self.width).filter(|p| !jumped(p)) {
                 Some(p) => {
                     if p.left.is_some() && p.right.is_some() && (2.5..6.0).contains(&p.width) {
                         self.width += 0.05 * (p.width - self.width);
@@ -306,6 +322,12 @@ impl Lanes {
         out.path = Some(p);
         out.left_seen = p.left.is_some();
         out.right_seen = p.right.is_some();
+        if p.c[0].abs() > 0.5 * p.width + c.out_margin {
+            out.issue = Some(LaneIssue::NotInLane);
+            self.nudge_for = None;
+            self.correction = 0.0;
+            return out;
+        }
         let v = ego.speed;
         let k_max = lateral::max_curvature(&p.c, 0.0, p.range.min((4.0 * v).max(30.0)));
         if k_max > 1e-4 {
@@ -395,6 +417,38 @@ mod tests {
 
     fn ego(speed: f32) -> Ego {
         Ego { speed, ..Default::default() }
+    }
+
+    #[test]
+    fn no_steering_for_a_lane_the_car_is_not_in() {
+        let mut lanes = Lanes::default();
+        // The car across the centre line: its lane's centre is 2.9 m to the
+        // right in a 5 m lane (the GTA drive into the lake, after an AEB stop).
+        let f = frame(Some(line(-0.4, 0.0, 0.0)), Some(line(-5.4, 0.0, 0.0)));
+        let out = lanes.step(0.033, Some(&f), &ego(10.0), 2.7, true, false);
+        assert_eq!(out.issue, Some(LaneIssue::NotInLane));
+        assert!(out.angle.is_none() && out.nudge.is_none());
+        // Back inside it: steers again.
+        let mut lanes = Lanes::default();
+        let f = frame(Some(line(2.0, 0.0, 0.0)), Some(line(-3.0, 0.0, 0.0)));
+        assert!(lanes.step(0.033, Some(&f), &ego(10.0), 2.7, true, false).angle.is_some());
+    }
+
+    #[test]
+    fn a_lane_that_jumps_is_not_followed() {
+        let mut lanes = Lanes::default();
+        let ours = frame(Some(line(2.5, 0.0, 0.0)), Some(line(-2.5, 0.0, 0.0)));
+        lanes.step(0.033, Some(&ours), &ego(10.0), 2.7, true, false);
+        // Next frame the camera's lane is 5 m to the left (the lane beyond
+        // the centre line): not taken; the last lane is held a moment.
+        let next = frame(Some(line(7.5, 0.0, 0.0)), Some(line(2.5, 0.0, 0.0)));
+        let out = lanes.step(0.033, Some(&next), &ego(10.0), 2.7, true, false);
+        assert!(out.path.is_some_and(|p| p.c[0].abs() < 0.1), "{:?}", out.path);
+        // If it stays, the lane is lost: no steering for 0.5 s ...
+        let lost = (0..20).filter(|_| lanes.step(0.033, Some(&next), &ego(10.0), 2.7, true, false).issue == Some(LaneIssue::NoLanes)).count();
+        assert!(lost >= 1, "never lost");
+        // ... then the new lane is taken afresh.
+        assert!(lanes.step(0.033, Some(&next), &ego(10.0), 2.7, true, false).path.is_some_and(|p| (p.c[0] - 5.0).abs() < 0.1));
     }
 
     #[test]

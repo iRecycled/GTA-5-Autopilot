@@ -1,0 +1,35 @@
+# The drive behind recordings/regression/ (replayed by `cargo xtask test`):
+# ACC follows a lead at the 2.0 s gap, the lead brakes hard and ACC stops
+# behind it, then AEB stops for a stopped car from 50 km/h. To re-record:
+# run this test, then copy its recording over the regression file.
+name = "Regression drive: follow, lead brakes, AEB"
+steps = [
+  "engage",
+  "set 50",
+  "gap 2.0",
+  "wait speed>=48 25",
+  "lead 40 43",
+  "sleep 14",
+  "check_gap 4",
+  "lead_brake",
+  "wait stopped 20",
+  "sleep 2",
+  "clear",
+  "cancel",
+  # Back to the start of the taxiway: ACC alone doesn't steer, and our
+  # sensors don't see the airport's fences.
+  "tp airport taxiway",
+  "sleep 2",
+  "engage",
+  "set 50",
+  "wait speed>=48 25",
+  "stopped 25",
+  "wait event:AEB braking 15",
+  "wait stopped 15",
+  "sleep 1",
+]
+
+[pass]
+min_aeb = 1
+max_gap_error_s = 0.3
+stop_gap_min = 1.0

@@ -625,6 +625,7 @@ impl Core {
         let lanes_ok = self.avail.lanes.and(attentive).and(match self.lane_out.issue {
             Some(::features::LaneIssue::NoLanes) => Err(degrade::Reason::NoLanes),
             Some(::features::LaneIssue::LaneEnds) => Err(degrade::Reason::LaneEnds),
+            Some(::features::LaneIssue::NotInLane) => Err(degrade::Reason::NotInLane),
             None => Ok(()),
         });
         let feature_ok = match self.feature {

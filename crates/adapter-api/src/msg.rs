@@ -574,6 +574,7 @@ pub mod hud_message {
     pub const LANE_ENDS: u32 = 15;
     pub const NO_ATTENTION: u32 = 16;
     pub const CAMERA_BLOCKED: u32 = 17;
+    pub const NOT_IN_LANE: u32 = 18;
 
     pub fn text(code: u32) -> &'static str {
         match code {
@@ -594,6 +595,7 @@ pub mod hud_message {
             LANE_ENDS => "lane ends",
             NO_ATTENTION => "hands off the wheel too long",
             CAMERA_BLOCKED => "camera blocked",
+            NOT_IN_LANE => "car not in its lane",
             _ => "",
         }
     }

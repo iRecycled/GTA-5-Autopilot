@@ -73,6 +73,8 @@ stop_gap_max = 15.0
 - `max_lane_rms`, `min_centering`, `max_takeovers`: lane centering's RMS offset from the lane centre while it steers (m), the share of the engaged time it steered, and the number of takeover requests;
 - `min_engaged`: the share of the run, from the first engagement to the end, that the system stayed engaged. A drop-out fails it, such as the adapter releasing a core that stopped answering.
 
+`resume_after_aeb = true` (next to `name`): after an AEB stop, the test's driver waits out the hold, re-engages and restores the set speed, as a real driver would. Long drives in traffic then go on past a genuine AEB event, which is still counted (`max_aeb`) and listed in the log for review.
+
 The core reports the surround features as events: "BSD: vehicle in the left blind spot", "BSD warning: signalling left into an occupied lane", "RCTA: cross traffic from the right", "RCTA braking", "park assist braking".
 
 A failed step fails the test and the runner moves on to the next one. Each run's core log and recording are in `recordings/gta-tests/`; `replay` and `adas-viz --replay` open the recording.

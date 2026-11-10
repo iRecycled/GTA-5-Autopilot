@@ -3,3 +3,7 @@
 
 # Deceleration per unit of brake demand (m/s^2).
 brake_gain = 43.278
+
+# The fixed reference: learning stays within 1.3x of it. Never
+# written by the core except to copy it; set it by hand to re-tune.
+brake_gain_ref = 43.278

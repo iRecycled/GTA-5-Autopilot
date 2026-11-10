@@ -71,7 +71,10 @@ impl FaultRec {
 pub struct Profile {
     /// Brake gain (m/s² per unit of brake demand).
     pub brake_gain: f32,
-    pub _reserved: [f32; 3],
+    /// The fixed reference the learned gain stays within 1.3× of; 0 in
+    /// recordings made before it existed (the gain is the reference then).
+    pub brake_reference: f32,
+    pub _reserved: [f32; 2],
 }
 
 /// The test driver's stick as recorded: throttle, brake, steer.

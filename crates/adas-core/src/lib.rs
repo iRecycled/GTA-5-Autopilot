@@ -479,11 +479,22 @@ impl Core {
     }
 
     /// Starts from a known brake gain (a vehicle profile, D19); the session
-    /// then learns within a band around it.
+    /// then learns within a band around it, or around the profile's fixed
+    /// reference ([`Self::set_brake_reference`]).
     pub fn set_brake_gain(&mut self, g: f32) {
         if g.is_finite() && (3.0..=150.0).contains(&g) {
             self.brake_gain = g;
             self.brake_profile = Some(g);
+        }
+    }
+
+    /// Centres the learning band on a fixed reference (the profile's
+    /// `brake_gain_ref`), not on the last saved gain. Otherwise each save
+    /// moves the band, and the gain can creep 1.3× a session (issue #21).
+    pub fn set_brake_reference(&mut self, r: f32) {
+        if r.is_finite() && (3.0..=150.0).contains(&r) {
+            self.brake_profile = Some(r);
+            self.brake_gain = self.brake_gain.clamp(r / GAIN_PROFILE_BAND, r * GAIN_PROFILE_BAND);
         }
     }
 
@@ -1321,6 +1332,32 @@ mod tests {
             g = learn_brake_gain(g, brake(1.0, -9.0), None, 1.0 / 72.0);
         }
         assert!((g - 40.0).abs() < 1.0, "full braking taught {g}");
+    }
+
+    /// Issue #21: sessions that each push the gain to the edge of the band
+    /// don't walk it away from the reference.
+    #[test]
+    fn the_brake_band_stays_on_the_reference_across_sessions() {
+        let reference = 43.0;
+        let mut saved = reference;
+        for _ in 0..4 {
+            let mut core = Core::new(Feature::Acc(Default::default()), false);
+            core.set_brake_gain(saved);
+            core.set_brake_reference(reference);
+            // A session the guards miss: it reads as twice the gain.
+            let mut g = core.brake_gain();
+            for _ in 0..5000 {
+                g = learn_brake_gain(g, brake(0.05, -0.05 * 2.0 * g), core.brake_profile, 1.0 / 72.0);
+            }
+            assert!(g > saved - 0.01, "the session didn't learn upward");
+            saved = g;
+        }
+        assert!(saved <= reference * GAIN_PROFILE_BAND + 0.01, "crept to {saved} from {reference}");
+        // A profile already past the band is pulled back into it on load.
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        core.set_brake_gain(85.0);
+        core.set_brake_reference(reference);
+        assert!((core.brake_gain() - reference * GAIN_PROFILE_BAND).abs() < 0.01);
     }
 
     #[test]

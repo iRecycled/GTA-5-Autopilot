@@ -120,16 +120,16 @@ fn profile_path(host: &str, vehicle: &str) -> PathBuf {
     PathBuf::from("config").join("vehicles").join(slug(host)).join(format!("{}.toml", slug(vehicle)))
 }
 
-/// Reads `brake_gain = <x>` from a profile file.
-fn load_brake_gain(path: &std::path::Path) -> Option<f32> {
+/// Reads `<key> = <x>` from a profile file.
+fn load_profile_value(path: &std::path::Path, key: &str) -> Option<f32> {
     let text = std::fs::read_to_string(path).ok()?;
     text.lines().find_map(|l| {
         let (k, v) = l.split_once('=')?;
-        (k.trim() == "brake_gain").then(|| v.trim().parse().ok()).flatten()
+        (k.trim() == key).then(|| v.trim().parse().ok()).flatten()
     })
 }
 
-fn save_profile(path: &std::path::Path, host: &str, vehicle: &str, brake_gain: f32) -> std::io::Result<()> {
+fn save_profile(path: &std::path::Path, host: &str, vehicle: &str, brake_gain: f32, brake_ref: f32) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -138,8 +138,11 @@ fn save_profile(path: &std::path::Path, host: &str, vehicle: &str, brake_gain: f
         format!(
             "# Vehicle profile (D19) for {vehicle} on {host}.\n\
              # Learned on line by adas-core; edit by hand only with the core stopped.\n\n\
-             # Deceleration per unit of brake demand (m/s^2).\n\
-             brake_gain = {brake_gain:.3}\n"
+             # Deceleration per unit of brake demand (m/s^2), as learned.\n\
+             brake_gain = {brake_gain:.3}\n\n\
+             # The fixed reference: learning stays within 1.3x of it. Never\n\
+             # written by the core except to copy it; set it by hand to re-tune.\n\
+             brake_gain_ref = {brake_ref:.3}\n"
         ),
     )
 }
@@ -339,8 +342,9 @@ fn main() {
     let mut fans_sent = adapter_api::FanLayout::default();
     // A fresh core: no fans until it asks (an old layout may be in the link).
     link.fans.write(&fans_sent);
-    // The vehicle profile in use: (path, host, vehicle, saved brake gain).
-    let mut profile: Option<(PathBuf, String, String, f32)> = None;
+    // The vehicle profile in use: (path, host, vehicle, saved brake gain,
+    // the fixed reference the learning band is centred on).
+    let mut profile: Option<(PathBuf, String, String, f32, f32)> = None;
     let mut last_profile_check = 0u64;
 
     // Recording: the whole core run, from its first sample, so a replay can
@@ -459,16 +463,21 @@ fn main() {
             last_hello = 0;
             if profile.as_ref().is_none_or(|p| p.1 != host || p.2 != vehicle) {
                 let path = profile_path(&host, &vehicle);
-                match load_brake_gain(&path) {
+                match load_profile_value(&path, "brake_gain") {
                     Some(g) => {
+                        // A profile from before the reference: its gain becomes it.
+                        let r = load_profile_value(&path, "brake_gain_ref").unwrap_or(g);
                         core.set_brake_gain(g);
-                        post(Job::Profile(Profile { brake_gain: g, ..Default::default() }, wall_time_ns()));
-                        println!("profile {}: brake gain {g:.2}", path.display());
+                        core.set_brake_reference(r);
+                        post(Job::Profile(Profile { brake_gain: g, brake_reference: r, ..Default::default() }, wall_time_ns()));
+                        println!("profile {}: brake gain {g:.2} (reference {r:.2})", path.display());
                     }
                     None => println!("no profile at {} yet; learning", path.display()),
                 }
                 let g = core.brake_gain();
-                profile = Some((path, host, vehicle, g));
+                // With no profile, the first saved gain becomes the reference.
+                let r = load_profile_value(&path, "brake_gain_ref").unwrap_or(g);
+                profile = Some((path, host, vehicle, g, r));
             }
         }
 
@@ -602,10 +611,10 @@ fn main() {
         // Save the profile when the learned brake gain has drifted (every 10 s at most).
         if save_profiles && t1.saturating_sub(last_profile_check) > 10_000_000_000 {
             last_profile_check = t1;
-            if let Some((path, host, vehicle, saved)) = profile.as_mut() {
+            if let Some((path, host, vehicle, saved, reference)) = profile.as_mut() {
                 let g = core.brake_gain();
                 if (g - *saved).abs() > 0.03 * saved.abs().max(1.0) {
-                    match save_profile(path, host, vehicle, g) {
+                    match save_profile(path, host, vehicle, g, *reference) {
                         Ok(()) => {
                             println!("profile {}: brake gain {g:.2} saved", path.display());
                             *saved = g;

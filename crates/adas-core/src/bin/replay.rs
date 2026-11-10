@@ -89,6 +89,9 @@ fn replay(path: &Path, csv: Option<&PathBuf>, candump: Option<&PathBuf>, out_t: 
         }
         if let Some(p) = &f.profile {
             core.set_brake_gain(p.brake_gain);
+            if p.brake_reference > 0.0 {
+                core.set_brake_reference(p.brake_reference);
+            }
         }
         for fault in &f.faults {
             telem::apply_fault(&mut core, fault).map_err(|e| format!("{}: step {i}: {e}", path.display()))?;

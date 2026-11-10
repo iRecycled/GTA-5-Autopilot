@@ -1,0 +1,19 @@
+# The optional driver monitor (D11): with it on, the autopilot asks for
+# hands on the wheel after 15 s without steering input and for a takeover
+# after 25 s; the driver here never touches the wheel, so it ends in the
+# controlled stop.
+name = "Driver monitor: hands off too long"
+feature = "autopilot"
+duration = 45.0
+enabled = ["driver_monitor"]
+
+[ego]
+speed_kph = 100
+engage_at = 0.5
+set_kph = 100
+
+[pass]
+min_takeovers = 1
+max_takeovers = 1
+max_departures = 0
+end_speed_below = 0.5

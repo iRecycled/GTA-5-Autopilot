@@ -1,0 +1,21 @@
+# A tight bend (R = 150 m) at a 90 km/h set speed: the curve speed slows ACC
+# (2 m/s^2 of lateral acceleration is about 62 km/h), and lane centering stays
+# in the lane within ISO 11270's lateral acceleration.
+name = "Lane centering: a tight bend"
+feature = "autopilot"
+duration = 45.0
+
+[road]
+pieces = [[400, 0], [250, 150], [400, 0]]
+
+[ego]
+speed_kph = 90
+engage_at = 0.5
+set_kph = 90
+
+[pass]
+max_departures = 0
+max_lane_error = 0.6
+max_lat_accel = 3.5
+max_takeovers = 0
+max_aeb = 0

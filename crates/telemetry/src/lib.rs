@@ -88,6 +88,8 @@ pub mod track_flags {
     pub const BLIND_SPOT: u8 = 16;
     /// Crossing behind the car (RCTA).
     pub const CROSSING: u8 = 32;
+    /// A pedestrian (camera).
+    pub const PEDESTRIAN: u8 = 64;
 }
 
 /// Ground truth from the host, for the bird's-eye view only.
@@ -168,6 +170,18 @@ pub struct Step {
     pub rcta_activations: u32,
     pub park_activations: u32,
     pub corner_latency_frames: u32,
+    // Phase 3 (appended).
+    /// The camera's left and right lane lines: c0..c3 and the range seen
+    /// (range 0 = no line).
+    pub lane_left: [f32; 5],
+    pub lane_right: [f32; 5],
+    /// The car's offset from the lane centre the camera sees (m, left +;
+    /// NaN = no lane) and lane centering's road-wheel angle request (rad).
+    pub lane_offset: f32,
+    pub lane_angle: f32,
+    pub lka_nudges: u32,
+    /// Pedestrian tracks are in `tracks` with `track_flags::PEDESTRIAN`.
+    pub _reserved: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -440,6 +454,12 @@ fn encode_step(w: &mut W, s: &Step) {
     w.u32(s.rcta_activations);
     w.u32(s.park_activations);
     w.u32(s.corner_latency_frames);
+    for v in s.lane_left.iter().chain(&s.lane_right) {
+        w.f32(*v);
+    }
+    w.f32(s.lane_offset);
+    w.f32(s.lane_angle);
+    w.u32(s.lka_nudges);
 }
 
 fn decode_step(r: &mut R) -> Option<Step> {
@@ -510,6 +530,17 @@ fn decode_step(r: &mut R) -> Option<Step> {
         s.rcta_activations = r.u32()?;
         s.park_activations = r.u32()?;
         s.corner_latency_frames = r.u32()?;
+    }
+    s.lane_offset = f32::NAN;
+    s.lane_angle = f32::NAN;
+    // Phase 3 fields, if present.
+    if r.i < r.b.len() {
+        for v in s.lane_left.iter_mut().chain(s.lane_right.iter_mut()) {
+            *v = r.f32()?;
+        }
+        s.lane_offset = r.f32()?;
+        s.lane_angle = r.f32()?;
+        s.lka_nudges = r.u32()?;
     }
     Some(s)
 }
@@ -660,7 +691,7 @@ mod tests {
         let Some(Packet::Step(back)) = Packet::decode(&b) else { panic!("decodes") };
         assert_eq!((back.surround_flags, back.park[3], back.park_activations, back.ego_rear), (0b101, 0.85, 2, -2.35));
         // A Phase 1 step: everything up to `ego_front`.
-        let old = &b[..b.len() - (4 * 3 + 4 + 48 + 4 + 12)];
+        let old = &b[..b.len() - (4 * 3 + 4 + 48 + 4 + 12) - (40 + 8 + 4)];
         let Some(Packet::Step(back)) = Packet::decode(old) else { panic!("an older step decodes") };
         assert_eq!(back.surround_flags, 0);
         assert!(back.park.iter().all(|d| d.is_nan()));

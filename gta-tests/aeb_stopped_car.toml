@@ -1,10 +1,13 @@
 # AEB on a stopped car from 50 km/h (the Phase 1 gate's 10/10 test, once).
+# The car appears 25 m ahead: too close for ACC's comfortable braking
+# (about 28 m from 50 km/h), so AEB must act. Further out, ACC now stops
+# for it by itself (acc_stopped_car.toml).
 name = "AEB: stopped car from 50 km/h"
 steps = [
   "engage",
   "set 50",
   "wait speed>=48 25",
-  "stopped 70",
+  "stopped 25",
   "wait event:AEB braking 15",
   "wait stopped 15",
   "sleep 1",
@@ -12,5 +15,5 @@ steps = [
 
 [pass]
 min_aeb = 1
-stop_gap_min = 2.0
+stop_gap_min = 1.0
 stop_gap_max = 15.0

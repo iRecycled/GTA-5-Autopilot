@@ -126,32 +126,75 @@ impl Powertrain {
 pub struct Eps {
     angle: f32,
     engaged: bool,
+    pub limits: EpsLimits,
 }
 
-/// Road-wheel angle limits: range (rad) and rate (rad/s).
+/// The wide road-wheel limits of Phases 0 to 2 (the test driver keeps them):
+/// range (rad) and rate (rad/s).
 pub const EPS_MAX_ANGLE: f32 = 0.6;
 pub const EPS_MAX_RATE: f32 = 0.8;
+
+/// What the EPS accepts from `STEERING_LTA`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EpsLimits {
+    /// Any angle within ±0.6 rad at 0.8 rad/s (development: the test driver).
+    Wide,
+    /// A TSS2 car's LTA limits (opendbc `toyota/values.py`, `ANGLE_LIMITS`):
+    /// the steering wheel within ±94.9°; turning further at 30 °/s at 5 m/s
+    /// falling to 15 °/s at 25 m/s, turning back at 36 to 26 °/s.
+    Tss2,
+}
+
+impl Default for EpsLimits {
+    fn default() -> Self {
+        EpsLimits::Wide
+    }
+}
+
+impl EpsLimits {
+    /// (range, rate further from centre, rate back toward it), road wheel
+    /// (rad, rad/s), at `speed` (m/s).
+    pub fn at(self, speed: f32) -> (f32, f32, f32) {
+        match self {
+            EpsLimits::Wide => (EPS_MAX_ANGLE, EPS_MAX_RATE, EPS_MAX_RATE),
+            EpsLimits::Tss2 => {
+                let f = ((speed - 5.0) / 20.0).clamp(0.0, 1.0);
+                let sw = |a: f32, b: f32| (a + (b - a) * f).to_radians() / STEERING_RATIO;
+                (94.9f32.to_radians() / STEERING_RATIO, sw(30.0, 15.0), sw(36.0, 26.0))
+            }
+        }
+    }
+}
 
 impl Eps {
     pub fn new() -> Self {
         Self::default()
     }
 
+    pub fn with_limits(limits: EpsLimits) -> Self {
+        Self { limits, ..Self::default() }
+    }
+
     /// The road-wheel angle to apply, or `None` when steering isn't
     /// requested. `measured`: the current road-wheel angle (rad), to start
     /// from when engaging, so engaging doesn't jerk the wheel.
-    pub fn step(&mut self, r: &SteerRequest, measured: f32, dt: f32) -> Option<f32> {
+    /// `speed`: the car's speed (m/s), for speed-dependent limits.
+    pub fn step(&mut self, r: &SteerRequest, measured: f32, dt: f32, speed: f32) -> Option<f32> {
         if !r.request {
             self.engaged = false;
             return None;
         }
+        let (max, rate_out, rate_in) = self.limits.at(speed);
         if !self.engaged {
             self.engaged = true;
-            self.angle = if measured.is_finite() { measured.clamp(-EPS_MAX_ANGLE, EPS_MAX_ANGLE) } else { 0.0 };
+            self.angle = if measured.is_finite() { measured.clamp(-max, max) } else { 0.0 };
         }
-        let want = (r.sw_deg.to_radians() / STEERING_RATIO).clamp(-EPS_MAX_ANGLE, EPS_MAX_ANGLE);
-        let step = EPS_MAX_RATE * dt.max(0.0);
-        self.angle += (want - self.angle).clamp(-step, step);
+        let want = (r.sw_deg.to_radians() / STEERING_RATIO).clamp(-max, max);
+        let d = want - self.angle;
+        // Turning away from centre is slower than turning back.
+        let rate = if d * self.angle > 0.0 || self.angle == 0.0 { rate_out } else { rate_in };
+        let step = rate * dt.max(0.0);
+        self.angle += d.clamp(-step, step);
         Some(self.angle)
     }
 }
@@ -198,16 +241,38 @@ mod tests {
     fn eps_limits_rate_and_range() {
         let mut e = Eps::new();
         let req = |sw_deg| SteerRequest { request: true, sw_deg };
-        assert_eq!(e.step(&SteerRequest { request: false, sw_deg: 100.0 }, 0.0, 0.1), None);
+        assert_eq!(e.step(&SteerRequest { request: false, sw_deg: 100.0 }, 0.0, 0.1, 10.0), None);
         // A big step request: the road wheels move at most 0.8 rad/s.
-        let a = e.step(&req(500.0), 0.0, 0.1).unwrap();
+        let a = e.step(&req(500.0), 0.0, 0.1, 10.0).unwrap();
         assert!((a - 0.08).abs() < 1e-5, "{a}");
         for _ in 0..50 {
-            e.step(&req(2000.0), 0.0, 0.1);
+            e.step(&req(2000.0), 0.0, 0.1, 10.0);
         }
-        assert!((e.step(&req(2000.0), 0.0, 0.1).unwrap() - EPS_MAX_ANGLE).abs() < 1e-6);
+        assert!((e.step(&req(2000.0), 0.0, 0.1, 10.0).unwrap() - EPS_MAX_ANGLE).abs() < 1e-6);
         // Engaging starts from the measured angle (no jump).
         let mut e = Eps::new();
-        assert!((e.step(&req(0.0), 0.2, 0.0).unwrap() - 0.2).abs() < 1e-6);
+        assert!((e.step(&req(0.0), 0.2, 0.0, 10.0).unwrap() - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tss2_limits_follow_speed() {
+        let mut e = Eps::with_limits(EpsLimits::Tss2);
+        let req = |sw_deg| SteerRequest { request: true, sw_deg };
+        // At 25 m/s the wheel turns at 15 °/s: 1.5° in 0.1 s.
+        let a = e.step(&req(90.0), 0.0, 0.1, 25.0).unwrap();
+        assert!(((a * STEERING_RATIO).to_degrees() - 1.5).abs() < 1e-3, "{}", (a * STEERING_RATIO).to_degrees());
+        // At 5 m/s, 30 °/s.
+        let mut e = Eps::with_limits(EpsLimits::Tss2);
+        let a = e.step(&req(90.0), 0.0, 0.1, 5.0).unwrap();
+        assert!(((a * STEERING_RATIO).to_degrees() - 3.0).abs() < 1e-3);
+        // Never past 94.9° at the wheel.
+        for _ in 0..100 {
+            e.step(&req(500.0), 0.0, 0.1, 5.0);
+        }
+        let a = e.step(&req(500.0), 0.0, 0.1, 5.0).unwrap();
+        assert!(((a * STEERING_RATIO).to_degrees() - 94.9).abs() < 1e-3);
+        // Back toward centre faster: 36 °/s at 5 m/s.
+        let b = e.step(&req(0.0), 0.0, 0.1, 5.0).unwrap();
+        assert!((((a - b) * STEERING_RATIO).to_degrees() - 3.6).abs() < 1e-3);
     }
 }

@@ -1,0 +1,35 @@
+# Junction AEB must not brake for traffic that isn't in the way: a car that
+# crosses 40 m ahead and clears long before the car gets there, a car
+# waiting at the line of a side road on the right, and one driving away
+# from the road on the left.
+name = "Junction AEB: no braking for traffic that clears, waits or leaves"
+feature = "none"
+duration = 10.0
+
+[ego]
+speed_kph = 50
+
+[[actor]]
+s = 40
+d = 12
+heading = -90
+speed_kph = 50
+
+[[actor]]
+s = 30
+d = -7
+heading = 90
+speed_kph = 0
+
+[[actor]]
+s = 22
+d = 6
+heading = 90
+speed_kph = 20
+
+[repeat]
+count = 5
+vary_s = 4
+
+[pass]
+max_aeb = 0

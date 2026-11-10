@@ -76,3 +76,9 @@ pub const PLAY_SOUND_FRONTEND: u64 = 0x67C540AA08E4A6F5;
 // Phase 2: surround tests and the driver's own controls in reverse.
 pub const FREEZE_ENTITY_POSITION: u64 = 0x428CA6DBD1094446;
 pub const DISABLE_CONTROL_ACTION: u64 = 0xFE99B66D079CF6BC;
+
+// Phase 3: the road graph, world-space lines for the HUD, pedestrians.
+pub const GET_CLOSEST_ROAD: u64 = 0x132F52BBA570FE92;
+pub const DRAW_LINE: u64 = 0x6B7256074AE34680;
+pub const CREATE_PED: u64 = 0xD49F9B0955C367DE;
+pub const TASK_GO_STRAIGHT_TO_COORD: u64 = 0xD76B57B44F1E6F8B;

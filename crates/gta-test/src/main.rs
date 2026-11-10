@@ -53,8 +53,20 @@ struct Test {
     #[serde(default = "default_spot")]
     spot: String,
     steps: Vec<String>,
+    /// The core's feature: "acc" (the default) or "autopilot".
+    #[serde(default = "default_feature")]
+    feature: String,
     #[serde(default)]
     pass: Pass,
+    /// The driver re-engages after an AEB stop, as a real one would once the
+    /// hold ends: long drives in traffic go on past a genuine AEB event (each
+    /// one is still counted and listed, to be reviewed).
+    #[serde(default)]
+    resume_after_aeb: bool,
+}
+
+fn default_feature() -> String {
+    "acc".into()
 }
 
 fn default_spot() -> String {
@@ -91,6 +103,16 @@ struct Pass {
     /// Ground truth at the end: room (m) from the bumper in the direction of
     /// travel to the nearest actor in the car's path.
     min_room: Option<f32>,
+    /// Lane centering: RMS of the offset from the lane centre the camera
+    /// sees while it steers (m), the share of the run it steered after
+    /// engaging, and takeover requests.
+    max_lane_rms: Option<f32>,
+    min_centering: Option<f32>,
+    max_takeovers: Option<u32>,
+    /// The share of the run from the first engagement to the end that the
+    /// system stayed engaged: a drop-out (the adapter releasing a stalled
+    /// core, an unasked disengagement) fails the run.
+    min_engaged: Option<f32>,
 }
 
 impl Default for Pass {
@@ -110,6 +132,10 @@ impl Default for Pass {
             min_park: None,
             max_park: None,
             min_room: None,
+            max_lane_rms: None,
+            min_centering: None,
+            max_takeovers: None,
+            min_engaged: None,
         }
     }
 }
@@ -128,6 +154,9 @@ struct Snap {
     reverse: bool,
     /// Ground truth: room behind (reversing) or ahead to the nearest actor in the path.
     room: f32,
+    hud_flags: u32,
+    lane_offset: f32,
+    distance: f32,
 }
 
 #[derive(Default)]
@@ -172,9 +201,17 @@ fn gt_room(s: &telemetry::Step, behind: bool) -> f32 {
 fn listen(live: Arc<Mutex<Live>>) {
     let mut rx = telemetry::Receiver::bind(RUNNER_PORT).unwrap_or_else(|e| panic!("cannot listen for telemetry on UDP {RUNNER_PORT}: {e}"));
     std::thread::spawn(move || {
+        // Game time of the last step seen: distance is speed times the game
+        // time between steps, not an assumed frame rate (issue #25). Steps
+        // lost on the way only lengthen the interval; a pause or a reload
+        // (over 0.5 s, or time going back) adds nothing.
+        let mut last_t: Option<f64> = None;
         loop {
             match rx.try_recv() {
                 Some(Packet::Step(s)) => {
+                    let dt = last_t.map_or(0.0, |t0| s.t - t0);
+                    let dt = if (0.0..=0.5).contains(&dt) { dt as f32 } else { 0.0 };
+                    last_t = Some(s.t);
                     let snap = Snap {
                         speed: s.speed,
                         state: s.state,
@@ -186,6 +223,9 @@ fn listen(live: Arc<Mutex<Live>>) {
                         park: s.park_activations,
                         reverse: s.sample_flags & adapter_api::sample_flags::REVERSE != 0,
                         room: gt_room(&s, s.sample_flags & adapter_api::sample_flags::REVERSE != 0),
+                        hud_flags: s.hud_flags,
+                        lane_offset: s.lane_offset,
+                        distance: s.speed * dt,
                     };
                     live.lock().expect("live").snaps.push(snap);
                 }
@@ -265,11 +305,51 @@ struct Run<'a> {
     game: &'a Game,
     live: Arc<Mutex<Live>>,
     gap_error: f32,
+    resume_after_aeb: bool,
+    /// AEB activations already resumed from, and since when the car has
+    /// been stopped and disengaged after the latest.
+    resumed_aeb: u32,
+    stopped_since: Option<Instant>,
+    /// The set speed while last engaged (km/h), restored on resuming.
+    last_set_kph: f32,
 }
+
+/// After an AEB stop, the driver waits this long (the AEB hold is 3 s), then
+/// re-engages.
+const RESUME_AFTER: Duration = Duration::from_secs(4);
 
 impl Run<'_> {
     fn last(&self) -> Option<Snap> {
         self.live.lock().expect("live").last()
+    }
+
+    /// The driver re-engages once the car has stood, disengaged, for
+    /// [`RESUME_AFTER`] after an AEB activation.
+    fn maybe_resume(&mut self) -> Result<(), String> {
+        let Some(s) = self.last() else { return Ok(()) };
+        if s.state != 0 && s.set_speed.is_finite() && s.set_speed > 0.0 {
+            self.last_set_kph = (s.set_speed * 3.6).round();
+        }
+        if s.aeb <= self.resumed_aeb || s.state != 0 || s.speed > 0.3 {
+            if s.state != 0 {
+                self.stopped_since = None;
+            }
+            return Ok(());
+        }
+        let since = *self.stopped_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= RESUME_AFTER {
+            self.game.cmd("engage")?;
+            self.resumed_aeb = s.aeb;
+            self.stopped_since = None;
+            self.wait_for("engaged", Duration::from_secs(5), |l| l.last().is_some_and(|s| s.state != 0))?;
+            if self.last_set_kph > 0.0 {
+                self.step(&format!("set {}", self.last_set_kph))?;
+            }
+            let text = format!("driver re-engaged after AEB activation {} (set {} km/h)", s.aeb, self.last_set_kph);
+            println!("    {text}");
+            self.live.lock().expect("live").events.push(text);
+        }
+        Ok(())
     }
 
     fn wait_for(&self, what: &str, timeout: Duration, mut ok: impl FnMut(&Live) -> bool) -> Result<(), String> {
@@ -287,10 +367,10 @@ impl Run<'_> {
         let w: Vec<&str> = line.split_whitespace().collect();
         let num = |i: usize| -> Result<f32, String> { w.get(i).and_then(|v| v.parse().ok()).ok_or(format!("{line}: expected a number at {i}")) };
         match w.first().copied().unwrap_or("") {
-            "engage" | "cancel" | "lead_brake" | "clear" | "stopped" | "drive" | "car" | "tp" | "signal" | "obstacle" | "creep" => self.game.cmd(line).map(|_| ()),
+            "engage" | "cancel" | "lead_brake" | "clear" | "stopped" | "drive" | "car" | "tp" | "signal" | "obstacle" | "creep" | "ai" | "walker" | "walk" => self.game.cmd(line).map(|_| ()),
             "lead" => self.game.cmd(&format!("lead {} {}", num(1)?, num(2)? / 3.6)).map(|_| ()),
-            // `overtake|cross SIDE DIST KPH`: the adapter takes m/s.
-            "overtake" | "cross" => {
+            // `overtake|cross|pullout SIDE DIST KPH`: the adapter takes m/s.
+            "overtake" | "cross" | "pullout" => {
                 let side = w.get(1).copied().unwrap_or("");
                 self.game.cmd(&format!("{} {side} {} {}", w[0], num(2)?, num(3)? / 3.6)).map(|_| ())
             }
@@ -318,7 +398,13 @@ impl Run<'_> {
                 Err(format!("time gap never reached {want} s"))
             }
             "sleep" => {
-                std::thread::sleep(Duration::from_secs_f32(num(1)?));
+                let until = Instant::now() + Duration::from_secs_f32(num(1)?);
+                while Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if self.resume_after_aeb {
+                        self.maybe_resume()?;
+                    }
+                }
                 Ok(())
             }
             "fault" => {
@@ -395,7 +481,7 @@ struct Row {
     summary: String,
 }
 
-fn start_core(stem: &str) -> Result<Child, String> {
+fn start_core(stem: &str, feature: &str) -> Result<Child, String> {
     let root = root();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("adas-core.exe");
     let dir = root.join("recordings").join("gta-tests");
@@ -403,7 +489,7 @@ fn start_core(stem: &str) -> Result<Child, String> {
     let log = std::fs::File::create(dir.join(format!("{stem}.log"))).map_err(|e| e.to_string())?;
     Command::new(&exe)
         .current_dir(&root)
-        .args(["--feature", "acc", "--no-profile-save", "--record", &dir.display().to_string(), "--telemetry", &format!("47300,47302,{RUNNER_PORT}")])
+        .args(["--feature", feature, "--no-profile-save", "--record", &dir.display().to_string(), "--telemetry", &format!("47300,47302,{RUNNER_PORT}")])
         .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(log))
         .spawn()
@@ -431,14 +517,14 @@ fn run_test(game: &Game, live: &Arc<Mutex<Live>>, t: &Test, car: &str) -> Row {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let slug: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
     let stem = format!("{secs}-{car}-{}", slug.trim_matches('-'));
-    let mut core = match start_core(&stem) {
+    let mut core = match start_core(&stem, &t.feature) {
         Ok(c) => c,
         Err(e) => {
             row.failures.push(format!("core: {e}"));
             return row;
         }
     };
-    let mut run = Run { game, live: live.clone(), gap_error: 0.0 };
+    let mut run = Run { game, live: live.clone(), gap_error: 0.0, resume_after_aeb: t.resume_after_aeb, resumed_aeb: 0, stopped_since: None, last_set_kph: 0.0 };
     // The core is up once its telemetry arrives.
     let mut result = run.wait_for("the core's telemetry", Duration::from_secs(15), |l| l.snaps.len() > 72);
     if result.is_ok() {
@@ -518,7 +604,41 @@ fn run_test(game: &Game, live: &Arc<Mutex<Live>>, t: &Test, car: &str) -> Row {
     {
         fail(format!("ended {room:.2} m from the obstacle (want ≥ {r})"));
     }
+    // Lane centering, from the steps it steered.
+    use adapter_api::hud_flags as hf;
+    let engaged: Vec<&Snap> = l.snaps.iter().filter(|s| s.state != 0).collect();
+    let centering: Vec<&Snap> = engaged.iter().copied().filter(|s| s.hud_flags & hf::LANE_CENTERING != 0 && s.lane_offset.is_finite()).collect();
+    let lane_rms = if centering.is_empty() { f32::NAN } else { (centering.iter().map(|s| s.lane_offset * s.lane_offset).sum::<f32>() / centering.len() as f32).sqrt() };
+    let share = if engaged.is_empty() { 0.0 } else { centering.len() as f32 / engaged.len() as f32 };
+    let takeovers = l.snaps.windows(2).filter(|w| w[1].hud_flags & hf::TAKEOVER != 0 && w[0].hud_flags & hf::TAKEOVER == 0).count() as u32;
+    let km = l.snaps.iter().map(|s| s.distance).sum::<f32>() / 1000.0;
+    let since_engaged = l.snaps.iter().position(|s| s.state != 0).map_or(&l.snaps[..0], |i| &l.snaps[i..]);
+    let engaged_share = if since_engaged.is_empty() { 0.0 } else { since_engaged.iter().filter(|s| s.state != 0).count() as f32 / since_engaged.len() as f32 };
+    let dropouts = l.snaps.windows(2).filter(|w| w[0].state != 0 && w[1].state == 0).count();
+    if let Some(m) = p.min_engaged
+        && engaged_share < m
+    {
+        fail(format!("engaged {:.0} % of the run after engaging, {dropouts} drop-outs (want ≥ {:.0} %)", 100.0 * engaged_share, 100.0 * m));
+    }
+    if let Some(m) = p.max_lane_rms
+        && !(lane_rms <= m)
+    {
+        fail(format!("lane-centre offset {lane_rms:.2} m RMS (want ≤ {m})"));
+    }
+    if let Some(m) = p.min_centering
+        && share < m
+    {
+        fail(format!("lane centering steered {:.0} % of the engaged time (want ≥ {:.0} %)", 100.0 * share, 100.0 * m));
+    }
+    if let Some(m) = p.max_takeovers
+        && takeovers > m
+    {
+        fail(format!("{takeovers} takeover requests (want ≤ {m})"));
+    }
     let mut summary = format!("AEB {aeb}");
+    if p.max_lane_rms.is_some() || p.min_centering.is_some() {
+        summary += &format!(", lane RMS {lane_rms:.2} m, centering {:.0} %, takeovers {takeovers}, engaged {:.0} %, {km:.2} km", 100.0 * share, 100.0 * engaged_share);
+    }
     if rcta + park > 0 || p.min_room.is_some() {
         summary += &format!(", RCTA {rcta}, park {park}, room {room:.2} m");
     }

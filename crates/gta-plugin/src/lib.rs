@@ -9,7 +9,7 @@
 //! - on release, steering stops at once, throttle is dropped and any brake
 //!   fades out over about a second; TAKE OVER shows on the HUD.
 //!
-//! Driver keys: F10 engage / cancel ACC · F3 cancel · Page Up / Page Down set speed ±5 km/h
+//! Driver keys: F10 engage / cancel (starts the core if none runs) · F2 start the core · F3 cancel · Page Up / Page Down set speed ±5 km/h
 //! · End cycle the time gap (Home opens the Rockstar overlay) · `,` / `.` turn
 //! signal left / right (press again to cancel). AEB, BSD, RCTA and park assist
 //! are always armed.
@@ -29,9 +29,11 @@ mod actuate;
 mod fans;
 mod hud;
 mod input;
+mod lanes;
 mod n;
 mod remote;
 mod tools;
+mod launch;
 mod win;
 
 use core::ffi::{CStr, c_void};
@@ -57,6 +59,7 @@ const VK_F7: i32 = 0x76;
 const VK_F8: i32 = 0x77;
 const VK_F9: i32 = 0x78;
 const VK_F10: i32 = 0x79;
+const VK_F2: i32 = 0x71;
 const VK_F3: i32 = 0x72;
 const VK_F4: i32 = 0x73;
 const VK_F5: i32 = 0x74;
@@ -209,6 +212,7 @@ fn run() {
     let mut reverse = false;
     let mut reverse_for = 0i32;
     let mut hud_sounds = hud::Sounds::default();
+    let mut lanes_sys = lanes::Lanes::new();
     // A test's creeping driver: (backwards, speed m/s, until).
     let mut creep: Option<(bool, f32, u64)> = None;
     // Test commands over UDP (`remote`): scripted driver inputs until a time.
@@ -259,6 +263,12 @@ fn run() {
     let mut win_steer_ns = 0u64;
     let mut win_steer_n = 0u64;
     let mut hud2 = String::new();
+    // Starting the core from the game (F2, or F10 with none running).
+    let game_dir = dir.parent().map(PathBuf::from).unwrap_or_default();
+    let mut launcher = launch::Launcher::default();
+    // F10 started a core: engage once it answers, if it does by then.
+    let mut pending_engage_until = 0u64;
+    let mut notice: Option<(String, (i32, i32, i32), u64)> = None;
 
     loop {
         if cap60 {
@@ -319,7 +329,23 @@ fn run() {
             tools::ai_drive(ped, veh, ai);
             let _ = writeln!(log, "frame {frame}: GTA AI drive {}", if ai { "ON" } else { "OFF" });
         }
-        if keys.pressed(4, VK_F10) && in_vehicle {
+        let core_up = {
+            let pid = link.core_pid.load(Ordering::Acquire);
+            pid != 0 && !watch.exited(pid)
+        };
+        let f2 = keys.pressed(14, VK_F2);
+        let f10 = keys.pressed(4, VK_F10) && in_vehicle;
+        if f2 || f10 && !core_up && !engage_req {
+            let started = if core_up && !launcher.running() { Err("a core is already running".to_string()) } else { launcher.start(&game_dir) };
+            let _ = writeln!(log, "frame {frame}: start core: {started:?}");
+            notice = Some(match &started {
+                Ok(_) => ("STARTING THE AUTOPILOT CORE".into(), (120, 200, 255), wall_time_ns() + 4_000_000_000),
+                Err(e) => (format!("CORE: {e}"), (255, 120, 80), wall_time_ns() + 6_000_000_000),
+            });
+            if started.is_ok() && f10 {
+                pending_engage_until = wall_time_ns() + 15_000_000_000;
+            }
+        } else if f10 {
             engage_req = !engage_req;
             if engage_req && ai {
                 ai = false;
@@ -417,6 +443,23 @@ fn run() {
                             signal = 0;
                             "ok clear".into()
                         }
+                        remote::Cmd::Ai(on) if in_vehicle => {
+                            ai = on;
+                            if ai {
+                                engage_req = false;
+                            }
+                            tools::ai_drive(ped, veh, ai);
+                            format!("ok ai {}", if on { "on" } else { "off" })
+                        }
+                        remote::Cmd::Walker(dist, sd) if in_vehicle => {
+                            tools::spawn_walker(veh, dist, sd * 5.0, &mut extras, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok walker".into()
+                        }
+                        remote::Cmd::Walk => {
+                            tools::walk(&extras, &mut log);
+                            "ok walk".into()
+                        }
                         remote::Cmd::Signal(sd) => {
                             signal = sd;
                             signal_since = wall_time_ns();
@@ -433,6 +476,13 @@ fn run() {
                             tools::spawn_profile_car(veh, rear - dist - 1.0, sd * 25.0, -sd * 90.0, speed, &mut extras, &mut log);
                             last_tick = wall_time_ns();
                             "ok cross".into()
+                        }
+                        remote::Cmd::PullOut(sd, ahead, speed) if in_vehicle => {
+                            // From 15 m to that side, heading across the path ahead.
+                            let front = link.info.read().1.box_max[0];
+                            tools::spawn_profile_car(veh, front + ahead, sd * 15.0, -sd * 90.0, speed, &mut extras, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok pullout".into()
                         }
                         remote::Cmd::Obstacle(behind, gap) if in_vehicle => {
                             let info = link.info.read().1;
@@ -512,6 +562,7 @@ fn run() {
             if veh != info_for {
                 steering.reset();
                 actors_sys.reset();
+                lanes_sys.reset();
                 info_frames = 0;
             }
             info_for = veh;
@@ -540,7 +591,8 @@ fn run() {
                     | caps::DRIVER_INPUT
                     | caps::RANGE_FANS
                     | caps::TURN_SIGNALS
-                    | caps::GEAR,
+                    | caps::GEAR
+                    | caps::MAP,
                 _reserved: 0,
                 box_min: min_iso,
                 box_max: max_iso,
@@ -567,6 +619,10 @@ fn run() {
         let mut ranges = if in_vehicle && !paused { fans_sys.step(veh, &fan_layout) } else { adapter_api::RangeReport::default() };
         ranges.header = Header { kind: MsgKind::RangeReport, version: CONTRACT_VERSION, seq: seq.wrapping_add(1), frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() };
         link.ranges.write(&ranges);
+        // The lane markings around the car (the map capability).
+        let mut lane_map = if in_vehicle && !paused { lanes_sys.step(veh, &actor_list, &mut log) } else { adapter_api::LaneMap::default() };
+        lane_map.header = Header { kind: MsgKind::LaneMap, version: CONTRACT_VERSION, seq: seq.wrapping_add(1), frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() };
+        link.lanes.write(&lane_map);
 
         let mut s = VehicleSample::default();
         let mut measured_angle = f32::NAN;
@@ -679,6 +735,17 @@ fn run() {
         }
         if fresh {
             core_was_engaged = core_engaged && engage_req;
+        }
+        if pending_engage_until != 0 {
+            if fresh && in_vehicle && !paused && wall_time_ns() < pending_engage_until {
+                engage_req = true;
+                pending_engage_until = 0;
+                notice = None;
+                let _ = writeln!(log, "frame {frame}: core answering: engage request ON");
+            } else if wall_time_ns() >= pending_engage_until {
+                pending_engage_until = 0;
+                notice = Some(("CORE DID NOT ANSWER: see recordings/core-*.log".into(), (255, 120, 80), wall_time_ns() + 6_000_000_000));
+            }
         }
         let active = in_vehicle && engage_req && core_engaged && fresh && !paused;
         // Hazard lights for a controlled stop (D11).
@@ -918,7 +985,7 @@ fn run() {
                 0.015,
                 0.062,
                 &format!(
-                    "F10 ACC | PgUp/PgDn speed | End gap | F11 lead | F5 lead brakes | F4 stopped car | F7 tp | F8 car | F9 AI | F6 cap60 {}{warn}",
+                    "F10 engage | F2 core | PgUp/PgDn speed | End gap | F11 lead | F5 lead brakes | F4 stopped car | F7 tp | F8 car | F9 AI | F6 cap60 {}{warn}",
                     if cap60 { "ON" } else { "off" }
                 ),
                 (255, 255, 255),
@@ -936,10 +1003,25 @@ fn run() {
                 let aeb_off = if hud.flags & hud_flags::AEB_OFF != 0 { " | AEB OFF" } else { "" };
                 let colour = if acc { (80, 220, 120) } else if hud.flags & hud_flags::UNAVAILABLE != 0 { (255, 170, 60) } else { (180, 180, 180) };
                 let () = invoke!(n::DRAW_RECT, 0.5f32, 0.925f32, 0.34f32, 0.045f32, 0i32, 0i32, 0i32, 170i32, false);
+                // Lane centering, the lines the camera sees, LKA.
+                let lanes_txt = if hud.flags & hud_flags::LANE_CENTERING != 0 {
+                    " | AUTOSTEER"
+                } else if hud.flags & hud_flags::STEER_OVERRIDE != 0 {
+                    " | steering: you"
+                } else if hud.flags & hud_flags::LKA != 0 {
+                    " | LANE KEEP"
+                } else {
+                    ""
+                };
                 let line = if hud.flags & hud_flags::UNAVAILABLE != 0 {
                     format!("ACC unavailable: {}{aeb_off}", adapter_api::hud_message::text(hud.message))
                 } else {
-                    format!("{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}{aeb_off}", if acc { "ACC" } else { "ACC off" }, hud.set_speed * 3.6, hud.time_gap)
+                    format!(
+                        "{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}{lanes_txt}{aeb_off}",
+                        if acc { "ACC" } else { "ACC off" },
+                        hud.set_speed * 3.6,
+                        hud.time_gap
+                    )
                 };
                 // The lead-car icon: grey with no lead, white with one, green while following.
                 let (r, g, b) = if hud.flags & hud_flags::FOLLOWING != 0 {
@@ -975,6 +1057,18 @@ fn run() {
             }
         }
         hud::draw(&hud, hud_live, frame, &mut hud_sounds);
+        if let Some((text, rgb, until)) = &notice {
+            if wall_time_ns() < *until {
+                unsafe { draw_text(0.36, 0.06, text, *rgb) };
+            } else {
+                notice = None;
+            }
+        }
+        if hud_live && in_vehicle && !paused {
+            let info = link.info.read().1;
+            hud::draw_lanes(&hud, veh, info.box_min[2]);
+            hud::draw_paths(&hud, veh, info.box_min, info.box_max);
+        }
 
         unsafe { shv_sys::scriptWait(0) };
     }

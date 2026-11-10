@@ -1,0 +1,22 @@
+# Phase 3 gate: lane-centre error <= 0.3 m RMS on a highway loop, and at most
+# 1 takeover per 10 km. The autopilot (ACC + lane centering) at 110 km/h over
+# about 11 km of straights and bends (radii 900 to 2000 m, both ways), hands off.
+name = "Lane centering: an 11 km highway loop"
+feature = "autopilot"
+duration = 360.0
+
+[road]
+pieces = [[800, 0], [600, 1500], [400, 0], [700, -1200], [500, 0], [500, 900], [400, 0], [600, -2000]]
+repeat_pieces = 3
+
+[ego]
+speed_kph = 110
+engage_at = 0.5
+set_kph = 110
+
+[pass]
+max_lane_rms = 0.3
+max_departures = 0
+max_takeovers_per_10km = 1
+min_centering = 0.98
+max_aeb = 0

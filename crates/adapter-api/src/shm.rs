@@ -11,10 +11,12 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::sync::OnceLock;
 
-use crate::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, FanLayout, Hud, Mailbox, RangeReport, SensorLayout, VehicleSample};
+use crate::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, FanLayout, Hud, LaneMap, Mailbox, RangeReport, SensorLayout, VehicleSample};
 
-/// Default name of the link for one adapter ↔ core pair.
-pub const DEFAULT_NAME: &str = "Local\\adas-link-v1";
+/// Default name of the link for one adapter ↔ core pair. It carries the
+/// contract version, so a core or adapter left running from another
+/// contract (its mapping laid out differently) can never share the link.
+pub const DEFAULT_NAME: &str = "Local\\adas-link-c6";
 const LINK_MAGIC: u64 = u64::from_le_bytes(*b"ADASLNK1");
 
 /// The shared region's layout.
@@ -47,6 +49,8 @@ pub struct Link {
     pub fans: Mailbox<FanLayout>,
     /// adapter → core, every frame while the fans are active (v4).
     pub ranges: Mailbox<RangeReport>,
+    /// adapter → core, every frame: the lane markings around the car (v5).
+    pub lanes: Mailbox<LaneMap>,
 }
 
 #[link(name = "kernel32", kind = "raw-dylib")]
@@ -172,6 +176,11 @@ impl Drop for SharedLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_name_carries_the_contract_version() {
+        assert!(DEFAULT_NAME.ends_with(&format!("-c{CONTRACT_VERSION}")), "rename DEFAULT_NAME with the contract version");
+    }
 
     #[test]
     fn two_opens_share_memory() {

@@ -143,6 +143,23 @@ fn deploy(name: &str) -> Result<(), String> {
     let dst = dir.join(asi);
     fs::copy(&src, &dst).map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
     println!("deployed {}", dst.display());
+    // Where the in-game F2 / F10 finds the core (gta-plugin's `launch`): the
+    // repository, and the core's arguments (kept if edited).
+    if asi == "adas.asi" {
+        let cfg = dir.join("adas-core.txt");
+        let args = fs::read_to_string(&cfg)
+            .ok()
+            .and_then(|t| t.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).nth(1).map(String::from))
+            .unwrap_or_else(|| "--feature autopilot".into());
+        let text = format!(
+            "# Written by `cargo xtask deploy`: F2 in the game (or F10 with no core running) starts the core.\n\
+             # Line 1: the repository. Line 2: the core's arguments; edit it to pick another feature\n\
+             # (acc, autopilot, test-driver) or add --driver-monitor.\n{}\n{args}\n",
+            workspace_root().display()
+        );
+        fs::write(&cfg, text).map_err(|e| format!("write {}: {e}", cfg.display()))?;
+        println!("wrote {} (core arguments: {args})", cfg.display());
+    }
     if !dir.join("ScriptHookV.dll").exists() {
         println!("warning: ScriptHookV.dll is missing from the game folder");
     }

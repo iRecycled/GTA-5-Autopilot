@@ -1,8 +1,9 @@
 //! Drive recordings (D20).
 //!
 //! One MCAP file per drive. Each core step writes, in order: `sample`,
-//! `actors`, `ranges` (while the range fans are answered), `stick` (if the
-//! test driver is running) and `command`. The bytes
+//! `actors`, `ranges` (while the range fans are answered), `lanes` (while the
+//! host gives lane markings), `stick` (if the test driver is running) and
+//! `command`. The bytes
 //! are the contract's `#[repr(C)]` layouts (encoding `adas-raw`, schema data =
 //! contract version), so a recording is tied to the contract version it was
 //! made with, and a replay can feed the core exactly what it saw live.
@@ -18,7 +19,7 @@ use std::fs::File;
 use std::io::{self, BufWriter};
 use std::path::Path;
 
-use adapter_api::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, Header, MAX_ACTORS, RangeReport, VehicleSample};
+use adapter_api::{ActorList, AdapterInfo, CONTRACT_VERSION, Command, Header, LaneMap, MAX_ACTORS, RangeReport, VehicleSample};
 
 pub const ENCODING: &str = "adas-raw";
 
@@ -37,6 +38,7 @@ unsafe impl Raw for Stick3 {}
 unsafe impl Raw for Profile {}
 unsafe impl Raw for FaultRec {}
 unsafe impl Raw for RangeReport {}
+unsafe impl Raw for LaneMap {}
 
 /// A bus fault injected (or faults cleared) between steps.
 #[repr(C)]
@@ -69,7 +71,10 @@ impl FaultRec {
 pub struct Profile {
     /// Brake gain (m/s² per unit of brake demand).
     pub brake_gain: f32,
-    pub _reserved: [f32; 3],
+    /// The fixed reference the learned gain stays within 1.3× of; 0 in
+    /// recordings made before it existed (the gain is the reference then).
+    pub brake_reference: f32,
+    pub _reserved: [f32; 2],
 }
 
 /// The test driver's stick as recorded: throttle, brake, steer.
@@ -127,6 +132,7 @@ struct Channels {
     info: u16,
     fault: u16,
     ranges: u16,
+    lanes: u16,
 }
 
 pub struct Recorder {
@@ -160,6 +166,7 @@ impl Recorder {
             info: chan("info", "adas.AdapterInfo")?,
             fault: chan("fault", "adas.Fault")?,
             ranges: chan("ranges", "adas.RangeReport")?,
+            lanes: chan("lanes", "adas.LaneMap")?,
         };
         let mut meta = meta.clone();
         meta.insert("contract".into(), ver);
@@ -187,12 +194,16 @@ impl Recorder {
     }
 
     /// Records one core step.
-    pub fn step(&mut self, s: &VehicleSample, a: &ActorList, ranges: Option<&RangeReport>, stick: Option<Stick3>, c: &Command) -> io::Result<()> {
+#[allow(clippy::too_many_arguments)]
+    pub fn step(&mut self, s: &VehicleSample, a: &ActorList, ranges: Option<&RangeReport>, lanes: Option<&LaneMap>, stick: Option<Stick3>, c: &Command) -> io::Result<()> {
         let t = s.header.wall_time_ns;
         self.put(self.ch.sample, t, bytes_of(s))?;
         self.put(self.ch.actors, t, &actors_bytes(a))?;
         if let Some(r) = ranges.filter(|r| r.count > 0) {
             self.put(self.ch.ranges, t, bytes_of(r))?;
+        }
+        if let Some(l) = lanes.filter(|l| l.count > 0) {
+            self.put(self.ch.lanes, t, bytes_of(l))?;
         }
         if let Some(st) = stick {
             self.put(self.ch.stick, t, bytes_of(&st))?;
@@ -224,6 +235,8 @@ pub struct Frame {
     pub actors: ActorList,
     /// The range fans' answers, while they were active.
     pub ranges: Option<RangeReport>,
+    /// The lane markings, while the host gave them.
+    pub lanes: Option<Box<LaneMap>>,
     pub stick: Option<Stick3>,
     pub command: Option<Command>,
 }
@@ -283,6 +296,7 @@ impl Recording {
                     sample: from_bytes(&m.data).ok_or_else(|| bad("bad sample".into()))?,
                     actors: ActorList::default(),
                     ranges: None,
+                    lanes: None,
                     stick: None,
                     command: None,
                 }),
@@ -299,6 +313,11 @@ impl Recording {
                 "ranges" => {
                     if let Some(f) = frames.last_mut() {
                         f.ranges = from_bytes(&m.data);
+                    }
+                }
+                "lanes" => {
+                    if let Some(f) = frames.last_mut() {
+                        f.lanes = from_bytes(&m.data).map(Box::new);
                     }
                 }
                 "command" => {
@@ -355,7 +374,10 @@ mod tests {
             }
             let mut ranges = RangeReport { count: 2, ..Default::default() };
             ranges.fans[1].hits[0] = i as f32;
-            rec.step(&s, &actors, (i == 4).then_some(&ranges), stick, &c).unwrap();
+            let mut lanes = LaneMap { count: 1, ..Default::default() };
+            lanes.lines[0].count = 2;
+            lanes.lines[0].points[1] = [30.0, 1.8];
+            rec.step(&s, &actors, (i == 4).then_some(&ranges), (i == 2).then_some(&lanes), stick, &c).unwrap();
         }
         rec.finish().unwrap();
 
@@ -374,6 +396,8 @@ mod tests {
         assert_eq!(r.frames[4].actors.actors[1].kind, ActorKind::Pedestrian);
         assert_eq!(r.frames[3].ranges.map(|g| g.fans[1].hits[0]), Some(4.0));
         assert!(r.frames[2].ranges.is_none() && r.frames[4].ranges.is_none());
+        assert_eq!(r.frames[1].lanes.as_ref().map(|l| l.lines[0].points[1]), Some([30.0, 1.8]));
+        assert!(r.frames[0].lanes.is_none());
         assert!(!r.truncated);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -387,7 +411,7 @@ mod tests {
         let a = ActorList::default();
         for i in 1..=200u32 {
             let s = VehicleSample { speed: i as f32, ..Default::default() };
-            rec.step(&s, &a, None, None, &Command { answers_seq: i, ..Default::default() }).unwrap();
+            rec.step(&s, &a, None, None, None, &Command { answers_seq: i, ..Default::default() }).unwrap();
         }
         // Simulate a crash: the writer is dropped without `finish`, after the
         // file is cut mid-way through the last (unflushed) chunk.

@@ -1,0 +1,25 @@
+# The other way round on the GTA-like car: 40 s at 35 km/h, then 110 km/h.
+# The gain learned slowly (about 0.7) is too weak at speed, where the car
+# turns about 0.2 of the model: the manual GTA drive drifted wide at
+# 120 km/h until the lane ran out.
+name = "Lane centering: speeding up to 110 km/h after town, on a GTA-like car"
+feature = "autopilot"
+duration = 90.0
+vehicle = "gta"
+
+[road]
+pieces = [[300, 0], [250, 900], [300, 0], [250, -900]]
+repeat_pieces = 20
+
+[ego]
+speed_kph = 35
+engage_at = 0.5
+set_kph = 35
+[[ego.set]]
+t = 40
+kph = 110
+
+[pass]
+max_lane_rms = 0.3
+max_departures = 0
+max_takeovers = 0

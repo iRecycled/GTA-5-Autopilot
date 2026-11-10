@@ -31,6 +31,18 @@ pub enum Reason {
     NoGear,
     /// ACC doesn't run in reverse.
     Reversing,
+    /// The host gives no lane markings (`caps::MAP`).
+    NoMap,
+    /// The camera sees no lane lines.
+    NoLanes,
+    /// The lane ends ahead.
+    LaneEnds,
+    /// The car isn't in the lane the camera sees (over a line).
+    NotInLane,
+    /// The camera has sent nothing for a while.
+    CameraSilent,
+    /// The driver monitor: hands off the wheel too long.
+    NoAttention,
 }
 
 impl Reason {
@@ -49,6 +61,12 @@ impl Reason {
             Reason::ParkSensorFault => "parking sensor fault",
             Reason::NoGear => "no gear signal on this host",
             Reason::Reversing => "not available in reverse",
+            Reason::NoMap => "no lane data on this host",
+            Reason::NoLanes => "lanes not detected",
+            Reason::LaneEnds => "lane ends",
+            Reason::NotInLane => "car not in its lane",
+            Reason::CameraSilent => "camera blocked",
+            Reason::NoAttention => "hands off the wheel too long",
         }
     }
 
@@ -68,6 +86,12 @@ impl Reason {
             Reason::ParkSensorFault => m::PARK_SENSOR_FAULT,
             Reason::NoGear => m::NO_GEAR,
             Reason::Reversing => m::REVERSING,
+            Reason::NoMap => m::NO_MAP,
+            Reason::NoLanes => m::NO_LANES,
+            Reason::LaneEnds => m::LANE_ENDS,
+            Reason::NotInLane => m::NOT_IN_LANE,
+            Reason::CameraSilent => m::CAMERA_BLOCKED,
+            Reason::NoAttention => m::NO_ATTENTION,
         }
     }
 }
@@ -95,6 +119,9 @@ pub struct Availability {
     /// The surround features may brake (the host has pedal control); else
     /// they only warn.
     pub surround_brake: bool,
+    /// Lane features (lane centering, LKA) as far as the host and the camera
+    /// allow; whether lines are actually seen is the lane feature's own check.
+    pub lanes: Result<(), Reason>,
 }
 
 /// Without stop-and-go, ACC works only above this speed (m/s), as on cars
@@ -118,7 +145,12 @@ pub struct Health {
     pub park_running: bool,
     pub park_age: u64,
     pub park_fault: bool,
+    /// Frames since the last camera frame arrived.
+    pub camera_age: u64,
 }
+
+/// The camera sends every 33 ms; this much silence is a fault (frames).
+pub const CAMERA_TIMEOUT_FRAMES: u64 = 36;
 
 /// The park ECU sends every 40 ms; this much silence is a fault (frames).
 pub const PARK_TIMEOUT_FRAMES: u64 = 18; // 0.25 s at 72 fps
@@ -137,6 +169,7 @@ pub fn evaluate(info: Option<&AdapterInfo>, h: Health) -> Availability {
             rcta: no,
             park: no,
             surround_brake: false,
+            lanes: no,
         };
     };
     let has = |c: u32| info.capabilities & c != 0;
@@ -169,6 +202,12 @@ pub fn evaluate(info: Option<&AdapterInfo>, h: Health) -> Availability {
         ]),
         park: need(&[(has(caps::RANGE_FANS), Reason::NoRangeFans), (chassis_ok, Reason::ChassisSilent), (park_ok, Reason::ParkSensorFault)]),
         surround_brake: has(caps::PEDALS),
+        lanes: need(&[
+            (has(caps::STEER), Reason::NoSteer),
+            (has(caps::MAP), Reason::NoMap),
+            (chassis_ok, Reason::ChassisSilent),
+            (h.camera_age <= CAMERA_TIMEOUT_FRAMES, Reason::CameraSilent),
+        ]),
     }
 }
 
@@ -179,8 +218,8 @@ mod tests {
     fn info(c: u32) -> AdapterInfo {
         AdapterInfo { capabilities: c, ..Default::default() }
     }
-    const ALL: u32 = caps::STEER | caps::PEDALS | caps::HOLD | caps::ACTORS | caps::LINE_OF_SIGHT | caps::RANGE_FANS | caps::GEAR;
-    const OK: Health = Health { chassis_age: 0, radar_age: 0, rear_corner_age: [0, 0], park_running: true, park_age: 0, park_fault: false };
+    const ALL: u32 = caps::STEER | caps::PEDALS | caps::HOLD | caps::ACTORS | caps::LINE_OF_SIGHT | caps::RANGE_FANS | caps::GEAR | caps::MAP;
+    const OK: Health = Health { chassis_age: 0, radar_age: 0, rear_corner_age: [0, 0], park_running: true, park_age: 0, park_fault: false, camera_age: 0 };
 
     #[test]
     fn everything_available_with_full_capabilities() {
@@ -221,5 +260,15 @@ mod tests {
         assert!(evaluate(Some(&info(ALL)), Health { park_running: false, park_age: 9999, ..OK }).park.is_ok());
         // No pedals: warn only.
         assert!(!evaluate(Some(&info(ALL & !caps::PEDALS)), OK).surround_brake);
+    }
+
+    #[test]
+    fn the_lane_rows() {
+        assert!(evaluate(Some(&info(ALL)), OK).lanes.is_ok());
+        assert_eq!(evaluate(Some(&info(ALL & !caps::MAP)), OK).lanes, Err(Reason::NoMap));
+        assert_eq!(evaluate(Some(&info(ALL & !caps::STEER)), OK).lanes, Err(Reason::NoSteer));
+        let blind = evaluate(Some(&info(ALL)), Health { camera_age: 100, ..OK });
+        assert_eq!(blind.lanes, Err(Reason::CameraSilent));
+        assert!(blind.acc.is_ok(), "ACC doesn't need the camera");
     }
 }

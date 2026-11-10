@@ -91,6 +91,10 @@ pub fn step(core: &Core, s: &VehicleSample, actors: &ActorList, cmd: &Command, l
                 Track { id: t.id, x: t.x(), y: t.y(), vx: t.vx(), vy: t.vy(), half_length: t.half_length, width: t.width, flags }
             })
             .chain(surround_tracks(core))
+            .chain(core.pedestrians().iter().map(|t| {
+                let flags = track_flags::PEDESTRIAN | if t.confirmed { track_flags::CONFIRMED } else { 0 };
+                Track { id: t.id, x: t.x(), y: t.y(), vx: t.vx(), vy: t.vy(), half_length: 0.25, width: 0.5, flags }
+            }))
             .collect(),
         actors: actors
             .as_slice()
@@ -107,7 +111,17 @@ pub fn step(core: &Core, s: &VehicleSample, actors: &ActorList, cmd: &Command, l
         rcta_activations: core.surround_activations().0,
         park_activations: core.surround_activations().1,
         corner_latency_frames: v.stats.corner_latency_frames,
+        lane_left: lane_line(core.lane_out().path.and_then(|p| p.left)),
+        lane_right: lane_line(core.lane_out().path.and_then(|p| p.right)),
+        lane_offset: core.lane_out().path.map_or(f32::NAN, |p| p.offset()),
+        lane_angle: core.lane_out().angle.unwrap_or(f32::NAN),
+        lka_nudges: core.lka_nudges(),
+        _reserved: 0,
     }
+}
+
+fn lane_line(f: Option<sensors::LaneFit>) -> [f32; 5] {
+    f.map_or([0.0; 5], |f| [f.c[0], f.c[1], f.c[2], f.c[3], f.range])
 }
 
 /// The surround tracks, flagged for the views.

@@ -18,6 +18,9 @@ const LIST_RANGE_M: f32 = 170.0;
 /// Map + vehicles + objects: what blocks a radar's view.
 const LOS_FLAGS: i32 = 1 | 2 | 16;
 const MAX_VEHICLES: usize = 1024;
+/// Pedestrians in the list, at most, and how far out (m).
+const MAX_PEDS: usize = 12;
+const PED_RANGE_M: f32 = 60.0;
 
 #[derive(Clone, Copy, Default)]
 struct Los {
@@ -39,6 +42,7 @@ pub struct LosStats {
 pub struct Actors {
     frame: u32,
     vbuf: Vec<i32>,
+    pbuf: Vec<i32>,
     los: HashMap<i32, Los>,
     /// (handle, actor, sensor bits it answers for, start frame)
     pending: Vec<(i32, i32, u8, u32)>,
@@ -87,7 +91,7 @@ pub fn model_dims(cache: &mut HashMap<u32, (Vector3, Vector3)>, model: u32) -> (
 
 impl Actors {
     pub fn new() -> Self {
-        Self { frame: 0, vbuf: vec![0; MAX_VEHICLES], los: HashMap::new(), pending: Vec::new(), dims: HashMap::new() }
+        Self { frame: 0, vbuf: vec![0; MAX_VEHICLES], pbuf: vec![0; MAX_VEHICLES], los: HashMap::new(), pending: Vec::new(), dims: HashMap::new() }
     }
 
     pub fn reset(&mut self) {
@@ -125,7 +129,7 @@ impl Actors {
 
         // 3. Every vehicle, nearest first, within range.
         let n = unsafe { shv_sys::worldGetAllVehicles(self.vbuf.as_mut_ptr(), self.vbuf.len() as i32) }.max(0) as usize;
-        let mut near: Vec<(f32, i32, Vector3)> = Vec::with_capacity(n.min(256));
+        let mut near: Vec<(f32, i32, Vector3, bool)> = Vec::with_capacity(n.min(256));
         for &v in &self.vbuf[..n.min(MAX_VEHICLES)] {
             if v == veh {
                 continue;
@@ -133,21 +137,46 @@ impl Actors {
             let p: Vector3 = unsafe { invoke!(n::GET_ENTITY_COORDS, v, true) };
             let d2 = (p.x - ep.x).powi(2) + (p.y - ep.y).powi(2);
             if d2 <= LIST_RANGE_M * LIST_RANGE_M {
-                near.push((d2, v, p));
+                near.push((d2, v, p, false));
             }
         }
+        // Pedestrians (Phase 3, for the camera): the nearest few on foot,
+        // within the camera's pedestrian range. Positions first (cheap), the
+        // in-a-vehicle check only for those candidates.
+        let np = unsafe { shv_sys::worldGetAllPeds(self.pbuf.as_mut_ptr(), self.pbuf.len() as i32) }.max(0) as usize;
+        let player: i32 = unsafe { invoke!(n::PLAYER_PED_ID) };
+        let mut peds: Vec<(f32, i32, Vector3, bool)> = Vec::new();
+        for &q in &self.pbuf[..np.min(MAX_VEHICLES)] {
+            if q == player {
+                continue;
+            }
+            let p: Vector3 = unsafe { invoke!(n::GET_ENTITY_COORDS, q, true) };
+            let d2 = (p.x - ep.x).powi(2) + (p.y - ep.y).powi(2);
+            if d2 <= PED_RANGE_M * PED_RANGE_M {
+                peds.push((d2, q, p, true));
+            }
+        }
+        peds.sort_by(|a, b| a.0.total_cmp(&b.0));
+        peds.truncate(2 * MAX_PEDS);
+        peds.retain(|&(_, q, _, _)| !unsafe { invoke!(n::IS_PED_IN_ANY_VEHICLE, q, false) });
+        peds.truncate(MAX_PEDS);
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        out.dropped = near.len().saturating_sub(MAX_ACTORS) as u32;
-        near.truncate(MAX_ACTORS);
+        out.dropped = near.len().saturating_sub(MAX_ACTORS - peds.len()) as u32;
+        near.truncate(MAX_ACTORS - peds.len());
+        near.extend(peds);
 
         // 4. Ego-frame state, sensor coverage and line-of-sight bits.
         let mounts = layout.as_slice();
         let mut due: Vec<(f32, usize, u8, usize, V2)> = Vec::new(); // (score, actor index, bits, mount, ray target)
         let ego_z = ep.z;
         out.count = near.len() as u32;
-        for (i, &(_, v, p)) in near.iter().enumerate() {
-            let model: u32 = unsafe { invoke!(n::GET_ENTITY_MODEL, v) };
-            let (lo, hi) = model_dims(&mut self.dims, model);
+        for (i, &(_, v, p, ped)) in near.iter().enumerate() {
+            let (lo, hi) = if ped {
+                (Vector3::new(-0.25, -0.25, -1.0), Vector3::new(0.25, 0.25, 0.8))
+            } else {
+                let model: u32 = unsafe { invoke!(n::GET_ENTITY_MODEL, v) };
+                model_dims(&mut self.dims, model)
+            };
             let f: Vector3 = unsafe { invoke!(n::GET_ENTITY_FORWARD_VECTOR, v) };
             let vel: Vector3 = unsafe { invoke!(n::GET_ENTITY_VELOCITY, v) };
             let rot: Vector3 = unsafe { invoke!(n::GET_ENTITY_ROTATION_VELOCITY, v) };
@@ -195,7 +224,7 @@ impl Actors {
             }
             out.actors[i] = Actor {
                 id: v as u32,
-                kind: ActorKind::Vehicle,
+                kind: if ped { ActorKind::Pedestrian } else { ActorKind::Vehicle },
                 los_mask: los.map(|l| l.mask & bits).unwrap_or(0),
                 los_age: age.min(u16::MAX as u32) as u16,
                 x: rel.x,

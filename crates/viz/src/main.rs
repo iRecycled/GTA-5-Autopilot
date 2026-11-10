@@ -176,6 +176,9 @@ impl Logger {
         let strips: Vec<Vec<[f32; 2]>> = s.actors.iter().map(|a| outline(a.x, a.y, a.yaw, a.length, a.width)).collect();
         self.rec.log("bev/actors", &LineStrips2D::new(strips).with_colors([Color::from_rgb(130, 130, 130)]).with_radii([0.08]))?;
         let color = |f: u8| {
+            if f & track_flags::PEDESTRIAN != 0 {
+                return Color::from_rgb(250, 120, 200);
+            }
             if f & track_flags::SURROUND != 0 {
                 return if f & track_flags::CROSSING != 0 {
                     Color::from_rgb(230, 90, 230)
@@ -218,9 +221,25 @@ impl Logger {
         let vectors: Vec<[f32; 2]> = s.tracks.iter().map(|t| bev(t.vx, t.vy)).collect();
         self.rec.log("bev/velocity", &Arrows2D::from_vectors(vectors).with_origins(centers).with_colors(colors))?;
         self.surround(s)?;
+        self.lanes(s)?;
         let mut hud: Vec<&str> = HUD_BITS.iter().enumerate().filter(|(i, _)| s.hud_flags >> i & 1 == 1).map(|(_, n)| *n).collect();
         hud.extend(SURROUND_BITS.iter().enumerate().filter(|(i, _)| s.surround_flags >> i & 1 == 1).map(|(_, n)| *n));
         self.rec.log("bev/hud", &TextLog::new(if hud.is_empty() { "-".to_string() } else { hud.join(" ") }))
+    }
+
+    /// The camera's lane lines (green when lane centering steers).
+    fn lanes(&self, s: &Step) -> rerun::RecordingStreamResult<()> {
+        let mut strips = Vec::new();
+        for l in [s.lane_left, s.lane_right] {
+            if l[4] < 5.0 {
+                continue;
+            }
+            let y = |x: f32| l[0] + x * (l[1] + x * (l[2] + x * l[3]));
+            strips.push((0..=20).map(|i| l[4] * i as f32 / 20.0).map(|x| bev(x, y(x))).collect::<Vec<_>>());
+        }
+        let steering = s.hud_flags & adapter_api::hud_flags::LANE_CENTERING != 0;
+        let c = if steering { Color::from_rgb(80, 230, 120) } else { Color::from_rgb(200, 200, 200) };
+        self.rec.log("bev/lanes", &LineStrips2D::new(strips).with_colors([c]).with_radii([0.05]))
     }
 
     /// BSD zones (lit while occupied) and park assist arcs.
@@ -325,13 +344,16 @@ fn replay(log: &mut Logger, path: &Path) -> Result<usize, String> {
         }
         if let Some(p) = &f.profile {
             core.set_brake_gain(p.brake_gain);
+            if p.brake_reference > 0.0 {
+                core.set_brake_reference(p.brake_reference);
+            }
         }
         for fault in &f.faults {
             telem::apply_fault(&mut core, fault).map_err(|e| format!("step {i}: {e}"))?;
             log.event(f.sample.header.frame, &format!("fault: {fault:?}")).map_err(err)?;
         }
         let stick = f.stick.map(|s| Stick { throttle: s.throttle, brake: s.brake, steer: s.steer });
-        let (c, event) = core.step(Inputs { sample: &f.sample, actors: &f.actors, ranges: f.ranges.as_ref(), stick });
+        let (c, event) = core.step(Inputs { sample: &f.sample, actors: &f.actors, ranges: f.ranges.as_ref(), lanes: f.lanes.as_deref(), stick });
         log.step(&telem::step(&core, &f.sample, &f.actors, &c, 0, 0)).map_err(err)?;
         log.frames(f.sample.header.frame, &telem::frames(&core)).map_err(err)?;
         if event != adas_core::Event::None {

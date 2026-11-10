@@ -18,6 +18,9 @@
 //! | `drive THR BRK STEER SECS` | the driver's inputs for SECS s (steer +left); fractional values count as an analogue device |
 //! | `creep back\|forward SPEED SECS` | the driver holds SPEED m/s (parking speeds) for SECS s; any `drive` ends it |
 //! | `signal left\|right\|off` | the turn signal |
+//! | `ai on\|off` | GTA's AI drives the car (as F9) |
+//! | `walker DIST left\|right` | a pedestrian waiting DIST m ahead, 5 m to that side of the car |
+//! | `walk` | the waiting pedestrians cross the road |
 //! | `overtake left\|right DIST SPEED` | a car DIST m behind in the next lane, driving straight at SPEED m/s |
 //! | `cross left\|right DIST SPEED` | a car from 25 m to that side, crossing DIST m behind the rear bumper at SPEED m/s |
 //! | `obstacle behind\|ahead GAP` | a parked van broadside, GAP m from the bumper |
@@ -45,9 +48,16 @@ pub enum Cmd {
     Creep(bool, f32, f32),
     /// 1 left, −1 right, 0 off.
     Signal(i8),
+    Ai(bool),
+    /// distance ahead (m), side (1 left, −1 right).
+    Walker(f32, f32),
+    Walk,
     /// side (1 left, −1 right), distance behind (m), speed (m/s).
     Overtake(f32, f32, f32),
     Cross(f32, f32, f32),
+    /// side (1 left, −1 right), distance ahead of the front bumper (m),
+    /// speed (m/s): a car pulling out across the path (junction AEB).
+    PullOut(f32, f32, f32),
     /// behind?, gap (m).
     Obstacle(bool, f32),
 }
@@ -96,8 +106,16 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
             Some("off") => 0,
             _ => return Err(format!("{line}: signal left|right|off")),
         }),
+        "ai" => Cmd::Ai(match w.get(1).copied() {
+            Some("on") => true,
+            Some("off") => false,
+            _ => return Err(format!("{line}: ai on|off")),
+        }),
+        "walker" => Cmd::Walker(num(1)?, side(w.get(2).copied(), line)?),
+        "walk" => Cmd::Walk,
         "overtake" => Cmd::Overtake(side(w.get(1).copied(), line)?, num(2)?, num(3)?),
         "cross" => Cmd::Cross(side(w.get(1).copied(), line)?, num(2)?, num(3)?),
+        "pullout" => Cmd::PullOut(side(w.get(1).copied(), line)?, num(2)?, num(3)?),
         "obstacle" => Cmd::Obstacle(
             match w.get(1).copied() {
                 Some("behind") => true,

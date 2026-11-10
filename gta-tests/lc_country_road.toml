@@ -1,0 +1,20 @@
+# Phase 3: lane centering on the Sandy Shores road (a two-lane country road,
+# one lane each way, with a long gentle right bend). The autopilot engages,
+# ACC sets 60 km/h, and it steers itself for 30 s. The teleport puts the car
+# into its lane.
+name = "Lane centering: country road"
+spot = "Sandy Shores road"
+feature = "autopilot"
+steps = [
+  "engage",
+  "set 60",
+  "wait speed>=50 25",
+  "sleep 30",
+]
+
+[pass]
+max_aeb = 0
+max_lane_rms = 0.3
+min_centering = 0.9
+max_takeovers = 0
+min_engaged = 0.98

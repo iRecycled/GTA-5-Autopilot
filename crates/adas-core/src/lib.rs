@@ -25,13 +25,13 @@ pub mod telem;
 pub mod vbus;
 
 use adapter_api::{
-    ActorList, AdapterInfo, Command, FanLayout, Hud, RangeReport, SensorLayout, VehicleSample, buttons, caps, command_flags, fan_flags, hud_flags,
-    sample_flags, surround_flags,
+    ActorList, AdapterInfo, Command, FanLayout, Hud, LaneMap, RangeReport, SensorLayout, VehicleSample, buttons, caps, command_flags, fan_flags,
+    hud_flags, sample_flags, surround_flags,
 };
 use control::{Config, SpeedController};
 use features::FeatureState;
-use fusion::{Lead, LeadKind, SurroundConfig, SurroundTracker, Tracker, TrackerConfig, select_lead};
-use sensors::{FrontRadar, Radar, RadarConfig, RadarScan, UltrasonicConfig, Ultrasonics};
+use fusion::{Lead, LeadKind, SurroundConfig, SurroundTracker, Tracker, TrackerConfig, nearer, select_in_body_path, select_lead, select_lead_in_lane, select_pedestrian};
+use sensors::{Camera, CameraConfig, FrontRadar, LaneFit, Radar, RadarConfig, RadarObject, RadarScan, UltrasonicConfig, Ultrasonics, camera};
 
 pub use features::{Feature, Stick};
 
@@ -42,6 +42,8 @@ pub struct Inputs<'a> {
     pub actors: &'a ActorList,
     /// The host's answers to the range fans, while they are active.
     pub ranges: Option<&'a RangeReport>,
+    /// The lane markings around the car (`caps::MAP`).
+    pub lanes: Option<&'a LaneMap>,
     /// The test driver's stick, when the test-driver feature is running.
     pub stick: Option<Stick>,
 }
@@ -61,13 +63,25 @@ pub struct Toggles {
     pub bsd: bool,
     pub rcta: bool,
     pub park: bool,
+    pub lka: bool,
+    /// Junction AEB: braking for traffic crossing the path ahead.
+    pub junction: bool,
+    /// The driver monitor (D11, optional): hands on the wheel while the
+    /// autopilot steers.
+    pub driver_monitor: bool,
 }
 
 impl Default for Toggles {
     fn default() -> Self {
-        Self { bsd: true, rcta: true, park: true }
+        Self { bsd: true, rcta: true, park: true, lka: true, junction: true, driver_monitor: false }
     }
 }
+
+/// The driver monitor's timings (openpilot's hands-on-wheel policy): a
+/// reminder after this long without steering input, and a takeover request
+/// (D11's escalation) after the second (s).
+pub const HANDS_REMIND_AFTER: f32 = 15.0;
+pub const HANDS_TAKEOVER_AFTER: f32 = 25.0;
 
 /// What the surround features did in the last step (for the HUD and views).
 #[derive(Clone, Copy, Debug, Default)]
@@ -155,6 +169,10 @@ pub struct Core {
     /// demand (m/s²). Hosts differ a lot (sim 8, GTA about 80 at light
     /// braking); this is the D19 vehicle profile, learned rather than tuned.
     brake_gain: f32,
+    /// The brake gain loaded from a vehicle profile, if any, and the core's
+    /// brake demand smoothed (the learning waits for it to hold steady).
+    brake_profile: Option<f32>,
+    brake_smoothed: f32,
     prev_brake: f32,
     /// Recent (game time µs, speed), for impact detection.
     impact_window: std::collections::VecDeque<(u64, f32)>,
@@ -169,6 +187,8 @@ pub struct Core {
     avail: degrade::Availability,
     /// Track ids of the follow lead and the collision threat, last step (for views).
     lead_ids: (Option<u32>, Option<u32>),
+    /// The AEB threat this step is crossing traffic (junction AEB).
+    aeb_crossing: bool,
     driver: driver::DriverMonitor,
     /// A takeover request in progress: (seconds since it started, why).
     takeover: Option<(f32, degrade::Reason)>,
@@ -188,6 +208,24 @@ pub struct Core {
     park_fault: bool,
     surround_out: Surround,
     toggles: Toggles,
+    // --- Camera and lanes (Phase 3) ---
+    camera: Camera,
+    camera_last: Option<u64>,
+    /// The camera's lane lines, when a frame arrived this step.
+    cam_lines: Option<[LaneFit; 4]>,
+    lanes: ::features::Lanes,
+    lane_out: ::features::LaneOut,
+    /// Pedestrians, tracked from the camera's objects.
+    peds: Tracker,
+    since_cam: f32,
+    /// The lateral command was LKA's nudge this step.
+    lka_on: bool,
+    /// LKA nudges applied so far.
+    lka_count: u32,
+    /// The EPS applied a lane feature's request last step.
+    eps_steering: bool,
+    /// Seconds since the driver's hands were last felt on the wheel.
+    hands_off: f32,
 }
 
 /// Starting guess for the brake gain (m/s² per unit of brake demand); learned
@@ -197,18 +235,43 @@ const BRAKE_GAIN_INIT: f32 = 8.0;
 /// (m/s²): well inside the tyres' grip.
 const GAIN_LEARN_MAX_DECEL: f32 = 6.0;
 
+/// The brake gain's learning time constant (s), and how far a session may
+/// move it from a saved profile (a factor either way).
+const GAIN_LEARN_TAU: f32 = 2.0;
+const GAIN_PROFILE_BAND: f32 = 1.3;
+
+/// What the brake-gain learning needs to know about the moment.
+#[derive(Clone, Copy, Debug)]
+struct BrakeSample {
+    /// Last frame's brake demand from the core, and that demand smoothed.
+    demand: f32,
+    smoothed: f32,
+    speed: f32,
+    a_est: f32,
+    /// The driver is on a pedal: the deceleration isn't the core's alone.
+    driver_pedals: bool,
+}
+
 /// One step of on-line brake-gain learning from what last frame's brake
-/// demand achieved. Only in the brakes' linear range: when the demand asks
-/// for more than the tyres can give, grip sets the deceleration and the gain
-/// would be learned far too low.
-fn learn_brake_gain(gain: f32, prev_brake: f32, speed: f32, a_est: f32, dt: f32) -> f32 {
-    let linear = prev_brake * gain < GAIN_LEARN_MAX_DECEL;
-    if prev_brake >= 0.03 && linear && speed > 2.0 && a_est < -0.5 {
-        let g = (-a_est / prev_brake).clamp(3.0, 150.0);
-        gain + (g - gain) * (dt / 0.5).min(1.0)
-    } else {
-        gain
+/// demand achieved. Only when the deceleration is the core's demand's doing:
+/// in the brakes' linear range (when the demand asks for more than the tyres
+/// can give, grip sets the deceleration and the gain would be learned far
+/// too low), with the demand steady (the brakes lag it), and with the
+/// driver off the pedals (a manual GTA drive taught 85 and 110 with the
+/// driver braking over a small AEB demand). Within `GAIN_PROFILE_BAND` of
+/// the saved profile, when there is one.
+fn learn_brake_gain(gain: f32, b: BrakeSample, profile: Option<f32>, dt: f32) -> f32 {
+    let linear = b.demand * gain < GAIN_LEARN_MAX_DECEL;
+    let steady = (b.demand - b.smoothed).abs() <= 0.15 * b.demand;
+    if b.demand < 0.03 || !linear || !steady || b.driver_pedals || b.speed <= 2.0 || b.a_est >= -0.5 {
+        return gain;
     }
+    let (lo, hi) = match profile {
+        Some(p) => (p / GAIN_PROFILE_BAND, p * GAIN_PROFILE_BAND),
+        None => (3.0, 150.0),
+    };
+    let g = (-b.a_est / b.demand).clamp(lo, hi);
+    (gain + (g - gain) * (dt / GAIN_LEARN_TAU).min(1.0)).clamp(lo, hi)
 }
 
 /// Acceleration per unit of throttle demand (m/s²), the calibration's guess.
@@ -219,14 +282,11 @@ impl Core {
     /// that was already set before this core started doesn't engage it.
     pub fn new(feature: Feature, initial_request: bool) -> Self {
         // ACC may brake harder than the cruise default (up to 3.5 m/s²).
-        let speed_cfg = match feature {
-            Feature::Acc(_) => Config { decel_max: 3.5, ..Config::default() },
-            _ => Config::default(),
-        };
-        let acc_cfg = match &feature {
-            Feature::Acc(c) => *c,
-            _ => Default::default(),
-        };
+        let speed_cfg = if feature.longitudinal() { Config { decel_max: 3.5, ..Config::default() } } else { Config::default() };
+        let acc_cfg = feature.acc().unwrap_or_default();
+        // A production EPS for the features; the development test driver
+        // and speed profile keep Phase 0's wide limits.
+        let eps_limits = if feature.longitudinal() { actuators::EpsLimits::Tss2 } else { actuators::EpsLimits::Wide };
         Self {
             feature,
             speed: SpeedController::new(speed_cfg),
@@ -246,8 +306,10 @@ impl Core {
             a_est: 0.0,
             prev_speed: None,
             powertrain: actuators::Powertrain::new(),
-            eps: actuators::Eps::new(),
+            eps: actuators::Eps::with_limits(eps_limits),
             brake_gain: BRAKE_GAIN_INIT,
+            brake_profile: None,
+            brake_smoothed: 0.0,
             prev_brake: 0.0,
             impact_window: std::collections::VecDeque::new(),
             vehicle: vbus::Vehicle::new(can::Delivery::Reactive),
@@ -257,6 +319,7 @@ impl Core {
             scan_arrived: false,
             avail: degrade::evaluate(None, degrade::Health::default()),
             lead_ids: (None, None),
+            aeb_crossing: false,
             driver: driver::DriverMonitor::new(),
             takeover: None,
             corners: core::array::from_fn(|k| Radar::new(RadarConfig::corner(), layout::CORNERS[k])),
@@ -272,6 +335,51 @@ impl Core {
             park_fault: false,
             surround_out: Surround::default(),
             toggles: Toggles::default(),
+            camera: Camera::new(CameraConfig::default(), layout::FRONT_CAMERA),
+            camera_last: None,
+            cam_lines: None,
+            lanes: Default::default(),
+            lane_out: Default::default(),
+            peds: Tracker::new(TrackerConfig { confirm_hits: 2, max_misses: 4, pos_noise_m: 0.2, pos_noise_frac: 0.04, vel_noise: 0.4, ..Default::default() }),
+            since_cam: 0.0,
+            lka_on: false,
+            lka_count: 0,
+            eps_steering: false,
+            hands_off: 0.0,
+        }
+    }
+
+    /// What the lane features saw and did in the last step.
+    pub fn lane_out(&self) -> &::features::LaneOut {
+        &self.lane_out
+    }
+
+    /// Pedestrian tracks (camera).
+    pub fn pedestrians(&self) -> &[fusion::Track] {
+        self.peds.tracks()
+    }
+
+    /// The AEB threat in the last step was crossing traffic (junction AEB).
+    pub fn aeb_crossing(&self) -> bool {
+        self.aeb_crossing
+    }
+
+    /// LKA nudges applied so far.
+    /// Lane centering's learned steering response at speed `v` (m/s).
+    pub fn lane_steer_gain(&self, v: f32) -> f32 {
+        self.lanes.response.at(v)
+    }
+
+    pub fn lka_nudges(&self) -> u32 {
+        self.lka_count
+    }
+
+    /// The wheelbase: the host's, else 60 % of the box length (m).
+    fn wheelbase(&self) -> f32 {
+        match self.info {
+            Some(i) if i.wheelbase.is_finite() && i.wheelbase > 1.0 => i.wheelbase,
+            Some(i) => (0.6 * (i.box_max[0] - i.box_min[0])).clamp(2.0, 4.0),
+            None => 2.7,
         }
     }
 
@@ -339,6 +447,7 @@ impl Core {
         // Give the radars their first scans' worth of grace from here.
         self.radar_last = None;
         self.corner_last = [None; 4];
+        self.camera_last = None;
         self.layout = layout::default_layout(info.box_min, info.box_max);
         let flags = self.fans.flags;
         self.fans = if info.capabilities & caps::RANGE_FANS != 0 { layout::default_fans(info.box_min, info.box_max) } else { FanLayout::default() };
@@ -369,10 +478,23 @@ impl Core {
         self.brake_gain
     }
 
-    /// Starts from a known brake gain (a vehicle profile, D19).
+    /// Starts from a known brake gain (a vehicle profile, D19); the session
+    /// then learns within a band around it, or around the profile's fixed
+    /// reference ([`Self::set_brake_reference`]).
     pub fn set_brake_gain(&mut self, g: f32) {
         if g.is_finite() && (3.0..=150.0).contains(&g) {
             self.brake_gain = g;
+            self.brake_profile = Some(g);
+        }
+    }
+
+    /// Centres the learning band on a fixed reference (the profile's
+    /// `brake_gain_ref`), not on the last saved gain. Otherwise each save
+    /// moves the band, and the gain can creep 1.3× a session (issue #21).
+    pub fn set_brake_reference(&mut self, r: f32) {
+        if r.is_finite() && (3.0..=150.0).contains(&r) {
+            self.brake_profile = Some(r);
+            self.brake_gain = self.brake_gain.clamp(r / GAIN_PROFILE_BAND, r * GAIN_PROFILE_BAND);
         }
     }
 
@@ -411,10 +533,30 @@ impl Core {
         // --- The buses and perception (always) ---
         // From here on the core works on the car as the ADAS ECU sees it on
         // the bus, not on the host's exact values.
-        let (follow, threat, bus_speed, bus_yaw, park_cycle) = self.perceive(host, inp.actors, inp.ranges, dt, paused);
+        let (follow, threat, bus_speed, bus_yaw, park_cycle) = self.perceive(host, inp.actors, inp.ranges, inp.lanes, dt, paused);
         let reverse = self.vehicle.ego.reverse;
+        // Pedestrians the camera sees in the path (Phase 3): AEB takes the
+        // nearer of the two threats.
+        let ped = match self.info {
+            Some(i) if !reverse => select_pedestrian(self.peds.tracks(), bus_speed, i.box_max[0], 0.5 * (i.box_max[1] - i.box_min[1])),
+            _ => None,
+        };
         // Going backwards, nothing ahead is a collision threat.
-        let threat = threat.filter(|_| !reverse);
+        let threat = match (threat.filter(|_| !reverse), ped) {
+            (Some(a), Some(b)) => Some(if b.gap < a.gap { b } else { a }),
+            (a, b) => a.or(b),
+        };
+        // Traffic crossing the path ahead (junction AEB), from the front
+        // corner radars: AEB takes it if it comes sooner than the threat ahead.
+        let k = if bus_speed > 1.0 { bus_yaw / bus_speed } else { 0.0 };
+        let cross = if self.toggles.junction && !reverse && self.info.is_some() {
+            ::features::select_crossing(&::features::JunctionConfig::default(), &self.ego(), k, self.surround.tracks()).map(|(l, _)| l)
+        } else {
+            None
+        };
+        let ttc = |l: &Option<fusion::Lead>| l.map_or(f32::INFINITY, |l| ::features::aeb::ttc(&l, bus_speed));
+        self.aeb_crossing = cross.is_some() && ttc(&cross) < ttc(&threat);
+        let threat = if self.aeb_crossing { cross } else { threat };
         self.lead_ids = (follow.map(|l| l.id), threat.map(|l| l.id));
         let mut view = *host;
         view.speed = bus_speed;
@@ -443,6 +585,9 @@ impl Core {
             if let Some(c) = &park_cycle {
                 self.park_fault = c.iter().any(|d| d.is_nan());
             }
+            if self.cam_lines.is_some() || (self.camera_last.is_none() && self.info.is_some()) {
+                self.camera_last = Some(frame);
+            }
         }
         let age = |last: Option<u64>| last.map_or(u64::MAX, |l| frame.saturating_sub(l));
         self.avail = degrade::evaluate(
@@ -454,16 +599,55 @@ impl Core {
                 park_running: self.fans_on.is_some_and(|n| n > PARK_GRACE_FRAMES),
                 park_age: age(self.park_last),
                 park_fault: self.park_fault,
+                camera_age: age(self.camera_last),
             },
         );
         self.radar.ignore_los = self.avail.los_degraded;
         for r in &mut self.corners {
             r.ignore_los = self.avail.los_degraded;
         }
+        self.camera.ignore_los = self.avail.los_degraded;
+
+        // --- Lanes (camera): lane centering, LKA, curve speed ---
+        if !paused && dt > 0.0 {
+            let ego = self.ego();
+            // The steering response, from the bus: wheel angle, yaw rate, speed.
+            let e = self.vehicle.ego;
+            if !e.reverse && self.eps_steering {
+                self.lanes.learn(dt, e.steer_angle, e.yaw_rate, e.speed, self.wheelbase());
+            }
+            // Lane centering steers while engaged, takeover requests included.
+            let centering = self.state != State::Off && matches!(self.feature, Feature::Autopilot(_));
+            self.lane_out = if self.avail.lanes.is_ok() {
+                self.lanes.step(dt, self.cam_lines.as_ref(), &ego, self.wheelbase(), centering, drv.steering)
+            } else {
+                ::features::LaneOut { curve_speed: f32::INFINITY, ..Default::default() }
+            };
+        }
+        // The driver monitor: a light touch on the wheel counts as hands on
+        // (a production car feels the torque; we see the input).
+        let steering_engaged = self.state != State::Off && matches!(self.feature, Feature::Autopilot(_));
+        if !self.toggles.driver_monitor || !steering_engaged || host.driver_steer.abs() > 0.02 {
+            self.hands_off = 0.0;
+        } else if !paused {
+            self.hands_off += dt;
+        }
+        let attentive = if self.hands_off >= HANDS_TAKEOVER_AFTER { Err(degrade::Reason::NoAttention) } else { Ok(()) };
+        let lanes_ok = self.avail.lanes.and(attentive).and(match self.lane_out.issue {
+            Some(::features::LaneIssue::NoLanes) => Err(degrade::Reason::NoLanes),
+            Some(::features::LaneIssue::LaneEnds) => Err(degrade::Reason::LaneEnds),
+            Some(::features::LaneIssue::NotInLane) => Err(degrade::Reason::NotInLane),
+            None => Ok(()),
+        });
         let feature_ok = match self.feature {
-            Feature::Acc(_) => {
+            Feature::Acc(_) | Feature::Autopilot(_) => {
                 let too_slow = !self.avail.stop_and_go && s.speed < degrade::ACC_MIN_SPEED;
-                self.avail.acc.and(if too_slow { Err(degrade::Reason::NoHold) } else { Ok(()) }).and(if reverse { Err(degrade::Reason::Reversing) } else { Ok(()) })
+                let acc = self
+                    .avail
+                    .acc
+                    .and(if too_slow { Err(degrade::Reason::NoHold) } else { Ok(()) })
+                    .and(if reverse { Err(degrade::Reason::Reversing) } else { Ok(()) });
+                if matches!(self.feature, Feature::Autopilot(_)) { acc.and(lanes_ok) } else { acc }
             }
             Feature::SpeedProfile(_) => self.avail.drive,
             Feature::TestDriver(_) => self.avail.drive.and(self.avail.steer),
@@ -477,7 +661,15 @@ impl Core {
                 self.a_est += (a - self.a_est) * (dt / 0.08).min(1.0);
             }
             self.prev_speed = Some(s.speed);
-            self.brake_gain = learn_brake_gain(self.brake_gain, self.prev_brake, s.speed, self.a_est, dt);
+            self.brake_smoothed += (self.prev_brake - self.brake_smoothed) * (dt / 0.3).min(1.0);
+            let b = BrakeSample {
+                demand: self.prev_brake,
+                smoothed: self.brake_smoothed,
+                speed: s.speed,
+                a_est: self.a_est,
+                driver_pedals: s.driver_brake > 0.02 || s.driver_throttle > 0.02,
+            };
+            self.brake_gain = learn_brake_gain(self.brake_gain, b, self.brake_profile, dt);
         }
 
         // An impact cancels everything, as a crash signal does on a real car.
@@ -554,7 +746,7 @@ impl Core {
                 self.speed.reset(s.speed);
                 self.t_engaged = 0.0;
                 self.feature_state = FeatureState::default();
-                if matches!(self.feature, Feature::Acc(_)) {
+                if self.feature.longitudinal() {
                     self.acc.engage(s.speed);
                 }
                 event = Event::Engaged;
@@ -565,7 +757,7 @@ impl Core {
         } else if !request {
             self.state = State::Off;
             event = Event::Disengaged;
-        } else if aeb_braking && matches!(self.feature, Feature::Acc(_)) {
+        } else if aeb_braking && self.feature.longitudinal() {
             self.state = State::Off;
             event = Event::CancelledByAeb;
         } else {
@@ -579,7 +771,7 @@ impl Core {
         let stopping = takeover_t.is_some_and(|t| t >= TAKEOVER_STOP_AFTER);
 
         // Buttons work while ACC is engaged (not during a takeover request).
-        if self.state != State::Off && takeover_t.is_none() && matches!(self.feature, Feature::Acc(_)) {
+        if self.state != State::Off && takeover_t.is_none() && self.feature.longitudinal() {
             if s.buttons & buttons::SPEED_UP != 0 {
                 self.acc.speed_up();
             }
@@ -608,7 +800,16 @@ impl Core {
                     &mut self.feature_state,
                     &mut self.speed,
                     &self.acc,
-                    features::Ctx { sample: s, actors: inp.actors, stick: inp.stick, dt, t: self.t_engaged, follow },
+                    features::Ctx {
+                        sample: s,
+                        actors: inp.actors,
+                        stick: inp.stick,
+                        dt,
+                        t: self.t_engaged,
+                        follow,
+                        curve_speed: if self.avail.lanes.is_ok() { self.lane_out.curve_speed } else { f32::INFINITY },
+                        lane_angle: self.lane_out.angle,
+                    },
                 );
                 if self.state == State::Override {
                     // The driver's foot wins. Restart the reference from the
@@ -628,10 +829,25 @@ impl Core {
                 cmd.diag = out.diag;
             }
         }
+        // During a takeover request the autopilot keeps steering while it
+        // still sees the lane, until the driver answers (as openpilot's soft
+        // disable keeps control): letting go hands-off would be worse.
+        if takeover_t.is_some()
+            && !paused
+            && matches!(self.feature, Feature::Autopilot(_))
+            && let Some(a) = self.lane_out.angle
+        {
+            cmd.flags |= command_flags::STEER;
+            cmd.steer_angle = a;
+        }
         // The driver steering pauses lateral control (D11).
         if drv.steering {
             cmd.flags &= !command_flags::STEER;
         }
+        // LKA's nudge, when nothing else steers.
+        let nudge = self.lane_out.nudge.filter(|_| {
+            cmd.flags & command_flags::STEER == 0 && !drv.steering && !paused && self.toggles.lka && self.avail.lanes.is_ok() && !reverse
+        });
 
         // --- Arbitration: AEB wins (in the brake ECU) ---
         let gains = actuators::Gains { throttle: THROTTLE_GAIN, brake: self.brake_gain };
@@ -642,6 +858,10 @@ impl Core {
             req.hold = cmd.flags & command_flags::HOLD != 0;
             req.steer_request = cmd.flags & command_flags::STEER != 0;
             req.steer_angle = cmd.steer_angle;
+        }
+        if let Some(a) = nudge {
+            req.steer_request = true;
+            req.steer_angle = a;
         }
         if let Some(t) = takeover_t.filter(|_| stopping) {
             // The controlled stop: a steady deceleration, ramped in to limit
@@ -687,11 +907,20 @@ impl Core {
             if hold {
                 cmd.flags |= command_flags::HOLD;
             }
-            if let Some(a) = self.eps.step(&steer_rx, self.vehicle.ego.steer_angle, dt) {
+            if let Some(a) = self.eps.step(&steer_rx, self.vehicle.ego.steer_angle, dt, self.vehicle.ego.speed) {
                 cmd.flags |= command_flags::STEER;
                 cmd.steer_angle = a;
+                if nudge.is_some() && cmd.flags & command_flags::ENGAGED == 0 {
+                    cmd.flags |= command_flags::LKA;
+                }
             }
         }
+        let lka_now = nudge.is_some() && cmd.flags & command_flags::STEER != 0;
+        if lka_now && !self.lka_on {
+            self.lka_count += 1;
+        }
+        self.lka_on = lka_now;
+        self.eps_steering = cmd.flags & command_flags::STEER != 0 && (lka_now || matches!(self.feature, Feature::Autopilot(_)));
 
         if stopping {
             cmd.flags |= command_flags::HAZARDS;
@@ -701,8 +930,26 @@ impl Core {
         self.prev_brake = if cmd.flags & (command_flags::ENGAGED | command_flags::AEB) != 0 && !paused { cmd.brake } else { 0.0 };
 
         // --- HUD ---
-        let acc_on = self.state != State::Off && takeover_t.is_none() && matches!(self.feature, Feature::Acc(_));
+        let acc_on = self.state != State::Off && takeover_t.is_none() && self.feature.longitudinal();
         let mut f = 0;
+        if acc_on && matches!(self.feature, Feature::Autopilot(_)) && cmd.flags & command_flags::STEER != 0 {
+            f |= hud_flags::LANE_CENTERING;
+        }
+        if acc_on && matches!(self.feature, Feature::Autopilot(_)) && drv.steering {
+            f |= hud_flags::STEER_OVERRIDE;
+        }
+        if self.lane_out.left_seen {
+            f |= hud_flags::LANE_LEFT;
+        }
+        if self.lane_out.right_seen {
+            f |= hud_flags::LANE_RIGHT;
+        }
+        if self.lka_on {
+            f |= hud_flags::LKA;
+        }
+        if self.hands_off >= HANDS_REMIND_AFTER {
+            f |= hud_flags::HANDS_ON;
+        }
         if acc_on {
             f |= hud_flags::ACC;
         }
@@ -758,6 +1005,17 @@ impl Core {
             surround: self.surround_flags(),
             park_tone: if sur.park.active { sur.park.tone } else { 0.0 },
             park: if sur.park.active { sur.park.dist } else { [f32::NAN; 12] },
+            lanes: {
+                let line = |f: Option<sensors::LaneFit>| f.map_or([0.0; 5], |f| [f.c[0], f.c[1], f.c[2], f.c[3], f.range]);
+                let p = self.lane_out.path;
+                [line(p.and_then(|p| p.left)), line(p.and_then(|p| p.right))]
+            },
+            heading: heading_arc(self.vehicle.ego.speed, self.vehicle.ego.yaw_rate, self.vehicle.ego.reverse),
+            plan: match self.lane_out.path {
+                Some(p) if f & hud_flags::LANE_CENTERING != 0 => [p.c[0], p.c[1], p.c[2], p.c[3], p.range],
+                _ => [0.0; 5],
+            },
+            _reserved: 0.0,
         };
         (cmd, event)
     }
@@ -832,12 +1090,14 @@ impl Core {
         s: &VehicleSample,
         actors: &ActorList,
         ranges: Option<&RangeReport>,
+        lanes: Option<&LaneMap>,
         dt: f32,
         paused: bool,
     ) -> (Option<Lead>, Option<Lead>, f32, f32, Option<[f32; 12]>) {
         let have_bus = self.vehicle.ego.frames > 0;
         let held = |v: &vbus::Vehicle| if have_bus { (v.ego.speed, v.ego.yaw_rate) } else { (s.speed, s.yaw_rate) };
         self.scan_arrived = false;
+        self.cam_lines = None;
         if paused || dt <= 0.0 {
             let (v, w) = held(&self.vehicle);
             return (None, None, v, w, None);
@@ -858,8 +1118,14 @@ impl Core {
         }
         // The park ECU, while the parking sensors run.
         let park = if have_info && self.fans_on.is_some() { self.ultrasonics.step(dt, &self.fans, ranges, frame) } else { None };
+        // The camera ECU (its lanes only where the host gives markings).
+        let map = lanes.filter(|_| self.info.is_some_and(|i| i.capabilities & caps::MAP != 0));
+        let cam = match (have_info, mounts.get(layout::FRONT_CAMERA)) {
+            (true, Some(m)) => self.camera.step(dt, m, actors, map, frame),
+            _ => None,
+        };
         let t = s.header.game_time_us as f64 / 1e6;
-        let out = vbus::SensorOut { front: scan.as_ref(), corners: [corner[0].as_ref(), corner[1].as_ref(), corner[2].as_ref(), corner[3].as_ref()], park: park.as_ref() };
+        let out = vbus::SensorOut { front: scan.as_ref(), corners: [corner[0].as_ref(), corner[1].as_ref(), corner[2].as_ref(), corner[3].as_ref()], park: park.as_ref(), camera: cam.as_ref() };
         let arrived = self.vehicle.step_all(t, frame, s, &out);
         self.scan_arrived = arrived.front.is_some();
         let (v, w) = (self.vehicle.ego.speed, self.vehicle.ego.yaw_rate);
@@ -873,6 +1139,25 @@ impl Core {
             self.since_scan = 0.0;
         }
         self.surround.predict(dt, vx, w);
+        // Pedestrians from the camera.
+        self.peds.predict(dt, vx, w);
+        self.since_cam += dt;
+        if let Some(c) = &arrived.camera {
+            self.cam_lines = Some(c.lanes);
+            // Radar–camera fusion: the vehicles the camera sees confirm the
+            // radar's tracks there (ACC then stops for a stopped car).
+            for o in c.objects.iter().filter(|o| matches!(o.class, camera::class::CAR | camera::class::TRUCK)) {
+                self.tracker.confirm_vehicle(o.x, o.y, o.vx, o.vy);
+            }
+            let objects = c
+                .objects
+                .iter()
+                .filter(|o| o.class == camera::class::PEDESTRIAN)
+                .map(|o| RadarObject { id: o.id, x: o.x, y: o.y, vx: o.vx, vy: o.vy, width: o.width, half_length: 0.25, stationary: false, clutter: false })
+                .collect();
+            self.peds.update(&RadarScan { scan: c.frame, objects }, self.since_cam);
+            self.since_cam = 0.0;
+        }
         for (k, sc) in arrived.corners.iter().enumerate() {
             if let Some(sc) = sc {
                 self.corner_last[k] = Some(frame);
@@ -881,9 +1166,22 @@ impl Core {
         }
         let front = info.box_max[0];
         let tracks = self.tracker.tracks();
+        // In the lane the camera sees, when the car is in it and it was
+        // seen just now (radar–camera fusion, Phase 3); else along the path
+        // the yaw rate predicts. AEB also brakes for anything in the car's
+        // own body path, so a lane it is halfway out of hides nothing.
+        let corridor = self.lane_out.path.filter(|_| self.lane_out.corridor);
+        let (follow, collision) = match corridor {
+            Some(p) => {
+                let half = (0.5 * p.width).clamp(1.5, 3.0);
+                let body = select_in_body_path(tracks, v, w, front, 0.5 * (info.box_max[1] - info.box_min[1]));
+                (select_lead_in_lane(tracks, v, &p.c, front, half, LeadKind::Follow), nearer(select_lead_in_lane(tracks, v, &p.c, front, half, LeadKind::Collision), body))
+            }
+            None => (select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Follow), select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Collision)),
+        };
         (
-            select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Follow),
-            select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Collision),
+            follow,
+            collision,
             v,
             w,
             arrived.park.map(|p| p.dist),
@@ -900,8 +1198,42 @@ impl Core {
     }
 }
 
+
+/// How far ahead the heading arc is drawn (s of travel).
+pub const HEADING_HORIZON: f32 = 3.0;
+
+/// The arc the car traces at constant speed and yaw rate (the HUD's
+/// `heading`): its curvature along the direction of travel and how far
+/// along it to draw, at most half a circle. Reversing, the length is
+/// negative: the arc runs behind the car.
+pub fn heading_arc(speed: f32, yaw_rate: f32, reverse: bool) -> [f32; 2] {
+    if !(speed > 1.0) || !yaw_rate.is_finite() {
+        return [0.0; 2];
+    }
+    let k = yaw_rate / speed * if reverse { -1.0 } else { 1.0 };
+    let mut len = (speed * HEADING_HORIZON).clamp(5.0, 120.0);
+    if k.abs() > 1e-6 {
+        len = len.min(std::f32::consts::PI / k.abs());
+    }
+    [k, if reverse { -len } else { len }]
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heading_arc_follows_the_turn() {
+        // 20 m/s at 0.2 rad/s: a 100 m radius to the left, drawn 60 m along.
+        let a = super::heading_arc(20.0, 0.2, false);
+        assert!((a[0] - 0.01).abs() < 1e-6 && (a[1] - 60.0).abs() < 1e-3, "{a:?}");
+        // A tight turn (4 m/s on a 2 m radius): half a circle, not 12 m.
+        assert!((super::heading_arc(4.0, 2.0, false)[1] - 2.0 * std::f32::consts::PI).abs() < 1e-3);
+        // Stopped: nothing to draw. Reversing: behind the car, and turning
+        // the wheel left swings the tail the same way as the arc's sign says.
+        assert_eq!(super::heading_arc(0.5, 0.1, false)[1], 0.0);
+        let r = super::heading_arc(3.0, 0.3, true);
+        assert!(r[1] < 0.0 && r[0] < 0.0, "{r:?}");
+    }
+
     use super::*;
     use adapter_api::Header;
 
@@ -929,7 +1261,7 @@ mod tests {
     fn step(core: &mut Core, seq: u32, flags: u32, speed: f32) -> (Command, Event) {
         let s = sample(seq, flags, speed);
         let a = ActorList::default();
-        core.step(Inputs { sample: &s, actors: &a, ranges: None, stick: None })
+        core.step(Inputs { sample: &s, actors: &a, ranges: None, lanes: None, stick: None })
     }
 
     #[test]
@@ -983,19 +1315,75 @@ mod tests {
         assert_eq!(run(), run());
     }
 
+    fn brake(demand: f32, a_est: f32) -> BrakeSample {
+        BrakeSample { demand, smoothed: demand, speed: 15.0, a_est, driver_pedals: false }
+    }
+
     #[test]
     fn the_brake_gain_is_learned_only_inside_grip() {
         // Brakes give 40 m/s² per unit: 0.1 of brake measures 4 m/s².
         let mut g = 8.0;
-        for _ in 0..200 {
-            g = learn_brake_gain(g, 0.1, 15.0, -4.0, 1.0 / 72.0);
+        for _ in 0..1000 {
+            g = learn_brake_gain(g, brake(0.1, -4.0), None, 1.0 / 72.0);
         }
         assert!((g - 40.0).abs() < 1.0, "learned {g}");
         // Full braking measures the tyres' 9 m/s², not the brakes: no change.
         for _ in 0..200 {
-            g = learn_brake_gain(g, 1.0, 15.0, -9.0, 1.0 / 72.0);
+            g = learn_brake_gain(g, brake(1.0, -9.0), None, 1.0 / 72.0);
         }
         assert!((g - 40.0).abs() < 1.0, "full braking taught {g}");
+    }
+
+    /// Issue #21: sessions that each push the gain to the edge of the band
+    /// don't walk it away from the reference.
+    #[test]
+    fn the_brake_band_stays_on_the_reference_across_sessions() {
+        let reference = 43.0;
+        let mut saved = reference;
+        for _ in 0..4 {
+            let mut core = Core::new(Feature::Acc(Default::default()), false);
+            core.set_brake_gain(saved);
+            core.set_brake_reference(reference);
+            // A session the guards miss: it reads as twice the gain.
+            let mut g = core.brake_gain();
+            for _ in 0..5000 {
+                g = learn_brake_gain(g, brake(0.05, -0.05 * 2.0 * g), core.brake_profile, 1.0 / 72.0);
+            }
+            assert!(g > saved - 0.01, "the session didn't learn upward");
+            saved = g;
+        }
+        assert!(saved <= reference * GAIN_PROFILE_BAND + 0.01, "crept to {saved} from {reference}");
+        // A profile already past the band is pulled back into it on load.
+        let mut core = Core::new(Feature::Acc(Default::default()), false);
+        core.set_brake_gain(85.0);
+        core.set_brake_reference(reference);
+        assert!((core.brake_gain() - reference * GAIN_PROFILE_BAND).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_brake_gain_is_not_taught_by_the_driver_or_a_ramp() {
+        // The driver brakes hard over a small demand: 0.05 "gives" 8 m/s².
+        let mut g = 43.0;
+        for _ in 0..500 {
+            g = learn_brake_gain(g, BrakeSample { driver_pedals: true, ..brake(0.05, -8.0) }, None, 1.0 / 72.0);
+        }
+        assert_eq!(g, 43.0, "the driver's braking taught {g}");
+        // The demand ramping up (the brakes lag it): not steady, no change.
+        for _ in 0..500 {
+            g = learn_brake_gain(g, BrakeSample { smoothed: 0.05, ..brake(0.1, -1.0) }, None, 1.0 / 72.0);
+        }
+        assert_eq!(g, 43.0, "a ramp taught {g}");
+    }
+
+    #[test]
+    fn a_session_stays_near_the_saved_profile() {
+        // Something the guards miss says 110: with a profile of 43, the
+        // session goes no further than 43 × 1.3.
+        let mut g = 43.0;
+        for _ in 0..5000 {
+            g = learn_brake_gain(g, brake(0.05, -5.5), Some(43.0), 1.0 / 72.0);
+        }
+        assert!((g - 43.0 * GAIN_PROFILE_BAND).abs() < 0.01, "{g}");
     }
 
     #[test]
@@ -1088,7 +1476,7 @@ mod tests {
         assert!(core.takeover().is_some());
         let mut s = sample(seq, sample_flags::ENGAGE_REQUEST, 20.0);
         s.driver_throttle = 0.3;
-        let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, stick: None });
+        let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, lanes: None, stick: None });
         assert_eq!(e, Event::TakenOver);
         assert_eq!(c.flags & command_flags::HAZARDS, 0);
         assert_eq!(core.state(), State::Off);
@@ -1102,7 +1490,7 @@ mod tests {
         let mut steered = |seq: u32, driver_steer: f32| {
             let mut s = sample(seq, sample_flags::ENGAGE_REQUEST, 5.0);
             s.driver_steer = driver_steer;
-            let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, stick });
+            let (c, e) = core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, lanes: None, stick });
             (c.flags & command_flags::STEER != 0, e)
         };
         let mut seq = 1;
@@ -1147,7 +1535,7 @@ mod tests {
         let set0 = core.hud().set_speed;
         let mut s = sample(2, sample_flags::ENGAGE_REQUEST, 20.0);
         s.buttons = buttons::SPEED_UP;
-        core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, stick: None });
+        core.step(Inputs { sample: &s, actors: &ActorList::default(), ranges: None, lanes: None, stick: None });
         assert!((core.hud().set_speed - set0 - 5.0 / 3.6).abs() < 1e-4);
     }
 }

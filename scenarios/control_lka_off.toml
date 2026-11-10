@@ -1,0 +1,15 @@
+# Control run for lka_drift: with LKA switched off the drifting car leaves
+# its lane, which shows that scenario needs LKA.
+name = "Control: LKA off, a drifting car leaves its lane"
+feature = "none"
+duration = 30.0
+disabled = ["lka"]
+
+[ego]
+speed_kph = 100
+hands = "off"
+heading_deg = 0.6
+
+[pass]
+min_departures = 1
+max_aeb = 0

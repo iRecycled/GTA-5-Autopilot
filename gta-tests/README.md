@@ -54,6 +54,7 @@ stop_gap_max = 15.0
 | `signal left\|right\|off` | the turn signal |
 | `overtake left\|right DIST KPH` | a car DIST m behind in the next lane, driving straight at KPH (a fixed profile, no AI driver) |
 | `cross left\|right DIST KPH` | a car from 25 m to that side, crossing DIST m behind the rear bumper at KPH |
+| `pullout left\|right DIST KPH` | a car from 15 m to that side, crossing the path DIST m ahead of the front bumper at KPH (junction AEB) |
 | `obstacle behind\|ahead GAP` | a van parked broadside, its near side GAP m from the bumper |
 | `fault adas\|chassis drop\|crc\|delay SECS` | a bus fault, as the engineering panel injects it |
 | `sleep SECS` | wait a fixed time |
@@ -68,7 +69,11 @@ stop_gap_max = 15.0
 - `events` / `no_events`: text that must or must not appear in the core's events;
 - `max_gap_error_s`: the largest time-gap error `check_gap` may measure;
 - `min_rcta`, `max_rcta`, `min_park`, `max_park`: limits on RCTA and park assist brake activations;
-- `min_room`: the ground-truth room at the end from the bumper (rear when reversing) to the nearest actor in the car's path (m).
+- `min_room`: the ground-truth room at the end from the bumper (rear when reversing) to the nearest actor in the car's path (m);
+- `max_lane_rms`, `min_centering`, `max_takeovers`: lane centering's RMS offset from the lane centre while it steers (m), the share of the engaged time it steered, and the number of takeover requests;
+- `min_engaged`: the share of the run, from the first engagement to the end, that the system stayed engaged. A drop-out fails it, such as the adapter releasing a core that stopped answering.
+
+`resume_after_aeb = true` (next to `name`): after an AEB stop, the test's driver waits out the hold, re-engages and restores the set speed, as a real driver would. Long drives in traffic then go on past a genuine AEB event, which is still counted (`max_aeb`) and listed in the log for review.
 
 The core reports the surround features as events: "BSD: vehicle in the left blind spot", "BSD warning: signalling left into an occupied lane", "RCTA: cross traffic from the right", "RCTA braking", "park assist braking".
 

@@ -89,13 +89,27 @@ fn replay(path: &Path, csv: Option<&PathBuf>, candump: Option<&PathBuf>, out_t: 
         }
         if let Some(p) = &f.profile {
             core.set_brake_gain(p.brake_gain);
+            if p.brake_reference > 0.0 {
+                core.set_brake_reference(p.brake_reference);
+            }
         }
         for fault in &f.faults {
             telem::apply_fault(&mut core, fault).map_err(|e| format!("{}: step {i}: {e}", path.display()))?;
             events.push(format!("fault at frame {}: {fault:?}", f.sample.header.frame));
         }
         let stick = f.stick.map(|s| Stick { throttle: s.throttle, brake: s.brake, steer: s.steer });
-        let (c, event) = core.step(Inputs { sample: &f.sample, actors: &f.actors, ranges: f.ranges.as_ref(), stick });
+        let (c, event) = core.step(Inputs { sample: &f.sample, actors: &f.actors, ranges: f.ranges.as_ref(), lanes: f.lanes.as_deref(), stick });
+        if std::env::var_os("REPLAY_LANES").is_some() && i % 72 == 0 {
+            // The lane map the host gave, and what the camera and lane centering made of it.
+            let map: Vec<String> = f
+                .lanes
+                .as_deref()
+                .map(|m| m.as_slice().iter().map(|l| format!("k{} n{} y0 {:+.1}", l.kind, l.count, l.as_slice().iter().find(|p| p[0] >= 0.0).map_or(f32::NAN, |p| p[1]))).collect())
+                .unwrap_or_default();
+            let lo = core.lane_out();
+            let path = lo.path.map(|p| format!("c0 {:+.2} w {:.1} L {} R {}", p.c[0], p.width, p.left.is_some(), p.right.is_some())).unwrap_or("none".into());
+            println!("step {i}: map [{}] | lanes {path} issue {:?} angle {:?} | avail {:?}", map.join(", "), lo.issue, lo.angle, core.availability().lanes);
+        }
         if let Some(tx) = out_t.tx.as_mut() {
             if let Some(speed) = out_t.pace {
                 let due = (f.sample.header.game_time_us.saturating_sub(game0)) as f64 / 1e6 / speed.max(0.01);

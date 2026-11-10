@@ -1,0 +1,27 @@
+# ACC stops behind a car that is already stopped (waiting at a stop sign),
+# never seen moving. A radar alone can't tell it from a sign or a bridge,
+# so radar-only ACC ignores it and AEB catches it late (a manual GTA drive,
+# 2026-11-09). The camera confirms it is a vehicle: ACC brakes smoothly to
+# a stop behind it, and AEB never has to.
+name = "ACC: stops behind a car waiting at a stop sign"
+feature = "acc"
+duration = 45.0
+
+[ego]
+speed_kph = 50
+engage_at = 0.5
+set_kph = 50
+
+[[actor]]
+s = 150
+speed_kph = 0
+
+[repeat]
+count = 5
+vary_s = 30
+
+[pass]
+max_aeb = 0
+min_stop_gap = 2.0
+max_stop_gap = 12.0
+end_speed_below = 0.1

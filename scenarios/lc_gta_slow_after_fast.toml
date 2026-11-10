@@ -1,0 +1,27 @@
+# Lane centering on a GTA-like car (its steering fades with speed, and its
+# yaw lags the wheels): 40 s at 110 km/h on gentle bends, then the driver
+# sets 35 km/h. A manual GTA drive (2026-11-09) weaved out of its lane
+# here: the steering gain it had learned at speed (about 0.3) was still in
+# use at 35 km/h, where the car turns about 0.75 of the model, so it
+# steered three times too hard.
+name = "Lane centering: slowing to 35 km/h after the highway, on a GTA-like car"
+feature = "autopilot"
+duration = 90.0
+vehicle = "gta"
+
+[road]
+pieces = [[300, 0], [250, 900], [300, 0], [250, -900]]
+repeat_pieces = 20
+
+[ego]
+speed_kph = 110
+engage_at = 0.5
+set_kph = 110
+[[ego.set]]
+t = 40
+kph = 35
+
+[pass]
+max_lane_rms = 0.3
+max_departures = 0
+max_takeovers = 0

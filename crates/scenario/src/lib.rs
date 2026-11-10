@@ -20,7 +20,7 @@ use std::path::Path;
 use adapter_api::{ActorList, Command, buttons, command_flags, hud_flags, sample_flags, surround_flags};
 use adas_core::{Core, Event as CoreEvent, Feature, Inputs};
 use serde::Deserialize;
-use sim::{ActorSpec, EgoParams, Event, Obstacle, Road, Traffic, TrafficLane, World};
+use sim::{ActorSpec, DriverSteer, EgoParams, Event, Obstacle, Road, Traffic, TrafficLane, World};
 
 #[derive(Debug, Deserialize)]
 pub struct Scenario {
@@ -30,6 +30,9 @@ pub struct Scenario {
     pub duration: f32,
     #[serde(default = "default_fps")]
     pub fps: f32,
+    /// The ego car's dynamics: "default" (the kinematic bicycle) or "gta"
+    /// (steers like a GTA car: understeer growing with speed, yaw lag).
+    pub vehicle: Option<String>,
     #[serde(default)]
     pub road: RoadSpec,
     pub ego: EgoSpec,
@@ -42,10 +45,13 @@ pub struct Scenario {
     #[serde(default)]
     pub obstacle: Vec<ObstacleToml>,
     pub traffic: Option<TrafficToml>,
-    /// Surround features switched off ("bsd", "rcta", "park"): control runs
-    /// that show a scenario needs the feature.
+    /// Features switched off ("bsd", "rcta", "park", "lka", "junction"): control
+    /// runs that show a scenario needs the feature.
     #[serde(default)]
     pub disabled: Vec<String>,
+    /// Optional features switched on ("driver_monitor").
+    #[serde(default)]
+    pub enabled: Vec<String>,
     pub pass: Pass,
 }
 
@@ -91,6 +97,13 @@ pub struct SignalToml {
     pub side: String,
 }
 
+/// A set-speed change: from `t` (s) the driver sets `kph`.
+#[derive(Debug, Deserialize)]
+pub struct SetToml {
+    pub t: f32,
+    pub kph: f32,
+}
+
 /// A bus fault for the whole run or a window of it.
 #[derive(Debug, Deserialize)]
 pub struct FaultToml {
@@ -118,6 +131,63 @@ pub struct RoadSpec {
     /// Straight length before a left bend (m); omit for a straight road.
     pub straight: Option<f32>,
     pub radius: Option<f32>,
+    /// Instead: pieces of [length m, radius m] (radius positive left,
+    /// negative right, 0 = straight); the last one continues.
+    #[serde(default)]
+    pub pieces: Vec<[f32; 2]>,
+    /// Repeat `pieces` this many times (a loop of bends).
+    pub repeat_pieces: Option<u32>,
+    /// A lane that ends: lane `lane` (−1 = right) ends at `s`, its outer
+    /// line sweeping across it over `taper` m before that.
+    pub lane_end: Option<LaneEndToml>,
+    pub speed_limit_kph: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LaneEndToml {
+    pub lane: f32,
+    pub s: f32,
+    #[serde(default = "default_taper")]
+    pub taper: f32,
+}
+
+fn default_taper() -> f32 {
+    120.0
+}
+
+impl RoadSpec {
+    pub fn build(&self) -> Road {
+        let mut road = if !self.pieces.is_empty() {
+            let one: Vec<(f32, f32)> = self.pieces.iter().map(|[len, r]| (*len, if *r == 0.0 { 0.0 } else { 1.0 / r })).collect();
+            let mut all = Vec::new();
+            for _ in 0..self.repeat_pieces.unwrap_or(1).max(1) {
+                all.extend_from_slice(&one);
+            }
+            all.push((f32::INFINITY, 0.0));
+            Road::new(all, 3.6)
+        } else {
+            Road::bend(self.straight.unwrap_or(f32::INFINITY), self.radius.unwrap_or(f32::INFINITY))
+        };
+        if let Some(e) = &self.lane_end {
+            // Lane `lane`'s outer line sweeps across it; the line between it
+            // and the lane it merges into ends.
+            let w = road.lane_width;
+            let side = e.lane.signum();
+            let outer = (e.lane.abs() + 0.5) * side * w;
+            let inner = (e.lane.abs() - 0.5) * side * w;
+            for m in &mut road.markings {
+                if (m.d - outer).abs() < 0.01 {
+                    m.shift = Some((e.s - e.taper, e.s, inner));
+                } else if (m.d - inner).abs() < 0.01 {
+                    m.to = e.s;
+                }
+            }
+        }
+        if let Some(v) = self.speed_limit_kph {
+            road.speed_limit = v / 3.6;
+        }
+        road
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +198,9 @@ pub struct EgoSpec {
     pub engage_at: f32,
     /// Set speed after engaging (km/h); the runner presses the buttons.
     pub set_kph: Option<f32>,
+    /// Later set-speed changes (`[[ego.set]]`).
+    #[serde(default)]
+    pub set: Vec<SetToml>,
     /// Time gap index (0 = 1.0 s … 3 = 2.5 s); default 2 (2.0 s).
     pub gap_index: Option<usize>,
     /// "reverse": the driver reverses at `speed_kph`.
@@ -135,6 +208,20 @@ pub struct EgoSpec {
     /// Turn signal changes.
     #[serde(default)]
     pub signal: Vec<SignalToml>,
+    /// The lane the car starts in (0 = the reference lane, −1 = right).
+    #[serde(default)]
+    pub lane: f32,
+    /// Start offset from that lane's centre (m, left +) and heading (deg).
+    #[serde(default)]
+    pub offset: f32,
+    #[serde(default)]
+    pub heading_deg: f32,
+    /// With nothing engaged: the driver drifts with the wheel held still
+    /// ("off"), instead of keeping the car exactly on its line.
+    pub hands: Option<String>,
+    /// The driver answers a takeover request after this long (s); never if
+    /// omitted. Answering: steering, then driving on in the lane that goes on.
+    pub takeover_reaction: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +236,9 @@ pub struct ActorToml {
     /// Drive in a fixed direction relative to the road (deg; 90 = across it,
     /// toward the left) instead of along it.
     pub heading: Option<f32>,
+    /// A pedestrian (0.5 m by 0.5 m unless sized).
+    #[serde(default)]
+    pub pedestrian: bool,
     pub speed_kph: f32,
     #[serde(default = "default_len")]
     pub length: f32,
@@ -222,6 +312,24 @@ pub struct Pass {
     /// No feature may be reported unavailable.
     #[serde(default)]
     pub stays_available: bool,
+    /// Lane centering: RMS and peak of the lane-centre error while it
+    /// steers (m), lane departures (a wheel over a line while it steers),
+    /// takeover requests, the share of time after engaging it steered, and
+    /// the peak lateral acceleration (m/s²).
+    pub max_lane_rms: Option<f32>,
+    pub max_lane_error: Option<f32>,
+    pub max_departures: Option<u32>,
+    pub min_departures: Option<u32>,
+    pub max_takeovers: Option<u32>,
+    pub min_takeovers: Option<u32>,
+    pub max_takeovers_per_10km: Option<f32>,
+    pub min_centering: Option<f32>,
+    pub max_lat_accel: Option<f32>,
+    /// LKA nudges.
+    pub min_lka: Option<u32>,
+    pub max_lka: Option<u32>,
+    /// A takeover request must come at least this long before the lane ends (s).
+    pub takeover_before_end: Option<f32>,
     /// BSD must report every vehicle that is truly in this side's zone for a
     /// second or more ("left" / "right"): lit within 0.5 s, and lit for at
     /// least 80 % of the rest of the time it is there.
@@ -275,6 +383,17 @@ pub struct Report {
     pub park: u32,
     /// Room left to the nearest obstacle in the direction of travel (m).
     pub clearance: f32,
+    /// Lane centering (see `Pass`).
+    pub lane_rms: f32,
+    pub lane_max: f32,
+    pub departures: u32,
+    pub takeovers: u32,
+    pub km: f32,
+    pub centering: f32,
+    pub max_lat_accel: f32,
+    pub lka: u32,
+    /// Seconds from the first takeover request to the lane's end.
+    pub takeover_lead: f32,
     pub failures: Vec<String>,
 }
 
@@ -295,11 +414,7 @@ fn kph(v: f32) -> f32 {
 
 /// Runs one repetition.
 pub fn run(sc: &Scenario, run: u32) -> Report {
-    let road = Road {
-        straight: sc.road.straight.unwrap_or(f32::INFINITY),
-        radius: sc.road.radius.unwrap_or(f32::INFINITY),
-        lane_width: 3.6,
-    };
+    let road = sc.road.build();
     let frac = if sc.repeat.count > 1 { run as f32 / (sc.repeat.count - 1) as f32 - 0.5 } else { 0.0 };
     let spread = sc.repeat.vary_s * frac;
     let spread_d = sc.repeat.vary_d * frac;
@@ -326,10 +441,21 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
                 width: a.width,
                 events,
                 heading: a.heading.map(f32::to_radians),
+                kind: if a.pedestrian { adapter_api::ActorKind::Pedestrian } else { adapter_api::ActorKind::Vehicle },
             }
         })
         .collect();
-    let mut world = World::new(road, EgoParams::default(), kph(sc.ego.speed_kph), actors, sc.fps);
+    let params = match sc.vehicle.as_deref() {
+        None | Some("default") => EgoParams::default(),
+        Some("gta") => EgoParams::gta(),
+        Some(other) => panic!("{}: unknown vehicle {other:?} (default, gta)", sc.name),
+    };
+    let mut world = World::new(road.clone(), params, kph(sc.ego.speed_kph), actors, sc.fps);
+    world.d = sc.ego.lane * road.lane_width + sc.ego.offset;
+    world.psi = sc.ego.heading_deg.to_radians();
+    if sc.ego.hands.as_deref() == Some("off") {
+        world.driver = DriverSteer::Off;
+    }
     let reverse = sc.ego.gear.as_deref() == Some("reverse");
     world.reverse = reverse;
     for (i, o) in sc.obstacle.iter().enumerate() {
@@ -361,9 +487,11 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
     signals.sort_by(|a, b| a.0.total_cmp(&b.0));
     let feature = match sc.feature.as_str() {
         "acc" => Feature::Acc(Default::default()),
+        "autopilot" => Feature::Autopilot(Default::default()),
         _ => Feature::speed_profile(), // never engaged in "none" scenarios
     };
-    let acc = sc.feature == "acc";
+    let autopilot = sc.feature == "autopilot";
+    let acc = sc.feature == "acc" || autopilot;
     let mut core = Core::new(feature, false);
     core.set_info(&world.info());
     let mut toggles = adas_core::Toggles::default();
@@ -372,7 +500,15 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
             "bsd" => toggles.bsd = false,
             "rcta" => toggles.rcta = false,
             "park" => toggles.park = false,
-            other => panic!("{}: unknown feature {other:?} in `disabled` (bsd, rcta, park)", sc.name),
+            "lka" => toggles.lka = false,
+            "junction" => toggles.junction = false,
+            other => panic!("{}: unknown feature {other:?} in `disabled` (bsd, rcta, park, lka, junction)", sc.name),
+        }
+    }
+    for e in &sc.enabled {
+        match e.as_str() {
+            "driver_monitor" => toggles.driver_monitor = true,
+            other => panic!("{}: unknown feature {other:?} in `enabled` (driver_monitor)", sc.name),
         }
     }
     core.set_toggles(toggles);
@@ -400,12 +536,33 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
     let mut bsd = BsdScore::default();
     let (mut rcta_warned, mut rcta_braked) = (false, false);
     let info = world.info();
+    // Lane centering's metrics, and the driver's answer to a takeover.
+    let (mut err_sq, mut err_n, mut steering_frames, mut engaged_frames) = (0f64, 0u64, 0u64, 0u64);
+    let mut departed = false;
+    let mut takeover_seen: Option<f32> = None;
+    let mut taken_over: Option<f32> = None;
+    let lane_end_s = sc.road.lane_end.as_ref().map(|e| e.s);
+    let mut first_takeover_s: Option<f32> = None;
     for _ in 0..frames {
         world.turn = signals.iter().rev().find(|(t, _)| *t <= world.t).map_or(0, |s| s.1);
-        let engage = acc && world.t >= sc.ego.engage_at;
+        let engage = acc && world.t >= sc.ego.engage_at && taken_over.is_none();
+        // Who steers when the core doesn't: hands off while the autopilot is
+        // engaged; the driver after taking over.
+        if autopilot {
+            world.driver = if taken_over.is_some() {
+                DriverSteer::Hands(continuing_lane(&world))
+            } else if core.state() != adas_core::State::Off {
+                DriverSteer::Off
+            } else if sc.ego.hands.as_deref() == Some("off") {
+                DriverSteer::Off
+            } else {
+                DriverSteer::Perfect
+            };
+        }
         let mut btn = 0;
         if engage && core.hud().flags & hud_flags::ACC != 0 {
-            if let Some(t) = set_target {
+            let later = sc.ego.set.iter().rev().find(|c| c.t <= world.t).map(|c| kph(c.kph));
+            if let Some(t) = later.or(set_target) {
                 let s = core.hud().set_speed;
                 if s < t - 0.1 {
                     btn |= buttons::SPEED_UP;
@@ -423,12 +580,42 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
         // The simulated driver holds the cruise speed while nothing is engaged
         // and doesn't react to the hazard; as in Euro NCAP's AEB tests, it
         // releases the accelerator once AEB intervenes.
-        let driver_throttle = if acc || aeb_seen { 0.0 } else { (0.3 * (cruise - world.v) + 0.05).clamp(0.0, 0.6) };
+        let driver_throttle = if (acc && taken_over.is_none()) || aeb_seen { 0.0 } else { (0.3 * (cruise - world.v) + 0.05).clamp(0.0, 0.6) };
         s.driver_throttle = driver_throttle;
+        // Answering a takeover request: the driver steers (an analogue input
+        // past the core's threshold) for 0.4 s, then drives on.
+        if core.hud().flags & hud_flags::TAKEOVER != 0 && takeover_seen.is_none() {
+            takeover_seen = Some(world.t);
+            first_takeover_s.get_or_insert(world.s);
+        }
+        if let (Some(seen), Some(react)) = (takeover_seen, sc.ego.takeover_reaction)
+            && taken_over.is_none()
+            && world.t - seen >= react
+        {
+            taken_over = Some(world.t);
+        }
+        if let Some(t0) = taken_over {
+            // The driver's hands are on the wheel: their steering shows on
+            // the input, and a lane change is signalled.
+            s.driver_steer = if world.t - t0 < 0.4 { 0.4 } else { (world.steer / 0.05).clamp(-1.0, 1.0) };
+            s.flags |= sample_flags::INPUT_ANALOG;
+            let target = continuing_lane(&world);
+            if (target - world.d).abs() > 1.0 {
+                world.turn = if target > world.d { 1 } else { -1 };
+                s.flags &= !(sample_flags::TURN_LEFT | sample_flags::TURN_RIGHT);
+                s.flags |= if target > world.d { sample_flags::TURN_LEFT } else { sample_flags::TURN_RIGHT };
+            }
+        }
         let a = world.actors(core.layout());
         let fans = *core.fans();
         let ranges = (fans.flags & adapter_api::fan_flags::ACTIVE != 0).then(|| world.ranges(&fans));
-        let (cmd, ev) = core.step(Inputs { sample: &s, actors: &a, ranges: ranges.as_ref(), stick: None });
+        let lane_map = world.lane_map();
+        let (cmd, ev) = core.step(Inputs { sample: &s, actors: &a, ranges: ranges.as_ref(), lanes: Some(&lane_map), stick: None });
+        if core.hud().flags & hud_flags::TAKEOVER == 0 {
+            takeover_seen = None;
+        } else if takeover_seen == Some(world.t) {
+            rep.takeovers += 1;
+        }
         let sf = core.hud().surround;
         bsd.frame(&sc.pass, &a, world.v, &info, sf, 1.0 / sc.fps);
         if std::env::var_os("BSD_TRACE").is_some() && world.frame.is_multiple_of(9) {
@@ -469,10 +656,47 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
         let applied = if cmd.flags & (command_flags::ENGAGED | command_flags::AEB) != 0 {
             cmd
         } else {
-            Command { flags: command_flags::ENGAGED, throttle: driver_throttle, ..Default::default() }
+            // The driver's pedals; LKA's nudge still steers.
+            Command { flags: command_flags::ENGAGED | (cmd.flags & command_flags::STEER), throttle: driver_throttle, steer_angle: cmd.steer_angle, ..Default::default() }
         };
         world.step(&applied);
 
+        // Lane metrics (ground truth), while lane centering steers.
+        let centering = cmd.flags & command_flags::ENGAGED != 0 && cmd.flags & command_flags::STEER != 0 && autopilot;
+        if autopilot && core.state() != adas_core::State::Off {
+            engaged_frames += 1;
+        }
+        if centering {
+            steering_frames += 1;
+            if let Some((off, _)) = world.lane_offset() {
+                err_sq += (off as f64).powi(2);
+                err_n += 1;
+                rep.lane_max = rep.lane_max.max(off.abs());
+            }
+        }
+        // Departures: a wheel over a line, while lane centering steers, or
+        // at any time without the autopilot (LKA, or nothing).
+        if centering || !autopilot {
+            let over = world.lane_offset().is_none_or(|(off, width)| off.abs() + 0.5 * world.ego_params.width > 0.5 * width);
+            if over && !departed && !world.reverse && world.v > 1.0 {
+                rep.departures += 1;
+            }
+            departed = over;
+        } else {
+            departed = false;
+        }
+        let lat = world.v * world.v * world.steer.tan() / world.ego_params.wheelbase;
+        if world.core_steering || world.driver != DriverSteer::Perfect {
+            rep.max_lat_accel = rep.max_lat_accel.max(lat.abs());
+        }
+
+        if std::env::var_os("SCENARIO_TRACE_LAT").is_some() && run == 0 && world.frame.is_multiple_of(18) {
+            let (off, width) = world.lane_offset().unwrap_or((f32::NAN, f32::NAN));
+            println!(
+                "LAT t {:6.2} v {:5.2} | lane off {:+.2} w {:.2} | psi {:+.4} steer {:+.4} kappa {:+.5} road k {:+.5} | gain {:.2} (truth {:.2}) | cmd {:+.4} flags {:#06x}",
+                world.t, world.v, off, width, world.psi, world.steer, world.kappa, world.road.curvature(world.s), core.lane_steer_gain(world.v), world.ego_params.steer_response(world.v), cmd.steer_angle, cmd.flags
+            );
+        }
         if trace && (world.frame.is_multiple_of(7) || aeb_on) && world.frame.is_multiple_of(2) {
             let (g, lv) = world.gap_ahead().unwrap_or((f32::NAN, f32::NAN));
             println!(
@@ -519,6 +743,14 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
     (rep.bsd_truth, rep.bsd_detected, rep.bsd_latency, rep.bsd_false, rep.bsd_warned) = (bsd.truth, bsd.detected, bsd.latency, bsd.false_alerts, bsd.warned);
     (rep.rcta, rep.park) = core.surround_activations();
     rep.clearance = world.clearance(reverse);
+    rep.lane_rms = if err_n > 0 { (err_sq / err_n as f64).sqrt() as f32 } else { 0.0 };
+    rep.km = world.s / 1000.0;
+    rep.centering = if engaged_frames > 0 { steering_frames as f32 / engaged_frames as f32 } else { 0.0 };
+    rep.lka = core.lka_nudges();
+    rep.takeover_lead = match (first_takeover_s, lane_end_s) {
+        (Some(s), Some(end)) => (end - s) / kph(sc.ego.speed_kph).max(1.0),
+        _ => 0.0,
+    };
 
     let p = &sc.pass;
     let mut fail = |m: String| rep.failures.push(m);
@@ -577,6 +809,66 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
     }
     if p.stays_available && !rep.unavailable.is_empty() {
         fail(format!("reported unavailable: {:?}", rep.unavailable));
+    }
+    if let Some(m) = p.max_lane_rms
+        && rep.lane_rms > m
+    {
+        fail(format!("lane-centre error {:.3} m RMS > {m}", rep.lane_rms));
+    }
+    if let Some(m) = p.max_lane_error
+        && rep.lane_max > m
+    {
+        fail(format!("lane-centre error peaked at {:.2} m > {m}", rep.lane_max));
+    }
+    if let Some(m) = p.max_departures
+        && rep.departures > m
+    {
+        fail(format!("{} lane departures > {m}", rep.departures));
+    }
+    if let Some(m) = p.min_departures
+        && rep.departures < m
+    {
+        fail(format!("{} lane departures < {m}", rep.departures));
+    }
+    if let Some(m) = p.max_takeovers
+        && rep.takeovers > m
+    {
+        fail(format!("{} takeover requests > {m}", rep.takeovers));
+    }
+    if let Some(m) = p.min_takeovers
+        && rep.takeovers < m
+    {
+        fail(format!("{} takeover requests < {m}", rep.takeovers));
+    }
+    if let Some(m) = p.max_takeovers_per_10km
+        && rep.takeovers as f32 * 10.0 / rep.km.max(0.1) > m
+    {
+        fail(format!("{} takeover requests in {:.1} km (> {m} per 10 km)", rep.takeovers, rep.km));
+    }
+    if let Some(m) = p.min_centering
+        && rep.centering < m
+    {
+        fail(format!("lane centering steered {:.0} % of the engaged time (< {:.0} %)", 100.0 * rep.centering, 100.0 * m));
+    }
+    if let Some(m) = p.max_lat_accel
+        && rep.max_lat_accel > m
+    {
+        fail(format!("lateral acceleration {:.2} > {m} m/s²", rep.max_lat_accel));
+    }
+    if let Some(m) = p.min_lka
+        && rep.lka < m
+    {
+        fail(format!("{} LKA nudges < {m}", rep.lka));
+    }
+    if let Some(m) = p.max_lka
+        && rep.lka > m
+    {
+        fail(format!("{} LKA nudges > {m}", rep.lka));
+    }
+    if let Some(m) = p.takeover_before_end
+        && rep.takeover_lead < m
+    {
+        fail(format!("takeover requested {:.1} s before the lane ends (< {m})", rep.takeover_lead));
     }
     let side = |s: &str| match s {
         "left" => 0,
@@ -652,6 +944,15 @@ struct BsdScore {
     latency: f32,
     false_alerts: u32,
     warned: [bool; 2],
+}
+
+/// The centre of the lane the driver means to drive in 60 m ahead: the one
+/// nearest the car among those that go on.
+fn continuing_lane(w: &World) -> f32 {
+    let s = w.s + 60.0;
+    let mut lines: Vec<f32> = w.road.markings.iter().filter_map(|m| m.d_at(s)).collect();
+    lines.sort_by(f32::total_cmp);
+    lines.windows(2).map(|p| 0.5 * (p[0] + p[1])).min_by(|a, b| (a - w.d).abs().total_cmp(&(b - w.d).abs())).unwrap_or(w.d)
 }
 
 /// A spell of truth: start time, frames, lit frames after the first 0.5 s,

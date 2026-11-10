@@ -1,0 +1,16 @@
+# Lane keeping (LKA): nothing engaged, the driver's hands are off and the car
+# drifts toward the left line (0.6 deg off the lane's heading at 100 km/h).
+# LKA nudges it back each time, and it never leaves the lane.
+name = "LKA: a drifting car is nudged back"
+feature = "none"
+duration = 30.0
+
+[ego]
+speed_kph = 100
+hands = "off"
+heading_deg = 0.6
+
+[pass]
+min_lka = 1
+max_departures = 0
+max_aeb = 0

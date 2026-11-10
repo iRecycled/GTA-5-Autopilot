@@ -91,12 +91,28 @@ pub struct Track {
     /// Over-ground acceleration estimate along x (m/s², low-pass).
     pub ax: f32,
     prev_vx: f32,
-    /// The camera has seen a vehicle here (radar–camera fusion): a stopped
-    /// one is then a car to stop behind, not a sign or a bridge.
-    pub camera_vehicle: bool,
+    /// Camera frames in a row that saw a vehicle here, moving as this track
+    /// moves (radar–camera fusion), and the time since the last (s).
+    camera_hits: u32,
+    since_camera: f32,
 }
 
+/// Camera frames that must agree before a track counts as a vehicle.
+const CAMERA_CONFIRM: u32 = 2;
+/// A camera confirmation counts this long (s) without being renewed.
+const CAMERA_HOLD: f32 = 1.0;
+/// The most a camera vehicle's velocity may differ from the track's (m/s,
+/// each axis): the camera's velocity noise (0.4 m/s) with room to spare.
+const CAMERA_VEL_GATE: f32 = 2.0;
+
 impl Track {
+    /// The camera sees a vehicle here (radar–camera fusion): a stopped one
+    /// is then a car to stop behind, not a sign or a bridge. It must have
+    /// agreed for a couple of frames, and lapses a second after the camera
+    /// stops confirming it.
+    pub fn camera_vehicle(&self) -> bool {
+        self.camera_hits >= CAMERA_CONFIRM && self.since_camera <= CAMERA_HOLD
+    }
     pub fn x(&self) -> f32 {
         self.x.p
     }
@@ -129,19 +145,22 @@ impl Tracker {
         &self.tracks
     }
 
-    /// Radar–camera fusion: marks the confirmed track nearest a vehicle the
-    /// camera reports at (`x`, `y`) as one, within the camera's range error
-    /// (1.5 m plus 8 % of the range along, 1.5 m across). Sticks for the
-    /// track's life.
-    pub fn confirm_vehicle(&mut self, x: f32, y: f32) {
+    /// Radar–camera fusion: one camera frame's vehicle at (`x`, `y`), moving
+    /// at (`vx`, `vy`) over ground, confirms the nearest confirmed track
+    /// within the camera's range error (1.5 m plus 8 % of the range along,
+    /// 1.5 m across) that moves as it does. A car passing a stationary
+    /// return doesn't make that return a car. See [`Track::camera_vehicle`].
+    pub fn confirm_vehicle(&mut self, x: f32, y: f32, vx: f32, vy: f32) {
         let gate_x = 1.5 + 0.08 * x.abs();
         if let Some(t) = self
             .tracks
             .iter_mut()
             .filter(|t| t.confirmed && (t.x() - x).abs() <= gate_x + t.half_length && (t.y() - y).abs() <= 1.5)
+            .filter(|t| (t.vx() - vx).abs() <= CAMERA_VEL_GATE && (t.vy() - vy).abs() <= CAMERA_VEL_GATE)
             .min_by(|a, b| (a.x() - x).hypot(a.y() - y).total_cmp(&(b.x() - x).hypot(b.y() - y)))
         {
-            t.camera_vehicle = true;
+            t.camera_hits = if t.since_camera <= CAMERA_HOLD { t.camera_hits.saturating_add(1) } else { 1 };
+            t.since_camera = 0.0;
         }
     }
 
@@ -158,6 +177,7 @@ impl Tracker {
         let q = self.cfg.accel_noise.powi(2);
         let (s, c) = (-yaw_rate * dt).sin_cos();
         for t in &mut self.tracks {
+            t.since_camera += dt;
             // Over-ground motion, then the ego frame's own translation.
             t.x.predict(dt, q);
             t.y.predict(dt, q);
@@ -211,7 +231,8 @@ impl Tracker {
                     ever_moving: o.vx.hypot(o.vy) > 2.0,
                     ax: 0.0,
                     prev_vx: o.vx,
-                    camera_vehicle: false,
+                    camera_hits: 0,
+                    since_camera: f32::INFINITY,
                 }),
             }
         }
@@ -253,17 +274,37 @@ pub enum LeadKind {
 /// Nearest confirmed track in the lane along the predicted path.
 pub fn select_lead(tracks: &[Track], ego_speed: f32, yaw_rate: f32, ego_front_x: f32, half_lane: f32, kind: LeadKind) -> Option<Lead> {
     let k = (yaw_rate / ego_speed.max(2.0)).clamp(-0.1, 0.1);
-    select_on(tracks, ego_speed, ego_front_x, half_lane, kind, |x| 0.5 * k * x * x)
+    select_on(tracks, ego_speed, ego_front_x, half_lane, kind, |_| true, |x| 0.5 * k * x * x)
 }
 
 /// As [`select_lead`], with the path given (Phase 3: the lane centre the
 /// camera sees, a cubic in the ego frame) instead of predicted from the yaw
 /// rate, and `half_lane` that lane's half width. Oncoming traffic (closing
-/// faster than 2 m/s over ground) is neither followed nor braked for, as in
-/// production AEB of this generation.
+/// faster than 2 m/s over ground) is left out: across a whole lane, in a
+/// bend, the oncoming lane's cars pass close to it. AEB pairs this with
+/// [`select_in_body_path`], which keeps them.
 pub fn select_lead_in_lane(tracks: &[Track], ego_speed: f32, lane: &[f32; 4], ego_front_x: f32, half_lane: f32, kind: LeadKind) -> Option<Lead> {
-    let oncoming: Vec<Track> = tracks.iter().filter(|t| t.vx() >= -2.0).cloned().collect();
-    select_on(&oncoming, ego_speed, ego_front_x, half_lane, kind, |x| lane[0] + x * (lane[1] + x * (lane[2] + x * lane[3])))
+    let not_oncoming = |t: &Track| t.vx() >= -2.0;
+    select_on(tracks, ego_speed, ego_front_x, half_lane, kind, not_oncoming, |x| lane[0] + x * (lane[1] + x * (lane[2] + x * lane[3])))
+}
+
+/// For AEB: the nearest confirmed track whose footprint overlaps the car's
+/// own along the path the yaw rate predicts, oncoming or not, whatever the
+/// lanes say. With lanes, AEB brakes for the nearer of this and the lane's
+/// collision lead, so neither a lane the car has left nor a lane it is
+/// halfway out of can hide what is straight ahead.
+pub fn select_in_body_path(tracks: &[Track], ego_speed: f32, yaw_rate: f32, ego_front_x: f32, ego_half_width: f32) -> Option<Lead> {
+    // `select_on` reaches half_lane + the track's half width − 0.3 m; the
+    // 0.3 m back makes it the footprints touching.
+    select_lead(tracks, ego_speed, yaw_rate, ego_front_x, ego_half_width + 0.3, LeadKind::Collision)
+}
+
+/// The nearer of two leads.
+pub fn nearer(a: Option<Lead>, b: Option<Lead>) -> Option<Lead> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.gap < a.gap { b } else { a }),
+        (a, b) => a.or(b),
+    }
 }
 
 /// A track crossing the path (≥ 2 m/s across it, at ≥ 30° to it: not a
@@ -281,12 +322,12 @@ fn clears_before_arrival(t: &Track, ego_speed: f32, gap: f32, offset: f32, reach
     later.abs() > reach && later * vy > 0.0
 }
 
-fn select_on(tracks: &[Track], ego_speed: f32, ego_front_x: f32, half_lane: f32, kind: LeadKind, path: impl Fn(f32) -> f32) -> Option<Lead> {
+fn select_on(tracks: &[Track], ego_speed: f32, ego_front_x: f32, half_lane: f32, kind: LeadKind, keep: impl Fn(&Track) -> bool, path: impl Fn(f32) -> f32) -> Option<Lead> {
     tracks
         .iter()
-        .filter(|t| t.confirmed && t.x() > ego_front_x - 0.5)
+        .filter(|t| t.confirmed && t.x() > ego_front_x - 0.5 && keep(t))
         .filter(|t| match kind {
-            LeadKind::Follow => !t.stationary() || t.ever_moving || t.camera_vehicle,
+            LeadKind::Follow => !t.stationary() || t.ever_moving || t.camera_vehicle(),
             LeadKind::Collision => true,
         })
         .filter_map(|t| {
@@ -414,6 +455,77 @@ mod tests {
         let k_yaw = 0.0048 * 20.0;
         let l = select_lead(t.tracks(), 20.0, k_yaw, 2.0, 1.8, LeadKind::Follow).unwrap();
         assert_eq!(l.id, 4);
+    }
+
+    fn tracked(objects: &[RadarObject]) -> Tracker {
+        let mut t = Tracker::new(TrackerConfig::default());
+        for i in 0..4 {
+            t.update(&RadarScan { scan: i, objects: objects.to_vec() }, 0.05);
+        }
+        t
+    }
+
+    /// Issue #20: a car passing a stationary return doesn't make it a car.
+    #[test]
+    fn camera_confirms_only_a_track_moving_as_the_vehicle_does() {
+        // A stationary return at 30 m, 1 m left; a car passing it at 15 m/s.
+        let mut t = tracked(&[obj(1, 30.0, 1.0, 0.0)]);
+        for _ in 0..5 {
+            t.confirm_vehicle(31.0, 0.0, 15.0, 0.0);
+        }
+        assert!(!t.tracks()[0].camera_vehicle(), "a moving camera car confirmed a stationary return");
+        // A stopped car the camera sees as stopped: confirmed after two frames, not one.
+        t.confirm_vehicle(30.5, 1.2, 0.2, 0.0);
+        assert!(!t.tracks()[0].camera_vehicle(), "confirmed by a single frame");
+        t.predict(1.0 / 30.0, 0.0, 0.0);
+        t.confirm_vehicle(30.5, 1.2, -0.1, 0.1);
+        assert!(t.tracks()[0].camera_vehicle());
+        let f = select_lead(t.tracks(), 0.0, 0.0, 2.0, 1.8, LeadKind::Follow).unwrap();
+        assert_eq!(f.id, 1);
+    }
+
+    /// Issue #20: the confirmation lapses once the camera stops seeing it.
+    #[test]
+    fn camera_confirmation_lapses() {
+        let mut t = tracked(&[obj(1, 30.0, 0.0, 0.0)]);
+        t.confirm_vehicle(30.0, 0.0, 0.0, 0.0);
+        t.predict(0.03, 0.0, 0.0);
+        t.confirm_vehicle(30.0, 0.0, 0.0, 0.0);
+        assert!(t.tracks()[0].camera_vehicle());
+        for _ in 0..40 {
+            t.predict(0.03, 0.0, 0.0);
+        }
+        assert!(!t.tracks()[0].camera_vehicle(), "still a vehicle 1.2 s after the camera last saw it");
+        assert!(select_lead(t.tracks(), 0.0, 0.0, 2.0, 1.8, LeadKind::Follow).is_none());
+        // One frame after the lapse doesn't restore it on its own.
+        t.confirm_vehicle(30.0, 0.0, 0.0, 0.0);
+        assert!(!t.tracks()[0].camera_vehicle());
+    }
+
+    /// Issues #18 and #19: with the lane off to one side (the car half out of
+    /// it), or a car coming the wrong way, AEB still sees what is straight
+    /// ahead of the car's body.
+    #[test]
+    fn body_path_catches_what_the_lane_misses() {
+        // Stopped object 1 m left of the car at 25 m; the lane's centre 2.9 m right.
+        let t = tracked(&[obj(1, 25.0, 1.0, 0.0)]);
+        let lane = [-2.9, 0.0, 0.0, 0.0];
+        assert!(select_lead_in_lane(t.tracks(), 15.0, &lane, 2.0, 2.5, LeadKind::Collision).is_none());
+        let b = select_in_body_path(t.tracks(), 15.0, 0.0, 2.0, 0.95).unwrap();
+        assert_eq!(b.id, 1);
+        assert_eq!(nearer(select_lead_in_lane(t.tracks(), 15.0, &lane, 2.0, 2.5, LeadKind::Collision), Some(b)).unwrap().id, 1);
+
+        // A car reversing at the ego car, dead ahead, in its own lane: not
+        // followed, but braked for.
+        let t = tracked(&[obj(2, 30.0, 0.0, -4.0)]);
+        let lane = [0.0; 4];
+        assert!(select_lead_in_lane(t.tracks(), 10.0, &lane, 2.0, 1.8, LeadKind::Follow).is_none());
+        assert_eq!(select_in_body_path(t.tracks(), 10.0, 0.0, 2.0, 0.95).unwrap().id, 2);
+
+        // Oncoming traffic in the next lane (3.5 m left) is in neither.
+        let t = tracked(&[obj(3, 30.0, 3.5, -15.0)]);
+        assert!(select_in_body_path(t.tracks(), 15.0, 0.0, 2.0, 0.95).is_none());
+        assert!(select_lead_in_lane(t.tracks(), 15.0, &lane, 2.0, 1.8, LeadKind::Collision).is_none());
     }
 
     #[test]

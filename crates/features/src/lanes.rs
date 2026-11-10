@@ -104,6 +104,9 @@ pub struct LaneConfig {
     pub curvature_rate: f32,
     pub curvature_scale_max: f32,
     pub curvature_min: f32,
+    /// The lane counts as a corridor for lead selection only if seen within
+    /// this long (s): about two missed camera frames, not the 0.5 s bridge.
+    pub corridor_fresh: f32,
 }
 
 impl Default for LaneConfig {
@@ -124,6 +127,7 @@ impl Default for LaneConfig {
             curvature_rate: 1.0,
             curvature_scale_max: 4.0,
             curvature_min: 2.5e-4,
+            corridor_fresh: 0.1,
         }
     }
 }
@@ -150,6 +154,10 @@ pub struct LaneOut {
     pub left_seen: bool,
     pub right_seen: bool,
     pub path: Option<LanePath>,
+    /// `path` may stand for where the car is going, when choosing what to
+    /// follow or brake for: the car is in that lane, and the camera saw it
+    /// just now (not a path held over missed or rejected frames).
+    pub corridor: bool,
 }
 
 /// Speed bands of the learned steering response (m/s): 0, 5, ... 55.
@@ -328,6 +336,7 @@ impl Lanes {
             self.correction = 0.0;
             return out;
         }
+        out.corridor = self.unseen <= c.corridor_fresh;
         let v = ego.speed;
         let k_max = lateral::max_curvature(&p.c, 0.0, p.range.min((4.0 * v).max(30.0)));
         if k_max > 1e-4 {
@@ -428,10 +437,14 @@ mod tests {
         let out = lanes.step(0.033, Some(&f), &ego(10.0), 2.7, true, false);
         assert_eq!(out.issue, Some(LaneIssue::NotInLane));
         assert!(out.angle.is_none() && out.nudge.is_none());
-        // Back inside it: steers again.
+        // Nor is it where the car is going (issue #18): leads come from the
+        // yaw-rate path instead.
+        assert!(out.path.is_some() && !out.corridor);
+        // Back inside it: steers again, and the lane is the corridor.
         let mut lanes = Lanes::default();
         let f = frame(Some(line(2.0, 0.0, 0.0)), Some(line(-3.0, 0.0, 0.0)));
-        assert!(lanes.step(0.033, Some(&f), &ego(10.0), 2.7, true, false).angle.is_some());
+        let out = lanes.step(0.033, Some(&f), &ego(10.0), 2.7, true, false);
+        assert!(out.angle.is_some() && out.corridor);
     }
 
     #[test]
@@ -445,7 +458,11 @@ mod tests {
         let out = lanes.step(0.033, Some(&next), &ego(10.0), 2.7, true, false);
         assert!(out.path.is_some_and(|p| p.c[0].abs() < 0.1), "{:?}", out.path);
         // If it stays, the lane is lost: no steering for 0.5 s ...
-        let lost = (0..20).filter(|_| lanes.step(0.033, Some(&next), &ego(10.0), 2.7, true, false).issue == Some(LaneIssue::NoLanes)).count();
+        // The held lane stops being the corridor within a few frames
+        // (issue #18), long before it is dropped.
+        let outs: Vec<LaneOut> = (0..20).map(|_| lanes.step(0.033, Some(&next), &ego(10.0), 2.7, true, false)).collect();
+        assert!(outs[2].path.is_some() && !outs[2].corridor, "a held lane still chose leads after 0.13 s");
+        let lost = outs.iter().filter(|o| o.issue == Some(LaneIssue::NoLanes)).count();
         assert!(lost >= 1, "never lost");
         // ... then the new lane is taken afresh.
         assert!(lanes.step(0.033, Some(&next), &ego(10.0), 2.7, true, false).path.is_some_and(|p| (p.c[0] - 5.0).abs() < 0.1));

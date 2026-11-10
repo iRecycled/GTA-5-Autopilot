@@ -30,7 +30,7 @@ use adapter_api::{
 };
 use control::{Config, SpeedController};
 use features::FeatureState;
-use fusion::{Lead, LeadKind, SurroundConfig, SurroundTracker, Tracker, TrackerConfig, select_lead, select_lead_in_lane, select_pedestrian};
+use fusion::{Lead, LeadKind, SurroundConfig, SurroundTracker, Tracker, TrackerConfig, nearer, select_in_body_path, select_lead, select_lead_in_lane, select_pedestrian};
 use sensors::{Camera, CameraConfig, FrontRadar, LaneFit, Radar, RadarConfig, RadarObject, RadarScan, UltrasonicConfig, Ultrasonics, camera};
 
 pub use features::{Feature, Stick};
@@ -1136,7 +1136,7 @@ impl Core {
             // Radar–camera fusion: the vehicles the camera sees confirm the
             // radar's tracks there (ACC then stops for a stopped car).
             for o in c.objects.iter().filter(|o| matches!(o.class, camera::class::CAR | camera::class::TRUCK)) {
-                self.tracker.confirm_vehicle(o.x, o.y);
+                self.tracker.confirm_vehicle(o.x, o.y, o.vx, o.vy);
             }
             let objects = c
                 .objects
@@ -1155,12 +1155,16 @@ impl Core {
         }
         let front = info.box_max[0];
         let tracks = self.tracker.tracks();
-        // In the lane the camera sees, when it sees one (radar–camera
-        // fusion, Phase 3); else along the path the yaw rate predicts.
-        let (follow, collision) = match self.lane_out.path {
+        // In the lane the camera sees, when the car is in it and it was
+        // seen just now (radar–camera fusion, Phase 3); else along the path
+        // the yaw rate predicts. AEB also brakes for anything in the car's
+        // own body path, so a lane it is halfway out of hides nothing.
+        let corridor = self.lane_out.path.filter(|_| self.lane_out.corridor);
+        let (follow, collision) = match corridor {
             Some(p) => {
                 let half = (0.5 * p.width).clamp(1.5, 3.0);
-                (select_lead_in_lane(tracks, v, &p.c, front, half, LeadKind::Follow), select_lead_in_lane(tracks, v, &p.c, front, half, LeadKind::Collision))
+                let body = select_in_body_path(tracks, v, w, front, 0.5 * (info.box_max[1] - info.box_min[1]));
+                (select_lead_in_lane(tracks, v, &p.c, front, half, LeadKind::Follow), nearer(select_lead_in_lane(tracks, v, &p.c, front, half, LeadKind::Collision), body))
             }
             None => (select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Follow), select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Collision)),
         };

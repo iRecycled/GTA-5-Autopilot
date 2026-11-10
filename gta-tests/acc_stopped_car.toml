@@ -1,0 +1,17 @@
+# ACC stops behind a car that is already stopped (as at a stop sign), never
+# seen moving: the camera confirms it is a vehicle, so ACC brakes smoothly
+# to a stop behind it, and AEB never has to (reported driving, 2026-11-09).
+name = "ACC: stops behind a stopped car"
+steps = [
+  "engage",
+  "set 50",
+  "wait speed>=48 25",
+  "stopped 100",
+  "wait stopped 25",
+  "sleep 2",
+]
+
+[pass]
+max_aeb = 0
+stop_gap_min = 2.0
+stop_gap_max = 15.0

@@ -91,6 +91,9 @@ pub struct Track {
     /// Over-ground acceleration estimate along x (m/s², low-pass).
     pub ax: f32,
     prev_vx: f32,
+    /// The camera has seen a vehicle here (radar–camera fusion): a stopped
+    /// one is then a car to stop behind, not a sign or a bridge.
+    pub camera_vehicle: bool,
 }
 
 impl Track {
@@ -124,6 +127,22 @@ impl Tracker {
 
     pub fn tracks(&self) -> &[Track] {
         &self.tracks
+    }
+
+    /// Radar–camera fusion: marks the confirmed track nearest a vehicle the
+    /// camera reports at (`x`, `y`) as one, within the camera's range error
+    /// (1.5 m plus 8 % of the range along, 1.5 m across). Sticks for the
+    /// track's life.
+    pub fn confirm_vehicle(&mut self, x: f32, y: f32) {
+        let gate_x = 1.5 + 0.08 * x.abs();
+        if let Some(t) = self
+            .tracks
+            .iter_mut()
+            .filter(|t| t.confirmed && (t.x() - x).abs() <= gate_x + t.half_length && (t.y() - y).abs() <= 1.5)
+            .min_by(|a, b| (a.x() - x).hypot(a.y() - y).total_cmp(&(b.x() - x).hypot(b.y() - y)))
+        {
+            t.camera_vehicle = true;
+        }
     }
 
     pub fn clear(&mut self) {
@@ -192,6 +211,7 @@ impl Tracker {
                     ever_moving: o.vx.hypot(o.vy) > 2.0,
                     ax: 0.0,
                     prev_vx: o.vx,
+                    camera_vehicle: false,
                 }),
             }
         }
@@ -223,7 +243,8 @@ pub struct Lead {
 /// What may be selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeadKind {
-    /// ACC: moving vehicles, and stopped ones that were seen moving.
+    /// ACC: moving vehicles, and stopped ones that were seen moving or that
+    /// the camera confirms are vehicles.
     Follow,
     /// AEB: anything confirmed in the path, including stationary objects.
     Collision,
@@ -265,7 +286,7 @@ fn select_on(tracks: &[Track], ego_speed: f32, ego_front_x: f32, half_lane: f32,
         .iter()
         .filter(|t| t.confirmed && t.x() > ego_front_x - 0.5)
         .filter(|t| match kind {
-            LeadKind::Follow => !t.stationary() || t.ever_moving,
+            LeadKind::Follow => !t.stationary() || t.ever_moving || t.camera_vehicle,
             LeadKind::Collision => true,
         })
         .filter_map(|t| {

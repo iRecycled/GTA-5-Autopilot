@@ -1132,6 +1132,11 @@ impl Core {
         self.since_cam += dt;
         if let Some(c) = &arrived.camera {
             self.cam_lines = Some(c.lanes);
+            // Radar–camera fusion: the vehicles the camera sees confirm the
+            // radar's tracks there (ACC then stops for a stopped car).
+            for o in c.objects.iter().filter(|o| matches!(o.class, camera::class::CAR | camera::class::TRUCK)) {
+                self.tracker.confirm_vehicle(o.x, o.y);
+            }
             let objects = c
                 .objects
                 .iter()

@@ -186,15 +186,23 @@ Goal: 360° awareness at short range, reusing Phase 1's sensor framework and tra
 
 Goal: the car steers itself within its lane, with a camera ECU that already behaves like a production one on the bus (D26).
 
-- [ ] Map capability in the GTA adapter: road network from path nodes; local lane map (lane count, widths, centerlines)
-- [ ] Camera ECU: objects, lanes and signs within its field of view, through a camera error model (worse range accuracy than radar, weather and night effects, misclassification); published on ADAS CAN FD
-- [ ] Radar–camera fusion in `fusion`; pedestrian AEB
-- [ ] Junction AEB: braking for traffic crossing the path ahead, from the front corner radars (added after a GTA traffic car pulled out into the gate drive)
-- [ ] Steering controller through the EPS model: pure pursuit first, then Stanley or MPC if pure pursuit can't hold the gate
-- [ ] Lane keeping (a nudge at the lane edge), then continuous lane centering
-- [ ] Curve speed: ACC slows ahead of bends from lane curvature
-- [ ] Optional driver-monitoring toggle (D11)
-- [ ] Scenarios: a long highway run, a tight bend, a lane that ends, a pedestrian stepping out
+- [x] Map capability in the GTA adapter: road network from path nodes; local lane map (lane count, widths, centerlines)
+- [x] Camera ECU: objects, lanes and the speed limit within its field of view, through a camera error model (worse range accuracy than radar, misclassification, a vertical field of view, objects only on the road); published on ADAS CAN FD. Not yet: weather and night effects, other signs
+- [x] Radar–camera fusion in `fusion`; pedestrian AEB
+- [x] Junction AEB: braking for traffic crossing the path ahead, from the front corner radars, ignoring cars braking to give way (added after a GTA traffic car pulled out into the gate drive)
+- [x] Steering controller through the EPS model: pure pursuit (it holds the gate's RMS so far: 0.18–0.20 m in GTA)
+- [x] Lane keeping (a nudge at the lane edge), then continuous lane centering
+- [x] Curve speed: ACC slows ahead of bends from lane curvature
+- [x] Optional driver-monitoring toggle (D11)
+- [x] Scenarios: a long highway run, a tight bend, a lane that ends, a pedestrian stepping out, junction pull-outs
+- [x] HUD path lines: where the car is heading (3 s) and the lane centre it steers along
+- [x] Start the core from the game (F2, or F10 with none running)
+
+**Open issues, found driving in GTA:**
+- [ ] Lane centering loses the road and doesn't get back to the lane centre (seen driving manually, 2026-11-09; recording `recordings/1794280513-autopilot.mcap`). Find whether the lane map, the camera's fit or the controller loses it, and make the car recover onto the lane centre
+- [ ] The learned brake gain ran away to 84.7 in that drive (from 43.3; the profile was reset by hand). Learn only from clean, sustained braking by the core, and bound each change
+- [ ] An impact at 31 km/h in that drive, just after blind-spot alerts on both sides (frame 70431): find out what hit what
+- [ ] Gate runs: GTA traffic stops the 5-minute Sandy Shores drive at junctions (genuine junction AEB stops, and a side-road truck parked with its nose in the lane). Run the gate on the highway loop it names, or on Sandy Shores once the issues above are fixed; pedestrian AEB 10 of 10 and false AEB per 30 min still to be measured in GTA
 
 **Gate:** lane-centre error ≤ 0.3 m RMS on a named highway loop; ≤ 1 takeover per 10 km; pedestrian AEB stops in 10 of 10 runs at 30 km/h; ≤ 1 false AEB activation per 30 min of driving in traffic (moved from Phase 1).
 
@@ -221,6 +229,8 @@ Goal: the car sees for itself. The camera ECU's eyes become a detector on real f
 - [ ] Auto-label exporter: frames plus boxes and masks from the stencil buffer and ground truth
 - [ ] `tools/train`: fine-tune lyuwenyu/RT-DETR or YOLOX (pick after a quick benchmark), export ONNX, build the TensorRT engine; version each model with its data
 - [ ] Camera ECU on vision: vehicles, pedestrians, lanes, signs and lights; the same output messages as Phase 3; Windows screen capture as the colour-only fallback (D3)
+- [ ] Camera objects with heading and length (3D boxes, as production cameras report them), on the bus: radars can't tell which way a stopped vehicle points, so a truck nosing out of a side road looks parked alongside the road
+- [ ] Animals as their own class (GTA counts birds as pedestrians; for now only the vertical view and the road-plane check keep them out)
 - [ ] Fusion of radar, camera and lidar tracks
 - [ ] Vision scoring against the ground-truth oracle in replay tests (D6)
 - [ ] Experiment: openpilot's lane model against map lanes; keep whichever scores better
@@ -233,6 +243,8 @@ Goal: point-to-point driving across the city, with the driver supervising.
 
 - [ ] Route planner on the road graph, with destination input from the map
 - [ ] Behavior planner as a state machine: follow lane, change lane, approach junction, stop, turn
+- [ ] Right of way at junctions: give way where the car's road must, rather than leaving it to junction AEB (Phase 3's AEB stops the car for crossing traffic, but the autopilot doesn't know who goes first)
+- [ ] Pass an obstruction: when a stopped vehicle sticks into the lane and shows no intent to move, shift within the lane, or over a dashed centre line when the oncoming lane is clear, at walking speed, then re-centre (needs the camera's 3D boxes from Phase 5)
 - [ ] Lane change assist on top of blind spot detection
 - [ ] Traffic lights and stop signs from the camera
 - [ ] Optional: openpilot as an alternative brain under WSL2 on the gaming PC (D13)

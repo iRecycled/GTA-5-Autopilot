@@ -28,6 +28,27 @@ pub fn in_vertical_view(a: &adapter_api::Actor, mount_z: f32, range: f32, half_v
     a.z + h >= mount_z - reach && a.z - h <= mount_z + reach
 }
 
+/// The actor stands on the road the car drives on, within a band that allows
+/// for hills (2.5 m, plus a 12 % grade to its range), not on a bridge or a
+/// wire above it: the bottom of its box against the ego car's reference
+/// point. A production camera places objects on the road plane, and a
+/// 2026-11-09 GTA run braked for someone 14.6 m up on a freeway bridge over
+/// the lane.
+pub fn on_the_road(a: &adapter_api::Actor, range: f32) -> bool {
+    let bottom = a.z - 0.5 * a.height.max(0.0);
+    bottom.abs() <= ROAD_BAND_M + ROAD_BAND_GRADE * range
+}
+
+/// [`on_the_road`]'s band: the fixed part (m) and the grade.
+pub const ROAD_BAND_M: f32 = 2.5;
+pub const ROAD_BAND_GRADE: f32 = 0.12;
+
+/// What the camera and radars can report: in their vertical view, and on
+/// the road.
+pub fn sees(a: &adapter_api::Actor, mount_z: f32, range: f32, half_vfov: f32) -> bool {
+    in_vertical_view(a, mount_z, range, half_vfov) && on_the_road(a, range)
+}
+
 /// A deterministic hash → uniform in [0, 1).
 pub fn unit(seed: u64, a: u64, b: u64, c: u64) -> f32 {
     let mut x = seed ^ a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ c.wrapping_mul(0x1656_67B1_9E37_79F9);
@@ -62,6 +83,17 @@ mod tests {
         // A tall truck right in front still is.
         let truck = adapter_api::Actor { z: 1.0, height: 4.0, ..ped(0.0) };
         assert!(in_vertical_view(&truck, 0.5, 2.0, 10f32.to_radians()));
+    }
+
+    #[test]
+    fn someone_on_a_bridge_is_not_on_the_road() {
+        let ped = |x: f32, z: f32| adapter_api::Actor { kind: adapter_api::ActorKind::Pedestrian, x, z, height: 1.8, ..adapter_api::Actor::ZERO };
+        // The GTA run: 14.6 m up, 57 m ahead.
+        assert!(!sees(&ped(57.0, 14.6), 1.3, 57.0, 25f32.to_radians()));
+        // On the road; up a 10 % slope 40 m on; down a dip 30 m on.
+        assert!(sees(&ped(20.0, 0.3), 1.3, 20.0, 25f32.to_radians()));
+        assert!(sees(&ped(40.0, 4.3), 1.3, 40.0, 25f32.to_radians()));
+        assert!(sees(&ped(30.0, -3.0), 1.3, 30.0, 25f32.to_radians()));
     }
 
     #[test]

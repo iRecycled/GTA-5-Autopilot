@@ -38,6 +38,8 @@ enum Job {
     Fault(FaultRec, u64),
     Step(Box<StepRec>),
     Packets(Vec<Packet>),
+    /// Close the recording (flush it, write the MCAP footer) and stop.
+    Finish,
 }
 
 struct StepRec {
@@ -56,6 +58,7 @@ const JOB_QUEUE: usize = 4096;
 fn writer(mut recorder: Option<Recorder>, mut tx: telemetry::Sender, jobs: std::sync::mpsc::Receiver<Job>) {
     for job in jobs {
         let r = match job {
+            Job::Finish => break,
             Job::Packets(ps) => {
                 for p in &ps {
                     tx.send(p);
@@ -69,7 +72,7 @@ fn writer(mut recorder: Option<Recorder>, mut tx: telemetry::Sender, jobs: std::
                     Job::Profile(p, t) => rec.profile(&p, t),
                     Job::Fault(f, t) => rec.fault(&f, t),
                     Job::Step(st) => rec.step(&st.sample, &st.actors, st.ranges.as_ref(), st.lanes.as_ref(), st.stick, &st.cmd),
-                    Job::Packets(_) => unreachable!(),
+                    Job::Packets(_) | Job::Finish => unreachable!(),
                 },
             },
         };
@@ -78,6 +81,24 @@ fn writer(mut recorder: Option<Recorder>, mut tx: telemetry::Sender, jobs: std::
             recorder = None;
         }
     }
+    if let Some(rec) = recorder
+        && let Err(e) = rec.finish()
+    {
+        eprintln!("cannot finish the recording: {e}");
+    }
+}
+
+/// Exits after the writer has written out what is queued and closed the
+/// recording. A bare `process::exit` would cut it off mid-file, with no
+/// footer (issue #23).
+fn exit_after_writer(jobs: &std::sync::mpsc::SyncSender<Job>, writer: &mut Option<std::thread::JoinHandle<()>>) -> ! {
+    let _ = std::io::stdout().flush();
+    if jobs.send(Job::Finish).is_ok()
+        && let Some(w) = writer.take()
+    {
+        let _ = w.join();
+    }
+    std::process::exit(0);
 }
 
 /// The core answers the game every frame, so it must not wait behind
@@ -373,7 +394,8 @@ fn main() {
     let tx = telemetry::Sender::udp(&telemetry_ports);
     let recording = recorder.is_some();
     let (jobs, job_rx) = std::sync::mpsc::sync_channel::<Job>(JOB_QUEUE);
-    std::thread::Builder::new().name("writer".into()).spawn(move || writer(recorder, tx, job_rx)).expect("writer thread");
+    let mut writer_thread = Some(std::thread::Builder::new().name("writer".into()).spawn(move || writer(recorder, tx, job_rx)).expect("writer thread"));
+    let finish_jobs = jobs.clone();
     let mut dropped_jobs = 0u64;
     let mut post = move |j: Job| {
         if jobs.try_send(j).is_err() {
@@ -419,8 +441,7 @@ fn main() {
                 && wall_time_ns().saturating_sub(last_sample_at) > s * 1_000_000_000
             {
                 println!("no sample for {s} s: exiting");
-                let _ = std::io::stdout().flush();
-                std::process::exit(0);
+                exit_after_writer(&finish_jobs, &mut writer_thread);
             }
             continue;
         }
@@ -430,8 +451,7 @@ fn main() {
         // newest epoch), so this one stops rather than answer alongside it.
         if link.epoch.load(Ordering::Acquire) != epoch {
             println!("a newer core took the link (epoch {} after {epoch}): exiting", link.epoch.load(Ordering::Acquire));
-            let _ = std::io::stdout().flush();
-            std::process::exit(0);
+            exit_after_writer(&finish_jobs, &mut writer_thread);
         }
         let (_, s) = link.sample.read();
         if last_seq == Some(s.header.seq) {

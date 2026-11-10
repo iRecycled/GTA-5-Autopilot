@@ -58,6 +58,11 @@ struct Test {
     feature: String,
     #[serde(default)]
     pass: Pass,
+    /// The driver re-engages after an AEB stop, as a real one would once the
+    /// hold ends: long drives in traffic go on past a genuine AEB event (each
+    /// one is still counted and listed, to be reviewed).
+    #[serde(default)]
+    resume_after_aeb: bool,
 }
 
 fn default_feature() -> String {
@@ -292,11 +297,51 @@ struct Run<'a> {
     game: &'a Game,
     live: Arc<Mutex<Live>>,
     gap_error: f32,
+    resume_after_aeb: bool,
+    /// AEB activations already resumed from, and since when the car has
+    /// been stopped and disengaged after the latest.
+    resumed_aeb: u32,
+    stopped_since: Option<Instant>,
+    /// The set speed while last engaged (km/h), restored on resuming.
+    last_set_kph: f32,
 }
+
+/// After an AEB stop, the driver waits this long (the AEB hold is 3 s), then
+/// re-engages.
+const RESUME_AFTER: Duration = Duration::from_secs(4);
 
 impl Run<'_> {
     fn last(&self) -> Option<Snap> {
         self.live.lock().expect("live").last()
+    }
+
+    /// The driver re-engages once the car has stood, disengaged, for
+    /// [`RESUME_AFTER`] after an AEB activation.
+    fn maybe_resume(&mut self) -> Result<(), String> {
+        let Some(s) = self.last() else { return Ok(()) };
+        if s.state != 0 && s.set_speed.is_finite() && s.set_speed > 0.0 {
+            self.last_set_kph = (s.set_speed * 3.6).round();
+        }
+        if s.aeb <= self.resumed_aeb || s.state != 0 || s.speed > 0.3 {
+            if s.state != 0 {
+                self.stopped_since = None;
+            }
+            return Ok(());
+        }
+        let since = *self.stopped_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= RESUME_AFTER {
+            self.game.cmd("engage")?;
+            self.resumed_aeb = s.aeb;
+            self.stopped_since = None;
+            self.wait_for("engaged", Duration::from_secs(5), |l| l.last().is_some_and(|s| s.state != 0))?;
+            if self.last_set_kph > 0.0 {
+                self.step(&format!("set {}", self.last_set_kph))?;
+            }
+            let text = format!("driver re-engaged after AEB activation {} (set {} km/h)", s.aeb, self.last_set_kph);
+            println!("    {text}");
+            self.live.lock().expect("live").events.push(text);
+        }
+        Ok(())
     }
 
     fn wait_for(&self, what: &str, timeout: Duration, mut ok: impl FnMut(&Live) -> bool) -> Result<(), String> {
@@ -345,7 +390,13 @@ impl Run<'_> {
                 Err(format!("time gap never reached {want} s"))
             }
             "sleep" => {
-                std::thread::sleep(Duration::from_secs_f32(num(1)?));
+                let until = Instant::now() + Duration::from_secs_f32(num(1)?);
+                while Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if self.resume_after_aeb {
+                        self.maybe_resume()?;
+                    }
+                }
                 Ok(())
             }
             "fault" => {
@@ -465,7 +516,7 @@ fn run_test(game: &Game, live: &Arc<Mutex<Live>>, t: &Test, car: &str) -> Row {
             return row;
         }
     };
-    let mut run = Run { game, live: live.clone(), gap_error: 0.0 };
+    let mut run = Run { game, live: live.clone(), gap_error: 0.0, resume_after_aeb: t.resume_after_aeb, resumed_aeb: 0, stopped_since: None, last_set_kph: 0.0 };
     // The core is up once its telemetry arrives.
     let mut result = run.wait_for("the core's telemetry", Duration::from_secs(15), |l| l.snaps.len() > 72);
     if result.is_ok() {

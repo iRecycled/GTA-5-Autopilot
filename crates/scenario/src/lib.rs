@@ -30,6 +30,9 @@ pub struct Scenario {
     pub duration: f32,
     #[serde(default = "default_fps")]
     pub fps: f32,
+    /// The ego car's dynamics: "default" (the kinematic bicycle) or "gta"
+    /// (steers like a GTA car: understeer growing with speed, yaw lag).
+    pub vehicle: Option<String>,
     #[serde(default)]
     pub road: RoadSpec,
     pub ego: EgoSpec,
@@ -92,6 +95,13 @@ pub struct SignalToml {
     pub t: f32,
     /// "left", "right" or "off".
     pub side: String,
+}
+
+/// A set-speed change: from `t` (s) the driver sets `kph`.
+#[derive(Debug, Deserialize)]
+pub struct SetToml {
+    pub t: f32,
+    pub kph: f32,
 }
 
 /// A bus fault for the whole run or a window of it.
@@ -188,6 +198,9 @@ pub struct EgoSpec {
     pub engage_at: f32,
     /// Set speed after engaging (km/h); the runner presses the buttons.
     pub set_kph: Option<f32>,
+    /// Later set-speed changes (`[[ego.set]]`).
+    #[serde(default)]
+    pub set: Vec<SetToml>,
     /// Time gap index (0 = 1.0 s … 3 = 2.5 s); default 2 (2.0 s).
     pub gap_index: Option<usize>,
     /// "reverse": the driver reverses at `speed_kph`.
@@ -432,7 +445,12 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
             }
         })
         .collect();
-    let mut world = World::new(road.clone(), EgoParams::default(), kph(sc.ego.speed_kph), actors, sc.fps);
+    let params = match sc.vehicle.as_deref() {
+        None | Some("default") => EgoParams::default(),
+        Some("gta") => EgoParams::gta(),
+        Some(other) => panic!("{}: unknown vehicle {other:?} (default, gta)", sc.name),
+    };
+    let mut world = World::new(road.clone(), params, kph(sc.ego.speed_kph), actors, sc.fps);
     world.d = sc.ego.lane * road.lane_width + sc.ego.offset;
     world.psi = sc.ego.heading_deg.to_radians();
     if sc.ego.hands.as_deref() == Some("off") {
@@ -543,7 +561,8 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
         }
         let mut btn = 0;
         if engage && core.hud().flags & hud_flags::ACC != 0 {
-            if let Some(t) = set_target {
+            let later = sc.ego.set.iter().rev().find(|c| c.t <= world.t).map(|c| kph(c.kph));
+            if let Some(t) = later.or(set_target) {
                 let s = core.hud().set_speed;
                 if s < t - 0.1 {
                     btn |= buttons::SPEED_UP;
@@ -671,6 +690,13 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
             rep.max_lat_accel = rep.max_lat_accel.max(lat.abs());
         }
 
+        if std::env::var_os("SCENARIO_TRACE_LAT").is_some() && run == 0 && world.frame.is_multiple_of(18) {
+            let (off, width) = world.lane_offset().unwrap_or((f32::NAN, f32::NAN));
+            println!(
+                "LAT t {:6.2} v {:5.2} | lane off {:+.2} w {:.2} | psi {:+.4} steer {:+.4} kappa {:+.5} road k {:+.5} | gain {:.2} (truth {:.2}) | cmd {:+.4} flags {:#06x}",
+                world.t, world.v, off, width, world.psi, world.steer, world.kappa, world.road.curvature(world.s), core.lane_steer_gain(world.v), world.ego_params.steer_response(world.v), cmd.steer_angle, cmd.flags
+            );
+        }
         if trace && (world.frame.is_multiple_of(7) || aeb_on) && world.frame.is_multiple_of(2) {
             let (g, lv) = world.gap_ahead().unwrap_or((f32::NAN, f32::NAN));
             println!(

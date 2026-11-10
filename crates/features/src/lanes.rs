@@ -92,6 +92,12 @@ pub struct LaneConfig {
     pub lka_time: f32,
     /// A nudge's lateral acceleration cap (m/s²): firm, not a swerve.
     pub lka_lat_accel: f32,
+    /// The curvature loop: how fast (1/s) the steering scales toward
+    /// driving the curvature asked for, the most it may scale either way, and
+    /// the smallest curvature it measures by (1/m).
+    pub curvature_rate: f32,
+    pub curvature_scale_max: f32,
+    pub curvature_min: f32,
 }
 
 impl Default for LaneConfig {
@@ -107,6 +113,9 @@ impl Default for LaneConfig {
             lka_margin: 0.2,
             lka_time: 2.0,
             lka_lat_accel: 1.5,
+            curvature_rate: 1.0,
+            curvature_scale_max: 4.0,
+            curvature_min: 2.5e-4,
         }
     }
 }
@@ -132,6 +141,97 @@ pub struct LaneOut {
     pub path: Option<LanePath>,
 }
 
+/// Speed bands of the learned steering response (m/s): 0, 5, ... 55.
+const BAND_MS: f32 = 5.0;
+const BANDS: usize = 12;
+
+/// How much the car turns for its wheel angle, by speed: driven curvature ÷
+/// the kinematic (bicycle) curvature. A car understeers more the faster it
+/// goes (GTA's Sultan: 0.75 at 35 km/h, 0.27 at 80, 0.15 at 120), so one
+/// number learned at one speed steers wrongly at another: a manual GTA drive
+/// weaved out of its lane at 35 km/h with the gain learned at 80.
+///
+/// Each band learns from steady turning near its speed. A band not learned
+/// yet takes the understeer curve `1 / (1 + (v / v_c)²)` fitted to the
+/// bands that are, or 1 with none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SteerResponse {
+    gain: [f32; BANDS],
+    /// How much each band has learned (0 = nothing, 1 = settled).
+    weight: [f32; BANDS],
+    /// The wheel angle, smoothed: learning waits for it to hold steady, as
+    /// the yaw follows the wheels about 0.1 s late.
+    steady: f32,
+}
+
+impl Default for SteerResponse {
+    fn default() -> Self {
+        Self { gain: [1.0; BANDS], weight: [0.0; BANDS], steady: 0.0 }
+    }
+}
+
+impl SteerResponse {
+    /// Learning time constant (s), and how long a band takes to count as
+    /// learned (s of steady turning).
+    const TAU: f32 = 3.0;
+    const SETTLE: f32 = 5.0;
+
+    /// The response at speed `v` (m/s).
+    pub fn at(&self, v: f32) -> f32 {
+        let f = (v.max(0.0) / BAND_MS).min((BANDS - 1) as f32);
+        let i = (f as usize).min(BANDS - 2);
+        let w = f - i as f32;
+        let model = self.model(v);
+        let band = |b: usize| self.gain[b] * self.weight[b] + model * (1.0 - self.weight[b]);
+        band(i) * (1.0 - w) + band(i + 1) * w
+    }
+
+    /// The understeer curve fitted to the learned bands (1 with none).
+    fn model(&self, v: f32) -> f32 {
+        let (mut sum, mut n) = (0.0f32, 0.0f32);
+        for b in 1..BANDS {
+            let (g, wt) = (self.gain[b], self.weight[b]);
+            if wt > 0.2 && g < 0.97 {
+                // 1/g - 1 = (v/v_c)², so 1/v_c² = (1/g - 1) / v².
+                let vb = b as f32 * BAND_MS;
+                sum += wt * (1.0 / g - 1.0) / (vb * vb);
+                n += wt;
+            }
+        }
+        if n == 0.0 { 1.0 } else { 1.0 / (1.0 + v * v * sum / n) }
+    }
+
+    /// Learns from the measured road-wheel angle (rad), yaw rate (rad/s)
+    /// and speed (m/s): only while turning forwards, enough to measure, with
+    /// the wheel angle steady.
+    pub fn learn(&mut self, dt: f32, wheel_angle: f32, yaw_rate: f32, speed: f32, wheelbase: f32) {
+        if !(wheel_angle.is_finite() && yaw_rate.is_finite() && dt > 0.0) {
+            return;
+        }
+        let held = (wheel_angle - self.steady).abs() <= 0.15 * wheel_angle.abs() + 0.002;
+        self.steady += (wheel_angle - self.steady) * (dt / 0.5).min(1.0);
+        let model = wheel_angle.tan() / wheelbase;
+        if !held || speed < 5.0 || model.abs() < 0.002 || model.signum() != yaw_rate.signum() {
+            return;
+        }
+        let g = ((yaw_rate / speed) / model).clamp(0.08, 2.0);
+        let f = (speed / BAND_MS).min((BANDS - 1) as f32);
+        let i = (f as usize).min(BANDS - 2);
+        let w = f - i as f32;
+        for (b, share) in [(i, 1.0 - w), (i + 1, w)] {
+            if share <= 0.0 {
+                continue;
+            }
+            // A band starts from what the curve says, not from 1.
+            if self.weight[b] == 0.0 {
+                self.gain[b] = self.model(b as f32 * BAND_MS);
+            }
+            self.gain[b] += (g - self.gain[b]) * (share * dt / Self::TAU).min(1.0);
+            self.weight[b] = (self.weight[b] + share * dt / Self::SETTLE).min(1.0);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Lanes {
     pub cfg: LaneConfig,
@@ -142,10 +242,14 @@ pub struct Lanes {
     nudge_for: Option<f32>,
     /// Seconds since the driver last steered.
     since_driver: f32,
-    /// Driven curvature ÷ the kinematic curvature of the wheel angle.
-    pub steer_gain: f32,
+    /// Driven curvature ÷ the kinematic curvature of the wheel angle, by speed.
+    pub response: SteerResponse,
     /// LKA nudges so far.
     pub nudges: u32,
+    /// The curvature the car drives (yaw rate ÷ speed, from the bus), and
+    /// the curvature loop's scale on the steering (log).
+    driven: Option<f32>,
+    correction: f32,
 }
 
 impl Default for Lanes {
@@ -155,23 +259,20 @@ impl Default for Lanes {
 }
 
 impl Lanes {
-    /// Learns the steering response from what the car did: its measured
-    /// road-wheel angle (rad), yaw rate (rad/s) and speed (m/s). Only while
-    /// turning steadily enough to measure, forwards.
+    /// Learns the steering response from what the car did (see
+    /// [`SteerResponse::learn`]).
     pub fn learn(&mut self, dt: f32, wheel_angle: f32, yaw_rate: f32, speed: f32, wheelbase: f32) {
-        if !(wheel_angle.is_finite() && yaw_rate.is_finite()) || speed < 8.0 {
-            return;
-        }
-        let model = wheel_angle.tan() / wheelbase;
-        if model.abs() < 0.002 || model.signum() != yaw_rate.signum() {
-            return;
-        }
-        let g = ((yaw_rate / speed) / model).clamp(0.3, 2.0);
-        self.steer_gain += (g - self.steer_gain) * (dt / 3.0).min(1.0);
+        self.driven = (speed > 2.0 && yaw_rate.is_finite()).then(|| yaw_rate / speed);
+        self.response.learn(dt, wheel_angle, yaw_rate, speed, wheelbase);
+    }
+
+    /// The curvature loop's scale on the steering now.
+    pub fn curvature_correction(&self) -> f32 {
+        self.correction.exp()
     }
 
     pub fn new(cfg: LaneConfig) -> Self {
-        Self { cfg, path: None, unseen: f32::INFINITY, width: 3.6, nudge_for: None, since_driver: f32::INFINITY, steer_gain: 1.0, nudges: 0 }
+        Self { cfg, path: None, unseen: f32::INFINITY, width: 3.6, nudge_for: None, since_driver: f32::INFINITY, response: SteerResponse::default(), nudges: 0, driven: None, correction: 0.0 }
     }
 
     /// One step. `lines`: a camera frame that arrived this step. `centering`:
@@ -210,13 +311,35 @@ impl Lanes {
         if k_max > 1e-4 {
             out.curve_speed = (c.curve_lat_accel / k_max).sqrt();
         }
-        let g = self.steer_gain;
+        let g = self.response.at(v);
         let steer = || lateral::angle_for(lateral::pursuit_curvature(&c.lateral, &p.c, p.range, v) / g, wheelbase);
         let nudge_cfg = LateralConfig { max_lat_accel: c.lka_lat_accel, ..c.lateral };
         let nudge = || lateral::angle_for(lateral::pursuit_curvature(&nudge_cfg, &p.c, p.range, v) / g, wheelbase);
         if p.ends_at(c.end_width, (c.end_time * v).max(20.0)).is_some() {
             out.issue = Some(LaneIssue::LaneEnds);
         }
+        if centering && !driver_steering {
+            self.nudge_for = None;
+            // Pure pursuit asks for a curvature; the learned response turns
+            // it into a wheel angle; the curvature loop scales that by what
+            // the car actually drives (a car turning a fifth of what it was
+            // asked would otherwise run wide until the response is learned).
+            // It adapts in log space, so it settles as fast (about 1 s)
+            // however wrong the response is; on the straight, with nothing
+            // to measure by, it holds.
+            let want = lateral::pursuit_curvature(&c.lateral, &p.c, p.range, v);
+            if let Some(k) = self.driven
+                && want.abs() > c.curvature_min
+                && k.abs() > 0.3 * c.curvature_min
+                && want.signum() == k.signum()
+            {
+                let lim = c.curvature_scale_max.ln();
+                self.correction = (self.correction + c.curvature_rate * (want.abs().ln() - k.abs().ln()) * dt).clamp(-lim, lim);
+            }
+            out.angle = Some(lateral::angle_for(want * self.correction.exp() / g, wheelbase));
+            return out;
+        }
+        self.correction = 0.0;
         if centering {
             self.nudge_for = None;
             out.angle = Some(steer());
@@ -306,17 +429,42 @@ mod tests {
     #[test]
     fn the_steering_response_is_learned() {
         let mut lanes = Lanes::default();
-        // A car that drives 60 % of the kinematic curvature.
+        // A car that drives 60 % of the kinematic curvature at 20 m/s.
         for _ in 0..2000 {
             let angle = 0.02f32;
             let yaw = 0.6 * 20.0 * angle.tan() / 2.7;
             lanes.learn(0.014, angle, yaw, 20.0, 2.7);
         }
-        assert!((lanes.steer_gain - 0.6).abs() < 0.01, "{}", lanes.steer_gain);
+        assert!((lanes.response.at(20.0) - 0.6).abs() < 0.01, "{}", lanes.response.at(20.0));
         // Straight ahead, or slow: nothing to learn.
         lanes.learn(0.014, 0.0001, 0.0, 20.0, 2.7);
         lanes.learn(0.014, 0.05, 0.0, 3.0, 2.7);
-        assert!((lanes.steer_gain - 0.6).abs() < 0.01);
+        assert!((lanes.response.at(20.0) - 0.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_response_is_learned_per_speed() {
+        // A GTA-like car: 1 / (1 + (v/15)²) of the kinematic curvature.
+        let truth = |v: f32| 1.0 / (1.0 + (v / 15.0).powi(2));
+        let mut r = SteerResponse::default();
+        // Learned at 80 km/h only.
+        for _ in 0..3000 {
+            let (v, angle) = (22.2f32, 0.03f32);
+            r.learn(0.014, angle, truth(v) * v * angle.tan() / 2.7, v, 2.7);
+        }
+        assert!((r.at(22.2) - truth(22.2)).abs() < 0.03, "at 80 km/h {}", r.at(22.2));
+        // Not learned at 35 km/h: from the fitted curve, near the truth and
+        // nowhere near the 80 km/h value.
+        assert!((r.at(9.7) - truth(9.7)).abs() < 0.08, "at 35 km/h {} vs {}", r.at(9.7), truth(9.7));
+        // Nor at 120 km/h.
+        assert!((r.at(33.3) - truth(33.3)).abs() < 0.05, "at 120 km/h {} vs {}", r.at(33.3), truth(33.3));
+        // While the wheel angle swings, nothing is learned (the yaw lags).
+        let before = r;
+        for i in 0..200 {
+            let angle = 0.03 * (i as f32 * 0.3).sin();
+            r.learn(0.014, angle, 0.5 * 22.2 * angle.tan() / 2.7, 22.2, 2.7);
+        }
+        assert!((r.at(22.2) - before.at(22.2)).abs() < 0.03, "{} vs {}", r.at(22.2), before.at(22.2));
     }
 
     #[test]

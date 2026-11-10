@@ -140,11 +140,30 @@ pub struct EgoParams {
     pub wheelbase: f32,
     /// The steering's first-order lag (s).
     pub steer_lag: f32,
+    /// Understeer: the car turns `1 / (1 + (v / char_speed)²)` of what its
+    /// wheel angle says (the characteristic speed, m/s; infinite = none).
+    pub char_speed: f32,
+    /// The yaw's first-order lag behind the wheel angle (s; 0 = none).
+    pub yaw_lag: f32,
 }
 
 impl Default for EgoParams {
     fn default() -> Self {
-        Self { accel_max: 4.5, v_max: 55.0, brake_max: 8.0, lag: 0.15, length: 4.7, width: 1.9, wheelbase: 2.7, steer_lag: 0.08 }
+        Self { accel_max: 4.5, v_max: 55.0, brake_max: 8.0, lag: 0.15, length: 4.7, width: 1.9, wheelbase: 2.7, steer_lag: 0.08, char_speed: f32::INFINITY, yaw_lag: 0.0 }
+    }
+}
+
+impl EgoParams {
+    /// Steers like a GTA car, measured on the Sultan (2026-11-09): it turns
+    /// 0.75, 0.27 and 0.15 of the bicycle model's curvature at 35, 80 and
+    /// 120 km/h, with its yaw about 0.1 s behind the wheels.
+    pub fn gta() -> Self {
+        Self { char_speed: 15.0, yaw_lag: 0.1, ..Self::default() }
+    }
+
+    /// The share of the bicycle model's curvature the car turns at `v`.
+    pub fn steer_response(&self, v: f32) -> f32 {
+        1.0 / (1.0 + (v / self.char_speed).powi(2))
     }
 }
 
@@ -239,6 +258,9 @@ pub struct World {
     pub d: f32,
     pub psi: f32,
     pub steer: f32,
+    /// The curvature the car turns at (1/m): the wheels' after understeer
+    /// and the yaw lag.
+    pub kappa: f32,
     /// Who steers when the core doesn't.
     pub driver: DriverSteer,
     /// The core steered in the last step.
@@ -273,6 +295,7 @@ impl World {
             d: 0.0,
             psi: 0.0,
             steer: 0.0,
+            kappa: 0.0,
             driver: DriverSteer::Perfect,
             core_steering: false,
             a: 0.0,
@@ -591,7 +614,7 @@ impl World {
     fn yaw_rate(&self) -> f32 {
         let k = self.road.curvature(self.s);
         if self.core_steering || self.driver != DriverSteer::Perfect {
-            let w = self.v * self.steer.tan() / self.ego_params.wheelbase;
+            let w = self.v * self.kappa;
             if self.reverse { -w } else { w }
         } else {
             self.v * k
@@ -627,14 +650,19 @@ impl World {
                 // On its line exactly: the car follows the road.
                 self.s += sign * ds;
                 self.steer = (p.wheelbase * k).atan();
+                self.kappa = k;
                 self.psi = 0.0;
             }
             Some(delta) => {
                 self.steer += (delta - self.steer) * (dt / p.steer_lag).min(1.0);
+                // The curvature the car turns at: the wheels' (bicycle
+                // model), less understeer, after the yaw lag.
+                let want = self.steer.tan() / p.wheelbase * p.steer_response(self.v);
+                self.kappa += (want - self.kappa) * if p.yaw_lag > 0.0 { (dt / p.yaw_lag).min(1.0) } else { 1.0 };
                 // Kinematic bicycle in the road frame.
                 let along = sign * ds * self.psi.cos() / (1.0 - k * self.d).max(0.2);
                 self.d += sign * ds * self.psi.sin();
-                self.psi = wrap_pi(self.psi + sign * ds * self.steer.tan() / p.wheelbase - k * along);
+                self.psi = wrap_pi(self.psi + sign * ds * self.kappa - k * along);
                 self.s += along;
             }
         }

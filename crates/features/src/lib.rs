@@ -17,6 +17,6 @@ pub use aeb::{Aeb, AebConfig, AebStage};
 pub use bsd::{Bsd, BsdConfig, BsdOut};
 pub use ego::Ego;
 pub use junction::{JunctionConfig, select_crossing};
-pub use lanes::{LaneConfig, LaneIssue, LaneOut, LanePath, Lanes};
+pub use lanes::{LaneConfig, LaneIssue, LaneOut, LanePath, Lanes, SteerResponse};
 pub use park::{ParkAssist, ParkConfig, ParkOut};
 pub use rcta::{Rcta, RctaConfig, RctaOut};

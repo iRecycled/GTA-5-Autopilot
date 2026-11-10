@@ -334,6 +334,11 @@ impl Core {
     }
 
     /// LKA nudges applied so far.
+    /// Lane centering's learned steering response at speed `v` (m/s).
+    pub fn lane_steer_gain(&self, v: f32) -> f32 {
+        self.lanes.response.at(v)
+    }
+
     pub fn lka_nudges(&self) -> u32 {
         self.lka_count
     }

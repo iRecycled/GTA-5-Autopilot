@@ -9,7 +9,7 @@
 //! - on release, steering stops at once, throttle is dropped and any brake
 //!   fades out over about a second; TAKE OVER shows on the HUD.
 //!
-//! Driver keys: F10 engage / cancel ACC · F3 cancel · Page Up / Page Down set speed ±5 km/h
+//! Driver keys: F10 engage / cancel (starts the core if none runs) · F2 start the core · F3 cancel · Page Up / Page Down set speed ±5 km/h
 //! · End cycle the time gap (Home opens the Rockstar overlay) · `,` / `.` turn
 //! signal left / right (press again to cancel). AEB, BSD, RCTA and park assist
 //! are always armed.
@@ -33,6 +33,7 @@ mod lanes;
 mod n;
 mod remote;
 mod tools;
+mod launch;
 mod win;
 
 use core::ffi::{CStr, c_void};
@@ -58,6 +59,7 @@ const VK_F7: i32 = 0x76;
 const VK_F8: i32 = 0x77;
 const VK_F9: i32 = 0x78;
 const VK_F10: i32 = 0x79;
+const VK_F2: i32 = 0x71;
 const VK_F3: i32 = 0x72;
 const VK_F4: i32 = 0x73;
 const VK_F5: i32 = 0x74;
@@ -261,6 +263,12 @@ fn run() {
     let mut win_steer_ns = 0u64;
     let mut win_steer_n = 0u64;
     let mut hud2 = String::new();
+    // Starting the core from the game (F2, or F10 with none running).
+    let game_dir = dir.parent().map(PathBuf::from).unwrap_or_default();
+    let mut launcher = launch::Launcher::default();
+    // F10 started a core: engage once it answers, if it does by then.
+    let mut pending_engage_until = 0u64;
+    let mut notice: Option<(String, (i32, i32, i32), u64)> = None;
 
     loop {
         if cap60 {
@@ -321,7 +329,23 @@ fn run() {
             tools::ai_drive(ped, veh, ai);
             let _ = writeln!(log, "frame {frame}: GTA AI drive {}", if ai { "ON" } else { "OFF" });
         }
-        if keys.pressed(4, VK_F10) && in_vehicle {
+        let core_up = {
+            let pid = link.core_pid.load(Ordering::Acquire);
+            pid != 0 && !watch.exited(pid)
+        };
+        let f2 = keys.pressed(14, VK_F2);
+        let f10 = keys.pressed(4, VK_F10) && in_vehicle;
+        if f2 || f10 && !core_up && !engage_req {
+            let started = if core_up && !launcher.running() { Err("a core is already running".to_string()) } else { launcher.start(&game_dir) };
+            let _ = writeln!(log, "frame {frame}: start core: {started:?}");
+            notice = Some(match &started {
+                Ok(_) => ("STARTING THE AUTOPILOT CORE".into(), (120, 200, 255), wall_time_ns() + 4_000_000_000),
+                Err(e) => (format!("CORE: {e}"), (255, 120, 80), wall_time_ns() + 6_000_000_000),
+            });
+            if started.is_ok() && f10 {
+                pending_engage_until = wall_time_ns() + 15_000_000_000;
+            }
+        } else if f10 {
             engage_req = !engage_req;
             if engage_req && ai {
                 ai = false;
@@ -705,6 +729,17 @@ fn run() {
         if fresh {
             core_was_engaged = core_engaged && engage_req;
         }
+        if pending_engage_until != 0 {
+            if fresh && in_vehicle && !paused && wall_time_ns() < pending_engage_until {
+                engage_req = true;
+                pending_engage_until = 0;
+                notice = None;
+                let _ = writeln!(log, "frame {frame}: core answering: engage request ON");
+            } else if wall_time_ns() >= pending_engage_until {
+                pending_engage_until = 0;
+                notice = Some(("CORE DID NOT ANSWER: see recordings/core-*.log".into(), (255, 120, 80), wall_time_ns() + 6_000_000_000));
+            }
+        }
         let active = in_vehicle && engage_req && core_engaged && fresh && !paused;
         // Hazard lights for a controlled stop (D11).
         let want_hazards = active && cmd.flags & command_flags::HAZARDS != 0;
@@ -943,7 +978,7 @@ fn run() {
                 0.015,
                 0.062,
                 &format!(
-                    "F10 ACC | PgUp/PgDn speed | End gap | F11 lead | F5 lead brakes | F4 stopped car | F7 tp | F8 car | F9 AI | F6 cap60 {}{warn}",
+                    "F10 engage | F2 core | PgUp/PgDn speed | End gap | F11 lead | F5 lead brakes | F4 stopped car | F7 tp | F8 car | F9 AI | F6 cap60 {}{warn}",
                     if cap60 { "ON" } else { "off" }
                 ),
                 (255, 255, 255),
@@ -1015,6 +1050,13 @@ fn run() {
             }
         }
         hud::draw(&hud, hud_live, frame, &mut hud_sounds);
+        if let Some((text, rgb, until)) = &notice {
+            if wall_time_ns() < *until {
+                unsafe { draw_text(0.36, 0.06, text, *rgb) };
+            } else {
+                notice = None;
+            }
+        }
         if hud_live && in_vehicle && !paused {
             let info = link.info.read().1;
             hud::draw_lanes(&hud, veh, info.box_min[2]);

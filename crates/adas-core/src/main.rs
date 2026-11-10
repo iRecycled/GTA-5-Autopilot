@@ -3,9 +3,12 @@
 //!
 //! Usage: `adas-core [--feature acc|autopilot|speed-profile|test-driver] [--spin]
 //!                   [--record DIR | --no-record] [--link NAME]
-//!                   [--telemetry PORT,PORT... | --no-telemetry] [--no-profile-save]`
+//!                   [--telemetry PORT,PORT... | --no-telemetry] [--no-profile-save]
+//!                   [--driver-monitor] [--exit-when-idle SECS]`
 //!
 //! - `--no-profile-save`: load vehicle profiles but never write them (tests).
+//! - `--exit-when-idle SECS`: exit once no sample has come for SECS (the GTA
+//!   adapter passes it when it starts the core, so none outlives the game).
 //!
 //! - `--spin`: busy-poll for samples (lowest latency, uses a CPU core);
 //!   default: sleep on the adapter's sample event.
@@ -264,6 +267,7 @@ fn main() {
     let mut telemetry_ports = vec![telemetry::PANEL_PORT, telemetry::RERUN_PORT];
     // Tests load vehicle profiles but never rewrite them.
     let mut save_profiles = true;
+    let mut exit_when_idle: Option<u64> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -277,6 +281,7 @@ fn main() {
             "--link" => name = args.next().expect("--link needs a name"),
             "--record" => rec_dir = Some(PathBuf::from(args.next().expect("--record needs a directory"))),
             "--no-record" => rec_dir = None,
+            "--exit-when-idle" => exit_when_idle = Some(args.next().and_then(|s| s.parse::<u64>().ok()).expect("--exit-when-idle needs seconds")),
             "--driver-monitor" => driver_monitor = true,
             "--feature" => {
                 feature = match args.next().as_deref() {
@@ -328,6 +333,7 @@ fn main() {
     let mut last_game_us = 0u64;
     let mut cmd_seq = 0u32;
     let mut seen_writes = link.sample.writes();
+    let mut last_sample_at = wall_time_ns();
     let mut info_writes = 0u32;
     let mut layout_seq = 0u32;
     let mut fans_sent = adapter_api::FanLayout::default();
@@ -405,8 +411,16 @@ fn main() {
                 core::hint::spin_loop();
             }
         } else if !link.wait_sample(100) && link.sample.writes() == seen_writes {
+            if let Some(s) = exit_when_idle
+                && wall_time_ns().saturating_sub(last_sample_at) > s * 1_000_000_000
+            {
+                println!("no sample for {s} s: exiting");
+                let _ = std::io::stdout().flush();
+                std::process::exit(0);
+            }
             continue;
         }
+        last_sample_at = wall_time_ns();
         seen_writes = link.sample.writes();
         // One core per link: a newer core took over (the adapter follows the
         // newest epoch), so this one stops rather than answer alongside it.

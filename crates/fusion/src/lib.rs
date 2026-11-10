@@ -232,7 +232,7 @@ pub enum LeadKind {
 /// Nearest confirmed track in the lane along the predicted path.
 pub fn select_lead(tracks: &[Track], ego_speed: f32, yaw_rate: f32, ego_front_x: f32, half_lane: f32, kind: LeadKind) -> Option<Lead> {
     let k = (yaw_rate / ego_speed.max(2.0)).clamp(-0.1, 0.1);
-    select_on(tracks, ego_front_x, half_lane, kind, |x| 0.5 * k * x * x)
+    select_on(tracks, ego_speed, ego_front_x, half_lane, kind, |x| 0.5 * k * x * x)
 }
 
 /// As [`select_lead`], with the path given (Phase 3: the lane centre the
@@ -240,12 +240,27 @@ pub fn select_lead(tracks: &[Track], ego_speed: f32, yaw_rate: f32, ego_front_x:
 /// rate, and `half_lane` that lane's half width. Oncoming traffic (closing
 /// faster than 2 m/s over ground) is neither followed nor braked for, as in
 /// production AEB of this generation.
-pub fn select_lead_in_lane(tracks: &[Track], lane: &[f32; 4], ego_front_x: f32, half_lane: f32, kind: LeadKind) -> Option<Lead> {
+pub fn select_lead_in_lane(tracks: &[Track], ego_speed: f32, lane: &[f32; 4], ego_front_x: f32, half_lane: f32, kind: LeadKind) -> Option<Lead> {
     let oncoming: Vec<Track> = tracks.iter().filter(|t| t.vx() >= -2.0).cloned().collect();
-    select_on(&oncoming, ego_front_x, half_lane, kind, |x| lane[0] + x * (lane[1] + x * (lane[2] + x * lane[3])))
+    select_on(&oncoming, ego_speed, ego_front_x, half_lane, kind, |x| lane[0] + x * (lane[1] + x * (lane[2] + x * lane[3])))
 }
 
-fn select_on(tracks: &[Track], ego_front_x: f32, half_lane: f32, kind: LeadKind, path: impl Fn(f32) -> f32) -> Option<Lead> {
+/// A track crossing the path (≥ 2 m/s across it, at ≥ 30° to it: not a
+/// cut-in) that will have left the lane by the time the car gets there. AEB
+/// leaves it to junction AEB, which times both: braking for a car that
+/// sweeps through the lane far ahead is a false activation.
+fn clears_before_arrival(t: &Track, ego_speed: f32, gap: f32, offset: f32, reach: f32) -> bool {
+    let (vx, vy) = (t.vx(), t.vy());
+    if vy.abs() < 2.0 || vy.abs() < vx.abs() * 30f32.to_radians().tan() {
+        return false;
+    }
+    let closing = (ego_speed - vx).max(0.1);
+    let arrive = (gap.max(0.0) / closing).min(4.0);
+    let later = offset + vy * arrive;
+    later.abs() > reach && later * vy > 0.0
+}
+
+fn select_on(tracks: &[Track], ego_speed: f32, ego_front_x: f32, half_lane: f32, kind: LeadKind, path: impl Fn(f32) -> f32) -> Option<Lead> {
     tracks
         .iter()
         .filter(|t| t.confirmed && t.x() > ego_front_x - 0.5)
@@ -256,7 +271,12 @@ fn select_on(tracks: &[Track], ego_front_x: f32, half_lane: f32, kind: LeadKind,
         .filter_map(|t| {
             let path_y = path(t.x());
             let offset = t.y() - path_y;
-            (offset.abs() <= half_lane + 0.5 * t.width.min(2.5) - 0.3).then_some(Lead {
+            let reach = half_lane + 0.5 * t.width.min(2.5) - 0.3;
+            let gap = t.x() - ego_front_x;
+            if kind == LeadKind::Collision && clears_before_arrival(t, ego_speed, gap, offset, reach) {
+                return None;
+            }
+            (offset.abs() <= reach).then_some(Lead {
                 id: t.id,
                 gap: t.x() - ego_front_x,
                 v: t.vx(),

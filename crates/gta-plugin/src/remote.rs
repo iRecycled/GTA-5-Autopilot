@@ -55,6 +55,9 @@ pub enum Cmd {
     /// side (1 left, −1 right), distance behind (m), speed (m/s).
     Overtake(f32, f32, f32),
     Cross(f32, f32, f32),
+    /// side (1 left, −1 right), distance ahead of the front bumper (m),
+    /// speed (m/s): a car pulling out across the path (junction AEB).
+    PullOut(f32, f32, f32),
     /// behind?, gap (m).
     Obstacle(bool, f32),
 }
@@ -112,6 +115,7 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
         "walk" => Cmd::Walk,
         "overtake" => Cmd::Overtake(side(w.get(1).copied(), line)?, num(2)?, num(3)?),
         "cross" => Cmd::Cross(side(w.get(1).copied(), line)?, num(2)?, num(3)?),
+        "pullout" => Cmd::PullOut(side(w.get(1).copied(), line)?, num(2)?, num(3)?),
         "obstacle" => Cmd::Obstacle(
             match w.get(1).copied() {
                 Some("behind") => true,

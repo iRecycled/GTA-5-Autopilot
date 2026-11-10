@@ -50,6 +50,8 @@ Lane centering runs inside the autopilot (`--feature autopilot`, ACC + lane cent
 
 Pedestrian AEB needs the camera; without it, AEB still brakes for what the front radar sees.
 
+Junction AEB (braking for traffic crossing the path ahead, 7–70 km/h) needs the front corner radars; without them, AEB still brakes for what is in the lane ahead. It can be switched off on its own (`junction` toggle).
+
 Not yet in the matrix:
 - bus faults short of silence, such as bad checksums or CRC errors: counted (`BusStats::errors`, `crc_errors`); the bad frames are discarded and the last good values held. A bus whose frames all fail counts as silent;
 - weather and dirt on the sensors (Phase 1 error model).

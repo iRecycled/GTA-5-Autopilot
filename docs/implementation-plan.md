@@ -189,6 +189,7 @@ Goal: the car steers itself within its lane, with a camera ECU that already beha
 - [ ] Map capability in the GTA adapter: road network from path nodes; local lane map (lane count, widths, centerlines)
 - [ ] Camera ECU: objects, lanes and signs within its field of view, through a camera error model (worse range accuracy than radar, weather and night effects, misclassification); published on ADAS CAN FD
 - [ ] Radar–camera fusion in `fusion`; pedestrian AEB
+- [ ] Junction AEB: braking for traffic crossing the path ahead, from the front corner radars (added after a GTA traffic car pulled out into the gate drive)
 - [ ] Steering controller through the EPS model: pure pursuit first, then Stanley or MPC if pure pursuit can't hold the gate
 - [ ] Lane keeping (a nudge at the lane edge), then continuous lane centering
 - [ ] Curve speed: ACC slows ahead of bends from lane curvature

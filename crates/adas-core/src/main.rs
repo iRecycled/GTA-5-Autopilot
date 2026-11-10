@@ -562,7 +562,8 @@ fn main() {
         }
         let surround_braking = hud.surround & (adapter_api::surround_flags::RCTA_BRAKE | adapter_api::surround_flags::PARK_BRAKE) != 0;
         if cmd.flags & adapter_api::command_flags::AEB != 0 && cmd.brake > 0.0 && !aeb_logged && !surround_braking {
-            let t = format!("AEB braking at frame {} ({:.1} m/s, ttc {:.2} s, brake {:.2})", s.header.frame, s.speed, hud.ttc, cmd.brake);
+            let why = if core.aeb_crossing() { " for crossing traffic" } else { "" };
+            let t = format!("AEB braking{why} at frame {} ({:.1} m/s, ttc {:.2} s, brake {:.2})", s.header.frame, s.speed, hud.ttc, cmd.brake);
             println!("{t}");
             events.push(t);
             aeb_logged = true;

@@ -64,6 +64,8 @@ pub struct Toggles {
     pub rcta: bool,
     pub park: bool,
     pub lka: bool,
+    /// Junction AEB: braking for traffic crossing the path ahead.
+    pub junction: bool,
     /// The driver monitor (D11, optional): hands on the wheel while the
     /// autopilot steers.
     pub driver_monitor: bool,
@@ -71,7 +73,7 @@ pub struct Toggles {
 
 impl Default for Toggles {
     fn default() -> Self {
-        Self { bsd: true, rcta: true, park: true, lka: true, driver_monitor: false }
+        Self { bsd: true, rcta: true, park: true, lka: true, junction: true, driver_monitor: false }
     }
 }
 
@@ -181,6 +183,8 @@ pub struct Core {
     avail: degrade::Availability,
     /// Track ids of the follow lead and the collision threat, last step (for views).
     lead_ids: (Option<u32>, Option<u32>),
+    /// The AEB threat this step is crossing traffic (junction AEB).
+    aeb_crossing: bool,
     driver: driver::DriverMonitor,
     /// A takeover request in progress: (seconds since it started, why).
     takeover: Option<(f32, degrade::Reason)>,
@@ -284,6 +288,7 @@ impl Core {
             scan_arrived: false,
             avail: degrade::evaluate(None, degrade::Health::default()),
             lead_ids: (None, None),
+            aeb_crossing: false,
             driver: driver::DriverMonitor::new(),
             takeover: None,
             corners: core::array::from_fn(|k| Radar::new(RadarConfig::corner(), layout::CORNERS[k])),
@@ -321,6 +326,11 @@ impl Core {
     /// Pedestrian tracks (camera).
     pub fn pedestrians(&self) -> &[fusion::Track] {
         self.peds.tracks()
+    }
+
+    /// The AEB threat in the last step was crossing traffic (junction AEB).
+    pub fn aeb_crossing(&self) -> bool {
+        self.aeb_crossing
     }
 
     /// LKA nudges applied so far.
@@ -487,6 +497,17 @@ impl Core {
             (Some(a), Some(b)) => Some(if b.gap < a.gap { b } else { a }),
             (a, b) => a.or(b),
         };
+        // Traffic crossing the path ahead (junction AEB), from the front
+        // corner radars: AEB takes it if it comes sooner than the threat ahead.
+        let k = if bus_speed > 1.0 { bus_yaw / bus_speed } else { 0.0 };
+        let cross = if self.toggles.junction && !reverse && self.info.is_some() {
+            ::features::select_crossing(&::features::JunctionConfig::default(), &self.ego(), k, self.surround.tracks()).map(|(l, _)| l)
+        } else {
+            None
+        };
+        let ttc = |l: &Option<fusion::Lead>| l.map_or(f32::INFINITY, |l| ::features::aeb::ttc(&l, bus_speed));
+        self.aeb_crossing = cross.is_some() && ttc(&cross) < ttc(&threat);
+        let threat = if self.aeb_crossing { cross } else { threat };
         self.lead_ids = (follow.map(|l| l.id), threat.map(|l| l.id));
         let mut view = *host;
         view.speed = bus_speed;
@@ -1087,7 +1108,7 @@ impl Core {
         let (follow, collision) = match self.lane_out.path {
             Some(p) => {
                 let half = (0.5 * p.width).clamp(1.5, 3.0);
-                (select_lead_in_lane(tracks, &p.c, front, half, LeadKind::Follow), select_lead_in_lane(tracks, &p.c, front, half, LeadKind::Collision))
+                (select_lead_in_lane(tracks, v, &p.c, front, half, LeadKind::Follow), select_lead_in_lane(tracks, v, &p.c, front, half, LeadKind::Collision))
             }
             None => (select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Follow), select_lead(tracks, v, w, front, HALF_LANE, LeadKind::Collision)),
         };

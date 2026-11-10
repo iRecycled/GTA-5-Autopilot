@@ -54,6 +54,7 @@ stop_gap_max = 15.0
 | `signal left\|right\|off` | the turn signal |
 | `overtake left\|right DIST KPH` | a car DIST m behind in the next lane, driving straight at KPH (a fixed profile, no AI driver) |
 | `cross left\|right DIST KPH` | a car from 25 m to that side, crossing DIST m behind the rear bumper at KPH |
+| `pullout left\|right DIST KPH` | a car from 15 m to that side, crossing the path DIST m ahead of the front bumper at KPH (junction AEB) |
 | `obstacle behind\|ahead GAP` | a van parked broadside, its near side GAP m from the bumper |
 | `fault adas\|chassis drop\|crc\|delay SECS` | a bus fault, as the engineering panel injects it |
 | `sleep SECS` | wait a fixed time |

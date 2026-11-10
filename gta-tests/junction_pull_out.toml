@@ -1,0 +1,17 @@
+# Phase 3: junction AEB. At 40 km/h (11.1 m/s), a car 15 m to the left and
+# 20 m ahead pulls out across the path at 30 km/h (8.3 m/s): it reaches the
+# path in about 1.6 s, as the car gets there. The driver doesn't react:
+# junction AEB must brake and the car must not hit it.
+name = "Junction AEB: a car pulls out from the left"
+steps = [
+  "engage",
+  "set 40",
+  "wait speed>=38 25",
+  "pullout left 20 30",
+  "wait event:AEB braking for crossing traffic 6",
+  "sleep 4",
+]
+
+[pass]
+min_aeb = 1
+events = ["AEB braking for crossing traffic"]

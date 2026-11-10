@@ -1,0 +1,22 @@
+# Junction AEB from the right, slower and closer: at 30 km/h, a car pulls
+# out from a side road on the right at 20 km/h, 12 m from the path.
+name = "Junction AEB: a car pulls out from the right at 30 km/h"
+feature = "none"
+duration = 12.0
+
+[ego]
+speed_kph = 30
+
+[[actor]]
+s = 25
+d = -12
+heading = 90
+speed_kph = 20
+
+[repeat]
+count = 10
+vary_s = 2
+vary_d = 2
+
+[pass]
+min_aeb = 1

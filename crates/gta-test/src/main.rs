@@ -316,8 +316,8 @@ impl Run<'_> {
         match w.first().copied().unwrap_or("") {
             "engage" | "cancel" | "lead_brake" | "clear" | "stopped" | "drive" | "car" | "tp" | "signal" | "obstacle" | "creep" | "ai" | "walker" | "walk" => self.game.cmd(line).map(|_| ()),
             "lead" => self.game.cmd(&format!("lead {} {}", num(1)?, num(2)? / 3.6)).map(|_| ()),
-            // `overtake|cross SIDE DIST KPH`: the adapter takes m/s.
-            "overtake" | "cross" => {
+            // `overtake|cross|pullout SIDE DIST KPH`: the adapter takes m/s.
+            "overtake" | "cross" | "pullout" => {
                 let side = w.get(1).copied().unwrap_or("");
                 self.game.cmd(&format!("{} {side} {} {}", w[0], num(2)?, num(3)? / 3.6)).map(|_| ())
             }

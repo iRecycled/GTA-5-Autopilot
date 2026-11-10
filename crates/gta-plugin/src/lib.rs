@@ -477,6 +477,13 @@ fn run() {
                             last_tick = wall_time_ns();
                             "ok cross".into()
                         }
+                        remote::Cmd::PullOut(sd, ahead, speed) if in_vehicle => {
+                            // From 15 m to that side, heading across the path ahead.
+                            let front = link.info.read().1.box_max[0];
+                            tools::spawn_profile_car(veh, front + ahead, sd * 15.0, -sd * 90.0, speed, &mut extras, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok pullout".into()
+                        }
                         remote::Cmd::Obstacle(behind, gap) if in_vehicle => {
                             let info = link.info.read().1;
                             let bumper = if behind { info.box_min[0] } else { info.box_max[0] };

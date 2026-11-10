@@ -1,0 +1,24 @@
+# Junction AEB: at 40 km/h on the main road, a car from a side road on the
+# left crosses at 30 km/h, timed to hit the car. The driver doesn't react
+# (the GTA gate drive ended this way, 2026-11-09). Only the front corner
+# radars see it in time; AEB must stop the car short of its path.
+name = "Junction AEB: a car pulls out from the left at 40 km/h"
+feature = "none"
+duration = 12.0
+
+[ego]
+speed_kph = 40
+
+[[actor]]
+s = 29
+d = 20
+heading = -90
+speed_kph = 30
+
+[repeat]
+count = 10
+vary_s = 2
+vary_d = 3
+
+[pass]
+min_aeb = 1

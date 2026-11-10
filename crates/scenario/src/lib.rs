@@ -42,7 +42,7 @@ pub struct Scenario {
     #[serde(default)]
     pub obstacle: Vec<ObstacleToml>,
     pub traffic: Option<TrafficToml>,
-    /// Surround features switched off ("bsd", "rcta", "park", "lka"): control
+    /// Features switched off ("bsd", "rcta", "park", "lka", "junction"): control
     /// runs that show a scenario needs the feature.
     #[serde(default)]
     pub disabled: Vec<String>,
@@ -483,7 +483,8 @@ pub fn run(sc: &Scenario, run: u32) -> Report {
             "rcta" => toggles.rcta = false,
             "park" => toggles.park = false,
             "lka" => toggles.lka = false,
-            other => panic!("{}: unknown feature {other:?} in `disabled` (bsd, rcta, park, lka)", sc.name),
+            "junction" => toggles.junction = false,
+            other => panic!("{}: unknown feature {other:?} in `disabled` (bsd, rcta, park, lka, junction)", sc.name),
         }
     }
     for e in &sc.enabled {

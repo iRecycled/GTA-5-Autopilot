@@ -4,6 +4,7 @@
 //! knows which host game is running: host quirks (pedal deadzones, how a
 //! standstill hold is applied) belong to that host's adapter (D22).
 
+pub mod lateral;
 pub mod longitudinal;
 
 pub use longitudinal::{Config, Output, SpeedController};

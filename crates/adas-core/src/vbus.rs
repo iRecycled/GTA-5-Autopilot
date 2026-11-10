@@ -13,7 +13,10 @@ use crate::actuators::{AccelRequest, AdasRequest, FULL_DECEL_SENT, SteerRequest}
 use crate::msgs::{adas, chassis};
 use adapter_api::{VehicleSample, sample_flags};
 use can::{Bus, CanMessage, Delivery, Frame, Topology, toyota};
-use sensors::{RadarObject, RadarScan, ULTRASONIC_COUNT, UltrasonicScan};
+use sensors::{CamObject, CameraFrame, LaneFit, RadarObject, RadarScan, ULTRASONIC_COUNT, UltrasonicScan};
+
+/// The camera's lane line message ids: left, right, left2, right2.
+pub const CAM_LANE_IDS: [u32; 4] = [adas::CamLaneLeft::ID, adas::CamLaneRight::ID, adas::CamLaneLeft2::ID, adas::CamLaneRight2::ID];
 
 /// The four corner radars' (status, object) message ids, in layout order:
 /// front left, front right, rear left, rear right.
@@ -47,6 +50,7 @@ pub struct SensorOut<'a> {
     /// Corner radars, in [`CORNER_IDS`] order.
     pub corners: [Option<&'a RadarScan>; 4],
     pub park: Option<&'a UltrasonicScan>,
+    pub camera: Option<&'a CameraFrame>,
 }
 
 /// What reached the ADAS ECU this step.
@@ -55,6 +59,7 @@ pub struct Arrived {
     pub front: Option<RadarScan>,
     pub corners: [Option<RadarScan>; 4],
     pub park: Option<UltrasonicScan>,
+    pub camera: Option<CameraFrame>,
 }
 
 const TOPOLOGY: &str = include_str!("../../../config/topology.toml");
@@ -135,6 +140,9 @@ pub struct Vehicle {
     park_counter: u8,
     /// The park ECU's frames received so far this cycle (front, rear).
     park_rx: (Option<ParkHalf>, Option<ParkHalf>),
+    cam_counter: u8,
+    /// The camera frame being received, the objects it announced, the lines so far.
+    cam_rx: Option<(CameraFrame, usize, u8)>,
     /// Scans whose creation frame is known, by scan counter (for latency).
     sent_scans: Vec<(u32, u64)>,
     pub stats: BusStats,
@@ -196,6 +204,8 @@ impl Vehicle {
             corner_sent: Default::default(),
             park_counter: 0,
             park_rx: (None, None),
+            cam_counter: 0,
+            cam_rx: None,
             sent_scans: Vec::new(),
             stats: BusStats::default(),
             last_frames: Vec::new(),
@@ -387,6 +397,9 @@ impl Vehicle {
         if let Some(p) = out.park {
             self.publish_park(p);
         }
+        if let Some(c) = out.camera {
+            self.publish_camera(c);
+        }
         self.last_frames.clear();
         let mut arrived = Arrived::default();
         for f in self.chassis.step(t) {
@@ -399,6 +412,10 @@ impl Vehicle {
             if let Some(k) = CORNER_IDS.iter().position(|&(st, ob)| f.id == st || f.id == ob) {
                 if let Some(sc) = self.read_corner(k, &f, frame) {
                     arrived.corners[k] = Some(sc);
+                }
+            } else if (adas::CamStatus::ID..=adas::CamObject::ID).contains(&f.id) {
+                if let Some(c) = self.read_camera(&f) {
+                    arrived.camera = Some(c);
                 }
             } else if f.id == adas::ParkSensorsFront::ID || f.id == adas::ParkSensorsRear::ID {
                 if let Some(p) = self.read_park(&f) {
@@ -442,6 +459,93 @@ impl Vehicle {
                 self.stats.corner_latency_frames = if k == 0 { lat } else { self.stats.corner_latency_frames.max(lat) };
             }
             return Some(RadarScan { scan: p.scan, objects: p.objects });
+        }
+        None
+    }
+
+    /// The camera ECU: a status frame, its four lane lines, one frame per object.
+    fn publish_camera(&mut self, c: &CameraFrame) {
+        let objects = &c.objects[..c.objects.len().min(32)];
+        let mut counter = || {
+            let n = self.cam_counter;
+            self.cam_counter = n.wrapping_add(1);
+            n as f64
+        };
+        let limit = if c.speed_limit > 0.0 { (c.speed_limit * 3.6).round() as f64 } else { 0.0 };
+        let status = [("FRAME_COUNTER", (c.frame & 0xFFFF) as f64), ("NUM_OBJECTS", objects.len() as f64), ("SPEED_LIMIT", limit.min(255.0)), ("COUNTER", counter())];
+        let mut frames = vec![(adas::CamStatus::ID, adas::encode_signals(adas::CamStatus::ID, &status).expect("camera status"))];
+        for (k, l) in c.lanes.iter().enumerate() {
+            let v = [
+                ("C0", l.c[0] as f64),
+                ("C1", l.c[1] as f64),
+                ("C2", l.c[2] as f64),
+                ("C3", l.c[3] as f64),
+                ("VIEW_RANGE", l.range.min(255.0) as f64),
+                ("QUALITY", l.quality as f64),
+                ("LINE_TYPE", l.kind as f64),
+                ("VALID", l.valid as u8 as f64),
+                ("COUNTER", counter()),
+            ];
+            frames.push((CAM_LANE_IDS[k], adas::encode_signals(CAM_LANE_IDS[k], &v).expect("camera lane")));
+        }
+        for (slot, o) in objects.iter().enumerate() {
+            let v = [
+                ("SLOT", slot as f64),
+                ("TRACK_ID", (o.id & 0xFFFF) as f64),
+                ("CLASS", o.class as f64),
+                ("DIST_X", o.x as f64),
+                ("DIST_Y", o.y as f64),
+                ("VEL_X", o.vx as f64),
+                ("VEL_Y", o.vy as f64),
+                ("WIDTH", o.width as f64),
+                ("CONFIDENCE", o.confidence as f64),
+                ("COUNTER", counter()),
+            ];
+            frames.push((adas::CamObject::ID, adas::encode_signals(adas::CamObject::ID, &v).expect("camera object")));
+        }
+        for (id, mut d) in frames {
+            toyota::seal(id, &mut d);
+            self.adas.send(id, d);
+        }
+    }
+
+    /// A camera frame is complete once its status, four lines and all its
+    /// objects have arrived.
+    fn read_camera(&mut self, f: &Frame) -> Option<CameraFrame> {
+        if !toyota::verify(f.id, &f.data) {
+            self.stats.errors += 1;
+            return None;
+        }
+        let sig = adas::decode_signals(f.id, &f.data)?;
+        let get = |n: &str| sig.iter().find(|(s, _)| *s == n).map_or(0.0, |(_, v)| *v);
+        if f.id == adas::CamStatus::ID {
+            let frame = CameraFrame { frame: get("FRAME_COUNTER") as u32, speed_limit: get("SPEED_LIMIT") as f32 / 3.6, ..Default::default() };
+            self.cam_rx = Some((frame, get("NUM_OBJECTS") as usize, 0));
+        } else if let Some((c, _, lanes)) = self.cam_rx.as_mut() {
+            if let Some(k) = CAM_LANE_IDS.iter().position(|&id| id == f.id) {
+                c.lanes[k] = LaneFit {
+                    valid: get("VALID") > 0.5,
+                    c: [get("C0") as f32, get("C1") as f32, get("C2") as f32, get("C3") as f32],
+                    range: get("VIEW_RANGE") as f32,
+                    kind: get("LINE_TYPE") as u8,
+                    quality: get("QUALITY") as u8,
+                };
+                *lanes += 1;
+            } else if f.id == adas::CamObject::ID {
+                c.objects.push(CamObject {
+                    id: get("TRACK_ID") as u32,
+                    class: get("CLASS") as u8,
+                    x: get("DIST_X") as f32,
+                    y: get("DIST_Y") as f32,
+                    vx: get("VEL_X") as f32,
+                    vy: get("VEL_Y") as f32,
+                    width: get("WIDTH") as f32,
+                    confidence: get("CONFIDENCE") as f32,
+                });
+            }
+        }
+        if self.cam_rx.as_ref().is_some_and(|(c, n, lanes)| *lanes >= 4 && c.objects.len() >= *n) {
+            return self.cam_rx.take().map(|(c, _, _)| c);
         }
         None
     }
@@ -764,6 +868,24 @@ mod tests {
         v.step(775.0, 1, &VehicleSample::default(), None);
         // One frame per periodic message (eight), not 775 s of backlog.
         assert!(v.stats.chassis_frames <= 8, "{} frames in the first step", v.stats.chassis_frames);
+    }
+
+    #[test]
+    fn a_camera_frame_crosses_the_adas_bus() {
+        let mut v = Vehicle::new(Delivery::Reactive);
+        let mut c = CameraFrame { frame: 41, speed_limit: 100.0 / 3.6, ..Default::default() };
+        c.lanes[0] = LaneFit { valid: true, c: [1.83, 0.012, 0.00125, 2.0e-6], range: 78.0, kind: 1, quality: 3 };
+        c.lanes[1] = LaneFit { valid: true, c: [-1.77, 0.012, 0.0013, 0.0], range: 80.0, kind: 3, quality: 3 };
+        c.objects.push(CamObject { id: 9, class: 3, x: 22.5, y: -1.1, vx: 0.0, vy: 1.4, width: 0.5, confidence: 0.9 });
+        let got = v.step_all(0.0, 0, &VehicleSample::default(), &SensorOut { camera: Some(&c), ..Default::default() }).camera.expect("a frame");
+        assert_eq!((got.frame, got.objects.len()), (41, 1));
+        let (l, r) = (got.lanes[0], got.lanes[1]);
+        assert!(l.valid && r.valid && !got.lanes[2].valid);
+        assert!((l.c[0] - 1.83).abs() < 0.002 && (l.c[2] - 0.00125).abs() < 1e-6 && (l.c[3] - 2.0e-6).abs() < 2e-8, "{l:?}");
+        assert_eq!((l.range, r.kind), (78.0, 3));
+        assert!((got.speed_limit * 3.6 - 100.0).abs() < 0.01);
+        let o = got.objects[0];
+        assert!(o.class == 3 && (o.x - 22.5).abs() < 0.05 && (o.vy - 1.4).abs() < 0.05);
     }
 
     #[test]

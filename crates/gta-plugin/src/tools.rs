@@ -13,6 +13,15 @@ pub const SPOTS: &[(&str, f32, f32, f32, f32, bool)] = &[
     ("airport taxiway", -1336.0, -3044.0, 13.9, 60.0, false),
     ("downtown road", 215.0, -880.0, 30.5, 0.0, true),
     ("Del Perro freeway", -1150.0, -750.0, 20.0, 0.0, true),
+    // A two-lane country road east of Sandy Shores (one lane each way): the
+    // Phase 3 lane-centering road.
+    ("Sandy Shores road", 2470.0, 4000.0, 40.0, 0.0, true),
+    // Spots tried for the lane map (the Phase 3 survey): b's road stops short,
+    // c and d gave no road, e jumps to the parallel carriageway after 40 m.
+    ("survey b", -2200.0, 4300.0, 50.0, 0.0, true),
+    ("survey c", 1200.0, -1800.0, 35.0, 0.0, true),
+    ("survey d", 2400.0, -800.0, 60.0, 0.0, true),
+    ("survey e", 1600.0, 1200.0, 80.0, 0.0, true),
 ];
 
 /// Spots from `%LOCALAPPDATA%\adas\spots.txt` if present (outside the game
@@ -111,6 +120,21 @@ pub fn teleport(ped: i32, veh: i32, idx: usize, log: &mut impl Write) {
         let found: bool = invoke!(n::GET_GROUND_Z_FOR_3D_COORD, tx, ty, tz + 50.0, &mut gz as *mut f32, false, false);
         let () = invoke!(n::SET_ENTITY_COORDS, e, tx, ty, if found { gz + 0.5 } else { tz + 0.5 }, false, false, false, true);
         let () = invoke!(n::SET_ENTITY_HEADING, e, th);
+        // Snapped to a node, the car stands on the road's node line (on a
+        // two-way road, its centre line): move it into the first lane in its
+        // direction.
+        if snap {
+            let off = crate::lanes::lane_offset_at(geom::V2::new(tx, ty), tz, th, crate::lanes::LANE_WIDTH);
+            if off != 0.0 {
+                let r = th.to_radians();
+                // Left of heading h (GTA: 0 = north, CCW) is (-cos h, -sin h).
+                let (lx, ly) = (-r.cos(), -r.sin());
+                let p: Vector3 = invoke!(n::GET_ENTITY_COORDS, e, true);
+                let () = invoke!(n::SET_ENTITY_COORDS, e, p.x + lx * off, p.y + ly * off, p.z, false, false, false, true);
+                let () = invoke!(n::SET_ENTITY_HEADING, e, th);
+                let _ = writeln!(log, "TELEPORT: moved {:.1} m {} into a lane", off.abs(), if off < 0.0 { "right" } else { "left" });
+            }
+        }
         if veh != 0 {
             let _: bool = invoke!(n::SET_VEHICLE_ON_GROUND_PROPERLY, veh, 5.0f32);
         }
@@ -243,6 +267,8 @@ pub struct Extras {
     pub cars: Vec<ProfileCar>,
     /// Frozen obstacles.
     pub parked: Vec<i32>,
+    /// Pedestrians waiting to cross: (ped, where they walk to).
+    pub walkers: Vec<(i32, Vector3)>,
 }
 
 pub fn clear_extras(x: &mut Extras) {
@@ -252,6 +278,39 @@ pub fn clear_extras(x: &mut Extras) {
             let () = invoke!(n::DELETE_VEHICLE, &mut v as *mut i32);
         }
     }
+    for (mut p, _) in x.walkers.drain(..) {
+        unsafe {
+            let () = invoke!(n::SET_ENTITY_AS_MISSION_ENTITY, p, true, true);
+            let () = invoke!(n::DELETE_PED, &mut p as *mut i32);
+        }
+    }
+}
+
+/// A pedestrian waiting `forward` m ahead, `left` m to the side (negative
+/// right), facing across the road; `walk` sends them to the other side.
+pub fn spawn_walker(ego: i32, forward: f32, left: f32, x: &mut Extras, log: &mut impl Write) {
+    let Some(model) = load_model(c"a_m_y_business_01") else {
+        let _ = writeln!(log, "WALKER: model did not load");
+        return;
+    };
+    let (px, py, pz, h) = ego_offset(ego, forward, left);
+    let (tx, ty, tz, _) = ego_offset(ego, forward, -left);
+    unsafe {
+        let across = if left < 0.0 { h + 90.0 } else { h - 90.0 };
+        let ped: i32 = invoke!(n::CREATE_PED, 4i32, model, px, py, pz, across, false, false);
+        let () = invoke!(n::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, ped, true);
+        let () = invoke!(n::SET_MODEL_AS_NO_LONGER_NEEDED, model);
+        let _ = writeln!(log, "WALKER {forward:.0} m ahead, {left:.1} m to the left (ped {ped})");
+        x.walkers.push((ped, Vector3::new(tx, ty, tz)));
+    }
+}
+
+/// Every waiting pedestrian walks across (about 1.4 m/s).
+pub fn walk(x: &Extras, log: &mut impl Write) {
+    for &(ped, to) in &x.walkers {
+        let () = unsafe { invoke!(n::TASK_GO_STRAIGHT_TO_COORD, ped, to.x, to.y, to.z, 1.0f32, -1i32, 0.0f32, 0.0f32) };
+    }
+    let _ = writeln!(log, "WALK: {} pedestrians cross", x.walkers.len());
 }
 
 /// Keeps the profile cars at their speeds (call every frame).

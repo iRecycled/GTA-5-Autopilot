@@ -110,36 +110,18 @@ fn nearest_box_point(a: &Actor, mx: f32, my: f32) -> (f32, f32) {
 /// Obstacle ids in [`Collision::actor`] start here.
 pub const OBSTACLE_ID_BASE: u32 = 1_000_000;
 
-/// The road: straight for `straight` metres, then a left bend of `radius`
-/// (infinite = straight forever). Lane 0 is the ego lane; +1 is to its left.
+pub mod road;
+pub use road::{Marking, MarkingKind, Road};
+
+/// Who steers the ego car when the core doesn't.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Road {
-    pub straight: f32,
-    pub radius: f32,
-    pub lane_width: f32,
-}
-
-impl Default for Road {
-    fn default() -> Self {
-        Self { straight: f32::INFINITY, radius: f32::INFINITY, lane_width: 3.6 }
-    }
-}
-
-impl Road {
-    /// World position and heading at arc length `s`, lateral offset `d` (left +).
-    pub fn pose(&self, s: f32, d: f32) -> (V2, f32) {
-        if s <= self.straight || !self.radius.is_finite() {
-            return (V2::new(s, d), 0.0);
-        }
-        let th = (s - self.straight) / self.radius;
-        let r = self.radius - d;
-        (V2::new(self.straight + r * th.sin(), self.radius - r * th.cos()), th)
-    }
-
-    /// Curvature at `s` (1/m).
-    pub fn curvature(&self, s: f32) -> f32 {
-        if s > self.straight && self.radius.is_finite() { 1.0 / self.radius } else { 0.0 }
-    }
+pub enum DriverSteer {
+    /// Holds the car exactly on its line (Phases 1 and 2's driver).
+    Perfect,
+    /// Steers toward this offset (m, left +) like a driver would.
+    Hands(f32),
+    /// Hands off: the wheel returns to centre (self-aligning, about 1 s).
+    Off,
 }
 
 /// The simulated ego car.
@@ -155,11 +137,14 @@ pub struct EgoParams {
     pub lag: f32,
     pub length: f32,
     pub width: f32,
+    pub wheelbase: f32,
+    /// The steering's first-order lag (s).
+    pub steer_lag: f32,
 }
 
 impl Default for EgoParams {
     fn default() -> Self {
-        Self { accel_max: 4.5, v_max: 55.0, brake_max: 8.0, lag: 0.15, length: 4.7, width: 1.9 }
+        Self { accel_max: 4.5, v_max: 55.0, brake_max: 8.0, lag: 0.15, length: 4.7, width: 1.9, wheelbase: 2.7, steer_lag: 0.08 }
     }
 }
 
@@ -187,12 +172,18 @@ pub struct ActorSpec {
     /// relative to the road's direction at `s`; π/2 = toward +d). Lane events
     /// don't apply.
     pub heading: Option<f32>,
+    pub kind: ActorKind,
 }
 
 impl ActorSpec {
     /// A car following the road.
     pub fn car(s: f32, d: f32, v: f32) -> Self {
-        Self { s, d, v, length: 4.5, width: 1.9, events: vec![], heading: None }
+        Self { s, d, v, length: 4.5, width: 1.9, events: vec![], heading: None, kind: ActorKind::Vehicle }
+    }
+
+    /// A pedestrian standing at (s, d), walking at `heading` when told to.
+    pub fn pedestrian(s: f32, d: f32, heading: f32) -> Self {
+        Self { s, d, v: 0.0, length: 0.5, width: 0.5, events: vec![], heading: Some(heading), kind: ActorKind::Pedestrian }
     }
 }
 
@@ -243,6 +234,15 @@ pub struct World {
     /// Ego arc length and speed.
     pub s: f32,
     pub v: f32,
+    /// Ego lateral offset from the road's reference line (m, left +), its
+    /// heading relative to the road (rad) and road-wheel angle (rad).
+    pub d: f32,
+    pub psi: f32,
+    pub steer: f32,
+    /// Who steers when the core doesn't.
+    pub driver: DriverSteer,
+    /// The core steered in the last step.
+    pub core_steering: bool,
     /// Ego longitudinal acceleration actually produced (m/s²).
     pub a: f32,
     actors: Vec<ActorState>,
@@ -270,6 +270,11 @@ impl World {
             frame: 1,
             s: 0.0,
             v: ego_speed,
+            d: 0.0,
+            psi: 0.0,
+            steer: 0.0,
+            driver: DriverSteer::Perfect,
+            core_steering: false,
             a: 0.0,
             actors: Vec::new(),
             collision: None,
@@ -305,16 +310,66 @@ impl World {
             let mut s = self.s - traffic.range + l.gap * rng.unit();
             while s < self.s + traffic.range {
                 let v = (l.speed + l.spread * (2.0 * rng.unit() - 1.0)).max(0.0);
-                self.push_actor(ActorSpec::car(s, l.d, v), Some(li));
+                // Not on top of the ego car in its own lane.
+                if (l.d - self.d).abs() > 0.5 * self.road.lane_width || (s - self.s).abs() > 30.0 {
+                    self.push_actor(ActorSpec::car(s, l.d, v), Some(li));
+                }
                 s += l.gap * (0.5 + rng.unit());
             }
         }
         self.traffic = Some((traffic, rng));
     }
 
+    /// The ego car's world position and heading.
+    pub fn ego_world(&self) -> (V2, f32) {
+        let (p, h) = self.road.pose(self.s, self.d);
+        (p, h + self.psi)
+    }
+
     fn ego_pose(&self) -> EgoPose {
-        let (p, h) = self.road.pose(self.s, 0.0);
+        let (p, h) = self.ego_world();
         EgoPose::new(p, V2::new(h.cos(), h.sin()))
+    }
+
+    /// The lane markings around the ego car (`caps::MAP`): every marking
+    /// present from 10 m behind to 150 m ahead, sampled every 8 m of road.
+    pub fn lane_map(&self) -> adapter_api::LaneMap {
+        use adapter_api::{LaneMap, MAX_LANE_LINES, MAX_LINE_POINTS, line_kind};
+        let ego = self.ego_pose();
+        let mut m = LaneMap { header: self.header(MsgKind::LaneMap), speed_limit: self.road.speed_limit, ..Default::default() };
+        for mk in &self.road.markings {
+            if m.count as usize >= MAX_LANE_LINES {
+                break;
+            }
+            let line = &mut m.lines[m.count as usize];
+            for k in 0..MAX_LINE_POINTS {
+                let s = self.s - 10.0 + 160.0 * k as f32 / (MAX_LINE_POINTS - 1) as f32;
+                if let Some(d) = mk.d_at(s) {
+                    let (p, _) = self.road.pose(s, d);
+                    let q = ego.to_vehicle(p);
+                    line.points[line.count as usize] = [q.x, q.y];
+                    line.count += 1;
+                }
+            }
+            if line.count >= 2 {
+                line.kind = match mk.kind {
+                    MarkingKind::Dashed => line_kind::DASHED,
+                    MarkingKind::Solid => line_kind::SOLID,
+                    MarkingKind::Edge => line_kind::EDGE,
+                };
+                m.count += 1;
+            } else {
+                *line = Default::default();
+            }
+        }
+        m
+    }
+
+    /// Ground truth: the ego car's offset from the centre of the lane it is
+    /// in (m, left +), and that lane's width; None off the road.
+    pub fn lane_offset(&self) -> Option<(f32, f32)> {
+        let (r, l) = self.road.lane_at(self.s, self.d)?;
+        Some((self.d - 0.5 * (r + l), l - r))
     }
 
     /// An actor's world position and heading.
@@ -328,7 +383,7 @@ impl World {
     /// Every box the world holds, in the ego frame: (id, box, is an actor).
     fn boxes(&self) -> Vec<(u32, Obb, bool)> {
         let ego = self.ego_pose();
-        let (_, ego_h) = self.road.pose(self.s, 0.0);
+        let (_, ego_h) = self.ego_world();
         let mut out = Vec::with_capacity(self.actors.len() + self.obstacles.len());
         for a in &self.actors {
             let (p, h) = self.actor_pose(a);
@@ -401,12 +456,20 @@ impl World {
             header: Header { kind: MsgKind::AdapterInfo, version: CONTRACT_VERSION, seq: 1, ..Default::default() },
             host: fixed_str("adas sim v2"),
             vehicle: fixed_str("sim sedan"),
-            capabilities: caps::PEDALS | caps::HOLD | caps::ACTORS | caps::LINE_OF_SIGHT | caps::RANGE_FANS | caps::GEAR | caps::TURN_SIGNALS,
+            capabilities: caps::PEDALS
+                | caps::HOLD
+                | caps::ACTORS
+                | caps::LINE_OF_SIGHT
+                | caps::RANGE_FANS
+                | caps::GEAR
+                | caps::TURN_SIGNALS
+                | caps::STEER
+                | caps::MAP,
             _reserved: 0,
             box_min,
             box_max,
-            max_steer_angle: f32::NAN,
-            wheelbase: 2.7,
+            max_steer_angle: 0.6,
+            wheelbase: self.ego_params.wheelbase,
         }
     }
 
@@ -437,8 +500,8 @@ impl World {
             speed: self.v,
             vx: if self.reverse { -self.v } else { self.v },
             vy: 0.0,
-            yaw_rate: self.v * self.road.curvature(self.s),
-            steer_angle: f32::NAN,
+            yaw_rate: self.yaw_rate(),
+            steer_angle: self.steer,
             wheel_omega: [f32::NAN; 4],
             rev_ratio: f32::NAN,
             gear: 1,
@@ -453,7 +516,7 @@ impl World {
     /// each sensor of `layout` (blocked by a nearer actor across the line).
     pub fn actors(&self, layout: &SensorLayout) -> ActorList {
         let ego = self.ego_pose();
-        let (_, ego_h) = self.road.pose(self.s, 0.0);
+        let (_, ego_h) = self.ego_world();
         let mut v: Vec<Actor> = self
             .actors
             .iter()
@@ -463,7 +526,7 @@ impl World {
                 let dv = ego.rotate_to_vehicle(V2::new(a.v * h.cos(), a.v * h.sin()));
                 Actor {
                     id: a.id,
-                    kind: ActorKind::Vehicle,
+                    kind: a.spec.kind,
                     los_mask: 0,
                     los_age: 0,
                     x: rel.x,
@@ -524,6 +587,59 @@ impl World {
         list
     }
 
+    /// The ego car's yaw rate (rad/s).
+    fn yaw_rate(&self) -> f32 {
+        let k = self.road.curvature(self.s);
+        if self.core_steering || self.driver != DriverSteer::Perfect {
+            let w = self.v * self.steer.tan() / self.ego_params.wheelbase;
+            if self.reverse { -w } else { w }
+        } else {
+            self.v * k
+        }
+    }
+
+    /// Moves the ego car `ds` (m, along its heading) and steers it: by the
+    /// core when it asks (`STEER` while engaged, or lane keeping's `LKA`
+    /// nudge), else by the simulated driver.
+    fn lateral(&mut self, cmd: &Command, ds: f32) {
+        let p = self.ego_params;
+        let dt = self.dt;
+        let core = cmd.flags & command_flags::STEER != 0 && cmd.flags & (command_flags::ENGAGED | command_flags::LKA) != 0;
+        self.core_steering = core;
+        let k = self.road.curvature(self.s);
+        let want = if core {
+            Some(cmd.steer_angle.clamp(-0.6, 0.6))
+        } else {
+            match self.driver {
+                DriverSteer::Perfect => None,
+                DriverSteer::Off => Some(self.steer * (1.0 - dt / 1.0).max(0.0)),
+                DriverSteer::Hands(target) => {
+                    // A driver's pursuit of the target line 1.2 s ahead.
+                    let look = (1.2 * self.v).max(6.0);
+                    let err = target - self.d - self.psi * look;
+                    Some((p.wheelbase * (2.0 * err / (look * look) + k)).atan().clamp(-0.5, 0.5))
+                }
+            }
+        };
+        let sign = if self.reverse { -1.0 } else { 1.0 };
+        match want {
+            None => {
+                // On its line exactly: the car follows the road.
+                self.s += sign * ds;
+                self.steer = (p.wheelbase * k).atan();
+                self.psi = 0.0;
+            }
+            Some(delta) => {
+                self.steer += (delta - self.steer) * (dt / p.steer_lag).min(1.0);
+                // Kinematic bicycle in the road frame.
+                let along = sign * ds * self.psi.cos() / (1.0 - k * self.d).max(0.2);
+                self.d += sign * ds * self.psi.sin();
+                self.psi = wrap_pi(self.psi + sign * ds * self.steer.tan() / p.wheelbase - k * along);
+                self.s += along;
+            }
+        }
+    }
+
     /// Advances one frame under `cmd`.
     pub fn step(&mut self, cmd: &Command) {
         let p = self.ego_params;
@@ -547,7 +663,7 @@ impl World {
             self.a = 0.0;
         }
         let ds = 0.5 * (v0 + self.v) * dt;
-        self.s += if self.reverse { -ds } else { ds };
+        self.lateral(cmd, ds);
 
         // Generated traffic follows the car ahead in its lane, and cars out
         // of range are replaced at the other end.
@@ -607,9 +723,12 @@ impl World {
         for i in 0..n {
             let Some(li) = self.actors[i].traffic_lane else { continue };
             let (s, want) = (self.actors[i].s, self.actors[i].spec.v);
+            // The car ahead in its lane: traffic, or the ego car.
+            let ego_ahead = ((self.actors[i].d - self.d).abs() < 0.5 * self.road.lane_width && self.s > s).then_some((self.s - s, self.v));
             let ahead = (0..n)
                 .filter(|&j| j != i && self.actors[j].traffic_lane == Some(li) && self.actors[j].s > s)
                 .map(|j| (self.actors[j].s - s, self.actors[j].v))
+                .chain(ego_ahead)
                 .min_by(|a, b| a.0.total_cmp(&b.0));
             let v = match ahead {
                 Some((gap, v_lead)) if gap < 30.0 => want.min(v_lead * (gap / 20.0).clamp(0.5, 1.0)),
@@ -645,7 +764,7 @@ impl World {
         let p = self.ego_params;
         self.actors
             .iter()
-            .filter(|a| a.free.is_none() && a.d.abs() < 0.5 * self.road.lane_width && a.s > self.s)
+            .filter(|a| a.free.is_none() && (a.d - self.d).abs() < 0.5 * self.road.lane_width && a.s > self.s)
             .map(|a| (a.s - self.s - 0.5 * (p.length + a.spec.length), a.v))
             .min_by(|x, y| x.0.total_cmp(&y.0))
     }
@@ -693,14 +812,6 @@ mod tests {
         assert_eq!(by_id(101).los_mask, 0, "car behind it hidden");
         // The next-lane car at 45 m is 4.6° off-axis: inside the ±10° beam and not blocked.
         assert_eq!(by_id(102).los_mask, 1, "next-lane car visible");
-    }
-
-    #[test]
-    fn bend_geometry() {
-        let r = Road { straight: 100.0, radius: 200.0, lane_width: 3.6 };
-        let (p, h) = r.pose(100.0 + 200.0 * core::f32::consts::FRAC_PI_2, 0.0);
-        assert!((p.x - 300.0).abs() < 1e-2 && (p.y - 200.0).abs() < 1e-2);
-        assert!((h - core::f32::consts::FRAC_PI_2).abs() < 1e-5);
     }
 
     #[test]

@@ -46,9 +46,11 @@ pub const CORNER_FL: usize = 1;
 pub const CORNER_FR: usize = 2;
 pub const CORNER_RL: usize = 3;
 pub const CORNER_RR: usize = 4;
+pub const FRONT_CAMERA: usize = 5;
 
-/// Front radar (160 m, ±10°) and four corner radars (80 m, ±75°), on a box
-/// from `box_min` to `box_max` (ISO, m). Refresh: 20 Hz at 72 fps ≈ 3.6 frames.
+/// Front radar (160 m, ±10°), four corner radars (80 m, ±75°) and the
+/// windshield camera (120 m, ±50°, 30 Hz), on a box from `box_min` to
+/// `box_max` (ISO, m). Radar refresh: 20 Hz at 72 fps ≈ 3.6 frames.
 pub fn default_layout(box_min: [f32; 3], box_max: [f32; 3]) -> SensorLayout {
     let z = 0.5;
     let deg = |d: f32| d.to_radians();
@@ -63,12 +65,14 @@ pub fn default_layout(box_min: [f32; 3], box_max: [f32; 3]) -> SensorLayout {
         _reserved: 0,
     };
     let (front, rear, left, right) = (box_max[0], box_min[0], box_max[1], box_min[1]);
-    let mut l = SensorLayout { count: 5, ..Default::default() };
+    let mut l = SensorLayout { count: 6, ..Default::default() };
     l.mounts[FRONT_RADAR] = mount(front, 0.0, 0.0, 10.0, 160.0);
     l.mounts[CORNER_FL] = mount(front, left, 45.0, 75.0, 80.0);
     l.mounts[CORNER_FR] = mount(front, right, -45.0, 75.0, 80.0);
     l.mounts[CORNER_RL] = mount(rear, left, 135.0, 75.0, 80.0);
     l.mounts[CORNER_RR] = mount(rear, right, -135.0, 75.0, 80.0);
+    // Behind the windshield, 1.8 m back from the front, 1.3 m up.
+    l.mounts[FRONT_CAMERA] = SensorMount { x: front - 1.8, z: box_min[2] + 1.3, refresh_frames: 2.4, ..mount(front - 1.8, 0.0, 0.0, 50.0, 120.0) };
     debug_assert!(l.count as usize <= MAX_SENSORS);
     l
 }

@@ -232,6 +232,20 @@ pub enum LeadKind {
 /// Nearest confirmed track in the lane along the predicted path.
 pub fn select_lead(tracks: &[Track], ego_speed: f32, yaw_rate: f32, ego_front_x: f32, half_lane: f32, kind: LeadKind) -> Option<Lead> {
     let k = (yaw_rate / ego_speed.max(2.0)).clamp(-0.1, 0.1);
+    select_on(tracks, ego_front_x, half_lane, kind, |x| 0.5 * k * x * x)
+}
+
+/// As [`select_lead`], with the path given (Phase 3: the lane centre the
+/// camera sees, a cubic in the ego frame) instead of predicted from the yaw
+/// rate, and `half_lane` that lane's half width. Oncoming traffic (closing
+/// faster than 2 m/s over ground) is neither followed nor braked for, as in
+/// production AEB of this generation.
+pub fn select_lead_in_lane(tracks: &[Track], lane: &[f32; 4], ego_front_x: f32, half_lane: f32, kind: LeadKind) -> Option<Lead> {
+    let oncoming: Vec<Track> = tracks.iter().filter(|t| t.vx() >= -2.0).cloned().collect();
+    select_on(&oncoming, ego_front_x, half_lane, kind, |x| lane[0] + x * (lane[1] + x * (lane[2] + x * lane[3])))
+}
+
+fn select_on(tracks: &[Track], ego_front_x: f32, half_lane: f32, kind: LeadKind, path: impl Fn(f32) -> f32) -> Option<Lead> {
     tracks
         .iter()
         .filter(|t| t.confirmed && t.x() > ego_front_x - 0.5)
@@ -240,7 +254,7 @@ pub fn select_lead(tracks: &[Track], ego_speed: f32, yaw_rate: f32, ego_front_x:
             LeadKind::Collision => true,
         })
         .filter_map(|t| {
-            let path_y = 0.5 * k * t.x() * t.x();
+            let path_y = path(t.x());
             let offset = t.y() - path_y;
             (offset.abs() <= half_lane + 0.5 * t.width.min(2.5) - 0.3).then_some(Lead {
                 id: t.id,
@@ -254,10 +268,49 @@ pub fn select_lead(tracks: &[Track], ego_speed: f32, yaw_rate: f32, ego_front_x:
         .min_by(|a, b| a.gap.total_cmp(&b.gap))
 }
 
+/// The pedestrian the car would hit: the nearest confirmed track ahead that
+/// is in the car's path now (its half width plus 0.3 m), or will be by the
+/// time the car reaches it (its half width plus 0.6 m), from its walking
+/// velocity. As a `Lead` for AEB: gap, its speed along x, stationary.
+pub fn select_pedestrian(tracks: &[Track], ego_speed: f32, ego_front_x: f32, half_width: f32) -> Option<Lead> {
+    tracks
+        .iter()
+        .filter(|t| t.confirmed && t.x() > ego_front_x - 0.5)
+        .filter_map(|t| {
+            let gap = (t.x() - ego_front_x).max(0.0);
+            let closing = ego_speed - t.vx();
+            let in_path = t.y().abs() < half_width + 0.3;
+            let will_be = closing > 0.5 && {
+                let reach = (gap / closing).min(4.0);
+                (t.y() + t.vy() * reach).abs() < half_width + 0.6
+            };
+            (in_path || will_be).then_some(Lead { id: t.id, gap, v: t.vx(), a: 0.0, offset: t.y(), stationary: true })
+        })
+        .min_by(|a, b| a.gap.total_cmp(&b.gap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sensors::RadarObject;
+
+    #[test]
+    fn a_pedestrian_stepping_into_the_path() {
+        let ped = |y: f32, vy: f32| {
+            let mut t = Tracker::new(TrackerConfig { confirm_hits: 1, ..Default::default() });
+            t.update(&RadarScan { scan: 0, objects: vec![RadarObject { id: 3, x: 25.0, y, vx: 0.0, vy, width: 0.5, half_length: 0.25, stationary: false, clutter: false }] }, 0.03);
+            select_pedestrian(t.tracks(), 8.3, 2.3, 0.95)
+        };
+        // 4 m to the right, walking left at 1.5 m/s: in the path in 2.7 s, the car arrives in 2.8 s.
+        assert!(ped(-4.0, 1.5).is_some());
+        // Standing on the kerb: no.
+        assert!(ped(-4.0, 0.0).is_none());
+        // Walking away: no.
+        assert!(ped(-4.0, -1.5).is_none());
+        // In the path: yes.
+        let l = ped(0.5, 0.0).unwrap();
+        assert!((l.gap - 22.7).abs() < 0.01);
+    }
 
     fn obj(id: u32, x: f32, y: f32, vx: f32) -> RadarObject {
         RadarObject { id, x, y, vx, vy: 0.0, width: 1.9, half_length: 2.25, stationary: vx.abs() < 0.5, clutter: false }

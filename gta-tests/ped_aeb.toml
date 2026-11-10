@@ -1,0 +1,20 @@
+# Phase 3: pedestrian AEB. ACC holds 30 km/h; a pedestrian waits on the
+# right 45 m ahead and steps out, timed to be in the car's path when it
+# arrives. Only the camera sees pedestrians.
+name = "Pedestrian AEB: someone steps out at 30 km/h"
+steps = [
+  "engage",
+  "set 30",
+  "wait speed>=28 25",
+  "walker 45 right",
+  "sleep 2.0",
+  "walk",
+  "wait event:AEB braking 8",
+  "wait stopped 6",
+  "sleep 1",
+]
+
+[pass]
+min_aeb = 1
+end_kph_below = 1
+events = ["AEB braking"]

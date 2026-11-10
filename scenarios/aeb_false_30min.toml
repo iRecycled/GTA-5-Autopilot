@@ -1,0 +1,39 @@
+# Phase 3 gate (moved from Phase 1): at most 1 false AEB activation per 30
+# minutes in traffic. The autopilot follows traffic in its own lane for 30
+# minutes on a road of bends, with traffic either side. Also counts towards
+# the takeover rate: at most 1 per 10 km.
+name = "AEB: 30 minutes of autopilot in traffic"
+feature = "autopilot"
+duration = 1800.0
+
+[road]
+pieces = [[900, 0], [600, 1500], [500, 0], [700, -1200], [600, 0], [500, 900]]
+repeat_pieces = 15
+
+[ego]
+speed_kph = 100
+engage_at = 0.5
+set_kph = 110
+
+[traffic]
+seed = 23
+[[traffic.lane]]
+lane = 0
+speed_kph = 95
+spread_kph = 12
+gap = 140
+[[traffic.lane]]
+lane = 1
+speed_kph = 115
+spread_kph = 10
+gap = 80
+[[traffic.lane]]
+lane = -1
+speed_kph = 88
+spread_kph = 10
+gap = 70
+
+[pass]
+max_aeb = 0
+max_takeovers_per_10km = 1
+max_departures = 0

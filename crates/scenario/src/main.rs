@@ -26,6 +26,14 @@ fn main() {
         let passed = reports.iter().filter(|r| r.passed()).count();
         println!("{} — {passed}/{} passed", sc.name, reports.len());
         for r in &reports {
+            let lanes = if r.km > 0.0 && (r.lane_rms > 0.0 || r.takeovers > 0 || r.lka > 0 || r.departures > 0) {
+                format!(
+                    " | lane RMS {:.3} m, max {:.2} m, departures {}, takeovers {} in {:.1} km, centering {:.0} %, lat accel {:.2}, LKA {}",
+                    r.lane_rms, r.lane_max, r.departures, r.takeovers, r.km, 100.0 * r.centering, r.max_lat_accel, r.lka
+                )
+            } else {
+                String::new()
+            };
             let surround = if r.bsd_truth != [0, 0] || r.bsd_false > 0 || r.rcta > 0 || r.park > 0 || r.clearance.is_finite() {
                 format!(
                     " | BSD {}/{} L, {}/{} R, latency {:.2} s, false {} | RCTA {} | park {} | room {:.2} m",
@@ -35,7 +43,7 @@ fn main() {
                 String::new()
             };
             println!(
-                "  run {:2}: {} | jerk {:.2} | gap err {:.2} s | AEB {} | min TTC {:.2} s | end {:.1} km/h, gap {:.1} m{surround}{}",
+                "  run {:2}: {} | jerk {:.2} | gap err {:.2} s | AEB {} | min TTC {:.2} s | end {:.1} km/h, gap {:.1} m{surround}{lanes}{}",
                 r.run,
                 if r.passed() { "pass" } else { "FAIL" },
                 r.max_jerk,

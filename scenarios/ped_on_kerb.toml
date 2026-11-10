@@ -1,0 +1,24 @@
+# Pedestrians on the kerb, one standing, one walking along it: no AEB.
+name = "Pedestrian AEB: no braking for people on the kerb"
+feature = "none"
+duration = 15.0
+
+[ego]
+speed_kph = 40
+
+[[actor]]
+s = 60
+d = -4.0
+heading = 0
+pedestrian = true
+speed_kph = 0
+
+[[actor]]
+s = 90
+d = 4.2
+heading = 0
+pedestrian = true
+speed_kph = 5
+
+[pass]
+max_aeb = 0

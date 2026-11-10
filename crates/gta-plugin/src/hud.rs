@@ -47,6 +47,81 @@ fn park_colour(d: f32) -> (i32, i32, i32) {
     }
 }
 
+/// Draws the camera's lane lines on the road (3D lines in the world): green
+/// while lane centering steers, white otherwise. `bottom`: the car's box
+/// bottom below its reference point (m, ISO z).
+pub fn draw_lanes(h: &Hud, veh: i32, bottom: f32) {
+    use adapter_api::hud_flags as hf;
+    let ep: shv_sys::Vector3 = unsafe { invoke!(n::GET_ENTITY_COORDS, veh, true) };
+    let ef: shv_sys::Vector3 = unsafe { invoke!(n::GET_ENTITY_FORWARD_VECTOR, veh) };
+    let ego = geom::EgoPose::new(geom::V2::new(ep.x, ep.y), geom::V2::new(ef.x, ef.y));
+    let z = ep.z + bottom + 0.05;
+    let (r, g, b) = if h.flags & hf::LANE_CENTERING != 0 { (80, 230, 120) } else { (230, 230, 230) };
+    for l in &h.lanes {
+        let range = l[4].min(80.0);
+        if range < 5.0 {
+            continue;
+        }
+        let y = |x: f32| l[0] + x * (l[1] + x * (l[2] + x * l[3]));
+        let n = 16;
+        for i in 0..n {
+            let (x0, x1) = (2.0 + (range - 2.0) * i as f32 / n as f32, 2.0 + (range - 2.0) * (i + 1) as f32 / n as f32);
+            let (a, b2) = (ego.to_world(geom::V2::new(x0, y(x0))), ego.to_world(geom::V2::new(x1, y(x1))));
+            let () = unsafe { invoke!(n::DRAW_LINE, a.x, a.y, z, b2.x, b2.y, z, r, g, b, 200i32) };
+        }
+    }
+}
+
+/// Draws where the car is heading (amber: two lines at the car's sides, the
+/// arc its speed and yaw rate trace over the next few seconds) and the path
+/// the autopilot steers along (blue: the lane centre it tracks). `box_min`,
+/// `box_max`: the car's box corners (ego frame, m).
+pub fn draw_paths(h: &Hud, veh: i32, box_min: [f32; 3], box_max: [f32; 3]) {
+    let ep: shv_sys::Vector3 = unsafe { invoke!(n::GET_ENTITY_COORDS, veh, true) };
+    let ef: shv_sys::Vector3 = unsafe { invoke!(n::GET_ENTITY_FORWARD_VECTOR, veh) };
+    let ego = geom::EgoPose::new(geom::V2::new(ep.x, ep.y), geom::V2::new(ef.x, ef.y));
+    let z = ep.z + box_min[2] + 0.08;
+    let polyline = |pts: &mut dyn Iterator<Item = geom::V2>, (r, g, b): (i32, i32, i32)| {
+        let mut prev: Option<geom::V2> = None;
+        for p in pts {
+            let p = ego.to_world(p);
+            if let Some(q) = prev {
+                let () = unsafe { invoke!(n::DRAW_LINE, q.x, q.y, z, p.x, p.y, z, r, g, b, 220i32) };
+            }
+            prev = Some(p);
+        }
+    };
+    let n = 24;
+    let [k, len] = h.heading;
+    if len.abs() >= 1.0 {
+        // From the bumper in the direction of travel, along the circle; each
+        // side line offset along the circle's normal.
+        let x0 = if len > 0.0 { box_max[0] } else { box_min[0] };
+        for dy in [box_min[1], box_max[1]] {
+            polyline(
+                &mut (0..=n).map(|i| {
+                    let s = len * i as f32 / n as f32;
+                    let th = k * s;
+                    let (sx, sy) = if k.abs() < 1e-6 { (s, 0.0) } else { (th.sin() / k, (1.0 - th.cos()) / k) };
+                    geom::V2::new(x0 + sx - dy * th.sin(), sy + dy * th.cos())
+                }),
+                (255, 180, 50),
+            );
+        }
+    }
+    let c = h.plan;
+    if c[4] > 3.0 {
+        let to = c[4].min(120.0);
+        polyline(
+            &mut (0..=n).map(|i| {
+                let x = 2.0 + (to - 2.0) * i as f32 / n as f32;
+                geom::V2::new(x, c[0] + x * (c[1] + x * (c[2] + x * c[3])))
+            }),
+            (70, 160, 255),
+        );
+    }
+}
+
 /// Draws the surround HUD and plays its sounds. `live`: the HUD is fresh.
 pub fn draw(h: &Hud, live: bool, frame: i32, s: &mut Sounds) {
     if !live {

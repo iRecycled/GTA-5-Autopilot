@@ -1,0 +1,11 @@
+# Survey (not a test): parked on the Del Perro freeway for 45 s, the adapter
+# logs where AI traffic drives relative to the road's node line (with the
+# file %LOCALAPPDATA%/adas/lane_survey present). AI traffic keeps to lane
+# centres, so the offsets cluster there: that measures GTA's lane width and
+# where the lanes sit.
+name = "Survey: lanes on the freeway"
+spot = "Del Perro freeway"
+steps = ["sleep 45"]
+
+[pass]
+no_impact = false

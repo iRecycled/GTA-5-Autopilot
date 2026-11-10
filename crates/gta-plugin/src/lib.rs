@@ -29,6 +29,7 @@ mod actuate;
 mod fans;
 mod hud;
 mod input;
+mod lanes;
 mod n;
 mod remote;
 mod tools;
@@ -209,6 +210,7 @@ fn run() {
     let mut reverse = false;
     let mut reverse_for = 0i32;
     let mut hud_sounds = hud::Sounds::default();
+    let mut lanes_sys = lanes::Lanes::new();
     // A test's creeping driver: (backwards, speed m/s, until).
     let mut creep: Option<(bool, f32, u64)> = None;
     // Test commands over UDP (`remote`): scripted driver inputs until a time.
@@ -417,6 +419,23 @@ fn run() {
                             signal = 0;
                             "ok clear".into()
                         }
+                        remote::Cmd::Ai(on) if in_vehicle => {
+                            ai = on;
+                            if ai {
+                                engage_req = false;
+                            }
+                            tools::ai_drive(ped, veh, ai);
+                            format!("ok ai {}", if on { "on" } else { "off" })
+                        }
+                        remote::Cmd::Walker(dist, sd) if in_vehicle => {
+                            tools::spawn_walker(veh, dist, sd * 5.0, &mut extras, &mut log);
+                            last_tick = wall_time_ns();
+                            "ok walker".into()
+                        }
+                        remote::Cmd::Walk => {
+                            tools::walk(&extras, &mut log);
+                            "ok walk".into()
+                        }
                         remote::Cmd::Signal(sd) => {
                             signal = sd;
                             signal_since = wall_time_ns();
@@ -512,6 +531,7 @@ fn run() {
             if veh != info_for {
                 steering.reset();
                 actors_sys.reset();
+                lanes_sys.reset();
                 info_frames = 0;
             }
             info_for = veh;
@@ -540,7 +560,8 @@ fn run() {
                     | caps::DRIVER_INPUT
                     | caps::RANGE_FANS
                     | caps::TURN_SIGNALS
-                    | caps::GEAR,
+                    | caps::GEAR
+                    | caps::MAP,
                 _reserved: 0,
                 box_min: min_iso,
                 box_max: max_iso,
@@ -567,6 +588,10 @@ fn run() {
         let mut ranges = if in_vehicle && !paused { fans_sys.step(veh, &fan_layout) } else { adapter_api::RangeReport::default() };
         ranges.header = Header { kind: MsgKind::RangeReport, version: CONTRACT_VERSION, seq: seq.wrapping_add(1), frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() };
         link.ranges.write(&ranges);
+        // The lane markings around the car (the map capability).
+        let mut lane_map = if in_vehicle && !paused { lanes_sys.step(veh, &actor_list, &mut log) } else { adapter_api::LaneMap::default() };
+        lane_map.header = Header { kind: MsgKind::LaneMap, version: CONTRACT_VERSION, seq: seq.wrapping_add(1), frame: frame as u64, game_time_us, wall_time_ns: wall_time_ns() };
+        link.lanes.write(&lane_map);
 
         let mut s = VehicleSample::default();
         let mut measured_angle = f32::NAN;
@@ -936,10 +961,25 @@ fn run() {
                 let aeb_off = if hud.flags & hud_flags::AEB_OFF != 0 { " | AEB OFF" } else { "" };
                 let colour = if acc { (80, 220, 120) } else if hud.flags & hud_flags::UNAVAILABLE != 0 { (255, 170, 60) } else { (180, 180, 180) };
                 let () = invoke!(n::DRAW_RECT, 0.5f32, 0.925f32, 0.34f32, 0.045f32, 0i32, 0i32, 0i32, 170i32, false);
+                // Lane centering, the lines the camera sees, LKA.
+                let lanes_txt = if hud.flags & hud_flags::LANE_CENTERING != 0 {
+                    " | AUTOSTEER"
+                } else if hud.flags & hud_flags::STEER_OVERRIDE != 0 {
+                    " | steering: you"
+                } else if hud.flags & hud_flags::LKA != 0 {
+                    " | LANE KEEP"
+                } else {
+                    ""
+                };
                 let line = if hud.flags & hud_flags::UNAVAILABLE != 0 {
                     format!("ACC unavailable: {}{aeb_off}", adapter_api::hud_message::text(hud.message))
                 } else {
-                    format!("{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}{aeb_off}", if acc { "ACC" } else { "ACC off" }, hud.set_speed * 3.6, hud.time_gap)
+                    format!(
+                        "{} {:.0} km/h | gap {bars} {:.1} s | {lead_txt}{hold}{lanes_txt}{aeb_off}",
+                        if acc { "ACC" } else { "ACC off" },
+                        hud.set_speed * 3.6,
+                        hud.time_gap
+                    )
                 };
                 // The lead-car icon: grey with no lead, white with one, green while following.
                 let (r, g, b) = if hud.flags & hud_flags::FOLLOWING != 0 {
@@ -975,6 +1015,11 @@ fn run() {
             }
         }
         hud::draw(&hud, hud_live, frame, &mut hud_sounds);
+        if hud_live && in_vehicle && !paused {
+            let info = link.info.read().1;
+            hud::draw_lanes(&hud, veh, info.box_min[2]);
+            hud::draw_paths(&hud, veh, info.box_min, info.box_max);
+        }
 
         unsafe { shv_sys::scriptWait(0) };
     }

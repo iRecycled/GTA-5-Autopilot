@@ -1,0 +1,19 @@
+# Phase 3 gate run: 5 minutes of the autopilot on the Sandy Shores road at
+# 80 km/h (about 6 km), hands off: lane-centre offset RMS and takeovers per
+# 10 km. (A two-lane country road, one lane each way, bends and junctions.)
+name = "Lane centering: 5 minutes on the Sandy Shores road"
+spot = "Sandy Shores road"
+feature = "autopilot"
+steps = [
+  "engage",
+  "set 80",
+  "wait speed>=50 25",
+  "sleep 300",
+]
+
+[pass]
+max_aeb = 0
+max_lane_rms = 0.3
+min_centering = 0.9
+max_takeovers = 1
+min_engaged = 0.98

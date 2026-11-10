@@ -1,0 +1,7 @@
+# Survey (not a test): as lanes_freeway, on two-way city streets.
+name = "Survey: lanes downtown"
+spot = "downtown road"
+steps = ["sleep 45"]
+
+[pass]
+no_impact = false

@@ -55,6 +55,11 @@ buses = ["adas"]
 name = "park"             # ultrasonic sensors
 buses = ["adas"]
 
+# Phase 3: the windshield camera ECU (D26): lane lines, objects, signs.
+[[ecu]]
+name = "front_camera"
+buses = ["adas"]
+
 [[ecu]]
 name = "adas"             # the ADAS ECU: features; on both buses (D9)
 buses = ["chassis", "adas"]

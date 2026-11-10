@@ -4,9 +4,9 @@ NS_ :
 
 BS_:
 
-BU_: FRONT_RADAR CORNER_RADAR_FL CORNER_RADAR_FR CORNER_RADAR_RL CORNER_RADAR_RR PARK_ECU ADAS
+BU_: FRONT_RADAR CORNER_RADAR_FL CORNER_RADAR_FR CORNER_RADAR_RL CORNER_RADAR_RR PARK_ECU FRONT_CAMERA ADAS
 
-CM_ "ADAS CAN FD (D9). Our own layout, modelled on production radar object lists: a status frame per scan, then one 16-byte frame per object, front radar 0x300-0x301, corner radars 0x310-0x317 (each its own status and object ids, as separate ECUs must), park sensors 0x340-0x341.";
+CM_ "ADAS CAN FD (D9). Our own layout, modelled on production radar object lists: a status frame per scan, then one 16-byte frame per object, front radar 0x300-0x301, corner radars 0x310-0x317 (each its own status and object ids, as separate ECUs must), park sensors 0x340-0x341, front camera 0x350-0x355.";
 
 BO_ 768 RADAR_STATUS: 8 FRONT_RADAR
  SG_ SCAN_COUNTER : 0|16@1+ (1,0) [0|65535] "" ADAS
@@ -138,6 +138,75 @@ BO_ 833 PARK_SENSORS_REAR: 16 PARK_ECU
  SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
  SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
 
+BO_ 848 CAM_STATUS: 8 FRONT_CAMERA
+ SG_ FRAME_COUNTER : 0|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ NUM_OBJECTS : 16|8@1+ (1,0) [0|32] "" ADAS
+ SG_ BLOCKED : 24|1@1+ (1,0) [0|1] "" ADAS
+ SG_ SPEED_LIMIT : 32|8@1+ (1,0) [0|255] "km/h" ADAS
+ SG_ COUNTER : 48|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 56|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 849 CAM_LANE_LEFT: 16 FRONT_CAMERA
+ SG_ C0 : 0|14@1- (0.002,0) [-16.384|16.382] "m" ADAS
+ SG_ C1 : 14|12@1- (0.0002,0) [-0.4096|0.4094] "" ADAS
+ SG_ C2 : 26|14@1- (1E-006,0) [-0.008192|0.008191] "1/m" ADAS
+ SG_ C3 : 40|14@1- (2E-008,0) [-0.00016384|0.00016382] "1/m2" ADAS
+ SG_ VIEW_RANGE : 54|8@1+ (1,0) [0|255] "m" ADAS
+ SG_ QUALITY : 62|2@1+ (1,0) [0|3] "" ADAS
+ SG_ LINE_TYPE : 64|2@1+ (1,0) [0|3] "" ADAS
+ SG_ VALID : 66|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 850 CAM_LANE_RIGHT: 16 FRONT_CAMERA
+ SG_ C0 : 0|14@1- (0.002,0) [-16.384|16.382] "m" ADAS
+ SG_ C1 : 14|12@1- (0.0002,0) [-0.4096|0.4094] "" ADAS
+ SG_ C2 : 26|14@1- (1E-006,0) [-0.008192|0.008191] "1/m" ADAS
+ SG_ C3 : 40|14@1- (2E-008,0) [-0.00016384|0.00016382] "1/m2" ADAS
+ SG_ VIEW_RANGE : 54|8@1+ (1,0) [0|255] "m" ADAS
+ SG_ QUALITY : 62|2@1+ (1,0) [0|3] "" ADAS
+ SG_ LINE_TYPE : 64|2@1+ (1,0) [0|3] "" ADAS
+ SG_ VALID : 66|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 851 CAM_LANE_LEFT2: 16 FRONT_CAMERA
+ SG_ C0 : 0|14@1- (0.002,0) [-16.384|16.382] "m" ADAS
+ SG_ C1 : 14|12@1- (0.0002,0) [-0.4096|0.4094] "" ADAS
+ SG_ C2 : 26|14@1- (1E-006,0) [-0.008192|0.008191] "1/m" ADAS
+ SG_ C3 : 40|14@1- (2E-008,0) [-0.00016384|0.00016382] "1/m2" ADAS
+ SG_ VIEW_RANGE : 54|8@1+ (1,0) [0|255] "m" ADAS
+ SG_ QUALITY : 62|2@1+ (1,0) [0|3] "" ADAS
+ SG_ LINE_TYPE : 64|2@1+ (1,0) [0|3] "" ADAS
+ SG_ VALID : 66|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 852 CAM_LANE_RIGHT2: 16 FRONT_CAMERA
+ SG_ C0 : 0|14@1- (0.002,0) [-16.384|16.382] "m" ADAS
+ SG_ C1 : 14|12@1- (0.0002,0) [-0.4096|0.4094] "" ADAS
+ SG_ C2 : 26|14@1- (1E-006,0) [-0.008192|0.008191] "1/m" ADAS
+ SG_ C3 : 40|14@1- (2E-008,0) [-0.00016384|0.00016382] "1/m2" ADAS
+ SG_ VIEW_RANGE : 54|8@1+ (1,0) [0|255] "m" ADAS
+ SG_ QUALITY : 62|2@1+ (1,0) [0|3] "" ADAS
+ SG_ LINE_TYPE : 64|2@1+ (1,0) [0|3] "" ADAS
+ SG_ VALID : 66|1@1+ (1,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
+BO_ 853 CAM_OBJECT: 16 FRONT_CAMERA
+ SG_ SLOT : 0|8@1+ (1,0) [0|31] "" ADAS
+ SG_ TRACK_ID : 8|16@1+ (1,0) [0|65535] "" ADAS
+ SG_ CLASS : 24|3@1+ (1,0) [0|7] "" ADAS
+ SG_ DIST_X : 27|13@1- (0.05,0) [-204.8|204.75] "m" ADAS
+ SG_ DIST_Y : 40|12@1- (0.02,0) [-40.96|40.94] "m" ADAS
+ SG_ VEL_X : 52|12@1- (0.05,0) [-102.4|102.35] "m/s" ADAS
+ SG_ VEL_Y : 64|11@1- (0.05,0) [-51.2|51.15] "m/s" ADAS
+ SG_ WIDTH : 75|7@1+ (0.05,0) [0|6.35] "m" ADAS
+ SG_ CONFIDENCE : 82|7@1+ (0.01,0) [0|1] "" ADAS
+ SG_ COUNTER : 112|8@1+ (1,0) [0|255] "" ADAS
+ SG_ CHECKSUM : 120|8@1+ (1,0) [0|255] "" ADAS
+
 CM_ BO_ 769 "One object; sent once per object per scan. SLOT orders the frames within a scan.";
 CM_ SG_ 769 DIST_X "Nearest face of the object, from the ego reference point (ISO 8855, forward).";
 CM_ SG_ 769 DIST_Y "ISO 8855, positive left.";
@@ -145,3 +214,6 @@ CM_ SG_ 769 VEL_X "Over-ground velocity rotated into the ego frame.";
 CM_ BO_ 785 "Corner radar objects: DIST_X is signed (rear radars see objects behind). The reported point is the object centre (the radar sees the nearest point of its box).";
 CM_ BO_ 832 "Park sensors, front bumper, left corner to right corner. 10.23 m = no echo, 10.22 m = no data (sensor fault).";
 CM_ BO_ 833 "Park sensors, rear bumper, left corner to right corner. 10.23 m = no echo, 10.22 m = no data (sensor fault).";
+CM_ BO_ 849 "Lane lines as y = C0 + C1 x + C2 x^2 + C3 x^3 (ISO 8855, from the ego reference point); LINE_TYPE 1 dashed, 2 solid, 3 road edge. CAM_LANE_LEFT/RIGHT are the ego lane's lines, LEFT2/RIGHT2 the next ones out.";
+CM_ BO_ 853 "Camera objects: CLASS 0 unknown, 1 car, 2 truck, 3 pedestrian. Vehicles by their near face, pedestrians by their centre.";
+CM_ SG_ 848 SPEED_LIMIT "The last speed-limit sign read (km/h); 0 = none.";

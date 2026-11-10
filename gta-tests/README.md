@@ -68,7 +68,9 @@ stop_gap_max = 15.0
 - `events` / `no_events`: text that must or must not appear in the core's events;
 - `max_gap_error_s`: the largest time-gap error `check_gap` may measure;
 - `min_rcta`, `max_rcta`, `min_park`, `max_park`: limits on RCTA and park assist brake activations;
-- `min_room`: the ground-truth room at the end from the bumper (rear when reversing) to the nearest actor in the car's path (m).
+- `min_room`: the ground-truth room at the end from the bumper (rear when reversing) to the nearest actor in the car's path (m);
+- `max_lane_rms`, `min_centering`, `max_takeovers`: lane centering's RMS offset from the lane centre while it steers (m), the share of the engaged time it steered, and the number of takeover requests;
+- `min_engaged`: the share of the run, from the first engagement to the end, that the system stayed engaged. A drop-out fails it, such as the adapter releasing a core that stopped answering.
 
 The core reports the surround features as events: "BSD: vehicle in the left blind spot", "BSD warning: signalling left into an occupied lane", "RCTA: cross traffic from the right", "RCTA braking", "park assist braking".
 

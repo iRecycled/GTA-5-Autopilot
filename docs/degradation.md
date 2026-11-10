@@ -34,6 +34,22 @@ The parking sensors run only below 18 km/h (off again above 20 km/h), as on real
 
 ACC is also unavailable **in reverse** ("not available in reverse"), and AEB ignores what is ahead while reversing.
 
+## Lanes and the camera (Phase 3)
+
+Lane centering runs inside the autopilot (`--feature autopilot`, ACC + lane centering). If it can't continue, the whole autopilot asks the driver to take over (D11). While the camera still sees the lane, it keeps steering until the driver answers, as openpilot's soft disable does. LKA nudges only when nothing else steers.
+
+| Condition | Lane centering (autopilot) | LKA | HUD shows |
+| --- | --- | --- | --- |
+| Host lacks **steering** (`caps::STEER`) | ✗ | ✗ | "no steering control on this host" |
+| Host lacks **lane markings** (`caps::MAP`) | ✗ | ✗ | "no lane data on this host" |
+| **Camera silent** for over 0.5 s (36 frames) | ✗ | ✗ | "camera blocked" |
+| **No lane lines seen** for over 0.5 s (a frame without lines is bridged) | ✗ | ✗ | "lanes not detected" |
+| **The lane ends** (narrower than 2.6 m within 4 s of driving) | ✗, takeover request | ✓ | "lane ends" |
+| **Hands off the wheel** 25 s, with the optional driver monitor on (reminder at 15 s) | ✗, takeover request | — | "hands off the wheel too long" |
+| **Chassis CAN silent** | ✗ | ✗ | "vehicle data lost" |
+
+Pedestrian AEB needs the camera; without it, AEB still brakes for what the front radar sees.
+
 Not yet in the matrix:
 - bus faults short of silence, such as bad checksums or CRC errors: counted (`BusStats::errors`, `crc_errors`); the bad frames are discarded and the last good values held. A bus whose frames all fail counts as silent;
 - weather and dirt on the sensors (Phase 1 error model).

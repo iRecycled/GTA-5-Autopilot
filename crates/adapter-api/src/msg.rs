@@ -15,6 +15,7 @@ pub enum MsgKind {
     Hud = 6,
     FanLayout = 7,
     RangeReport = 8,
+    LaneMap = 9,
 }
 
 /// Common header (layout from `docs/implementation-plan.md`).
@@ -115,6 +116,9 @@ pub mod command_flags {
     pub const FCW: u32 = 1 << 4;
     /// Hazard lights on (a controlled stop, D11).
     pub const HAZARDS: u32 = 1 << 5;
+    /// Lane keeping's nudge: apply `steer_angle` even when not engaged (as
+    /// `AEB` brakes). The driver's own steering still wins.
+    pub const LKA: u32 = 1 << 6;
 }
 
 /// core → adapter, once per core step.
@@ -363,6 +367,63 @@ pub mod caps {
     pub const TURN_SIGNALS: u32 = 1 << 8;
     /// The sample says when reverse is selected (`sample_flags::REVERSE`).
     pub const GEAR: u32 = 1 << 9;
+    /// The host gives the lane markings around the car ([`LaneMap`]).
+    pub const MAP: u32 = 1 << 10;
+}
+
+/// Lane marking kinds in [`LaneLine::kind`].
+pub mod line_kind {
+    pub const NONE: u32 = 0;
+    pub const DASHED: u32 = 1;
+    pub const SOLID: u32 = 2;
+    /// The edge of the carriageway.
+    pub const EDGE: u32 = 3;
+}
+
+pub const MAX_LANE_LINES: usize = 8;
+pub const MAX_LINE_POINTS: usize = 24;
+
+/// One lane marking near the car: points along it in the ego frame (m),
+/// ordered along the road (increasing x for a road ahead), behind the car to
+/// as far ahead as the host knows (about 150 m).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LaneLine {
+    pub kind: u32,
+    pub count: u32,
+    pub points: [[f32; 2]; MAX_LINE_POINTS],
+}
+
+impl Default for LaneLine {
+    fn default() -> Self {
+        Self { kind: line_kind::NONE, count: 0, points: [[0.0; 2]; MAX_LINE_POINTS] }
+    }
+}
+
+impl LaneLine {
+    pub fn as_slice(&self) -> &[[f32; 2]] {
+        &self.points[..(self.count as usize).min(MAX_LINE_POINTS)]
+    }
+}
+
+/// adapter → core, every frame (`caps::MAP`): the lane markings around the
+/// car, the ground truth a camera's lane detection sees (D26). Hosts with
+/// only a road graph fit the markings from its centreline, lane count and
+/// width.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LaneMap {
+    pub header: Header,
+    pub count: u32,
+    /// The speed limit here (m/s); infinite or 0 = unknown.
+    pub speed_limit: f32,
+    pub lines: [LaneLine; MAX_LANE_LINES],
+}
+
+impl LaneMap {
+    pub fn as_slice(&self) -> &[LaneLine] {
+        &self.lines[..(self.count as usize).min(MAX_LANE_LINES)]
+    }
 }
 
 /// adapter → core (latest wins): who the adapter is and what it can do.
@@ -408,6 +469,17 @@ pub mod hud_flags {
     pub const TAKEOVER_CHIME: u32 = 1 << 10;
     /// Not answered: the car is making a controlled stop, hazards on.
     pub const CONTROLLED_STOP: u32 = 1 << 11;
+    /// Lane centering is steering (Phase 3).
+    pub const LANE_CENTERING: u32 = 1 << 12;
+    /// The camera sees the left / right line of the lane.
+    pub const LANE_LEFT: u32 = 1 << 13;
+    pub const LANE_RIGHT: u32 = 1 << 14;
+    /// Lane keeping is nudging the car back from a line.
+    pub const LKA: u32 = 1 << 15;
+    /// The driver monitor wants hands on the wheel.
+    pub const HANDS_ON: u32 = 1 << 16;
+    /// The driver steered: lateral control is paused.
+    pub const STEER_OVERRIDE: u32 = 1 << 17;
 }
 
 /// core → adapter (latest wins): what the driver should see. The adapter only
@@ -437,6 +509,20 @@ pub struct Hud {
     /// core's sensor order (front, left corner to right corner, then rear,
     /// left corner to right corner); infinite = clear, NaN = not shown.
     pub park: [f32; 12],
+    /// The lane lines the camera sees, left and right: c0..c3 of
+    /// y = c0 + c1·x + c2·x² + c3·x³ (ego frame) and how far ahead (m;
+    /// 0 = no line). The adapter may draw them on the road.
+    pub lanes: [[f32; 5]; 2],
+    /// Where the car is heading if nothing changes: the circle its measured
+    /// speed and yaw rate trace, as its curvature (1/m, left positive) and
+    /// how far along it to draw (m of travel; 0 = not shown, negative =
+    /// reversing, behind the car).
+    pub heading: [f32; 2],
+    /// The path the autopilot steers along (the lane centre it tracks), as a
+    /// cubic and range; range 0 while it doesn't steer.
+    pub plan: [f32; 5],
+    /// Explicit padding (the struct is recorded as raw bytes).
+    pub _reserved: f32,
 }
 
 /// Surround flags in [`Hud::surround`]: blind spot (BSD), rear cross traffic
@@ -483,6 +569,11 @@ pub mod hud_message {
     pub const PARK_SENSOR_FAULT: u32 = 10;
     pub const NO_GEAR: u32 = 11;
     pub const REVERSING: u32 = 12;
+    pub const NO_LANES: u32 = 13;
+    pub const NO_MAP: u32 = 14;
+    pub const LANE_ENDS: u32 = 15;
+    pub const NO_ATTENTION: u32 = 16;
+    pub const CAMERA_BLOCKED: u32 = 17;
 
     pub fn text(code: u32) -> &'static str {
         match code {
@@ -498,6 +589,11 @@ pub mod hud_message {
             PARK_SENSOR_FAULT => "parking sensor fault",
             NO_GEAR => "no gear signal on this host",
             REVERSING => "not available in reverse",
+            NO_LANES => "lanes not detected",
+            NO_MAP => "no lane data on this host",
+            LANE_ENDS => "lane ends",
+            NO_ATTENTION => "hands off the wheel too long",
+            CAMERA_BLOCKED => "camera blocked",
             _ => "",
         }
     }
@@ -538,11 +634,13 @@ mod tests {
         assert_eq!(size_of::<SensorMount>(), 32);
         assert_eq!(size_of::<SensorLayout>(), 32 + 8 + MAX_SENSORS * 32);
         assert_eq!(size_of::<AdapterInfo>(), 32 + 64 + 8 + 24 + 8);
-        assert_eq!(size_of::<Hud>(), 32 + 32 + 8 + 48);
+        assert_eq!(size_of::<Hud>(), 32 + 32 + 8 + 48 + 40 + 8 + 20 + 4);
         assert_eq!(size_of::<RangeFan>(), 32);
         assert_eq!(size_of::<FanLayout>(), 32 + 8 + MAX_FANS * 32);
         assert_eq!(size_of::<FanResult>(), 24);
         assert_eq!(size_of::<RangeReport>(), 32 + 8 + MAX_FANS * 24);
+        assert_eq!(size_of::<LaneLine>(), 8 + MAX_LINE_POINTS * 8);
+        assert_eq!(size_of::<LaneMap>(), 32 + 8 + MAX_LANE_LINES * (8 + MAX_LINE_POINTS * 8));
     }
 
     #[test]

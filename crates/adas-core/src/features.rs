@@ -25,6 +25,8 @@ pub enum Feature {
     TestDriver(TestDriverConfig),
     /// Adaptive cruise (F1).
     Acc(AccConfig),
+    /// Adaptive cruise with lane centering (F1 + F7): one key engages both.
+    Autopilot(AccConfig),
 }
 
 impl Feature {
@@ -38,6 +40,20 @@ impl Feature {
             Feature::SpeedProfile(_) => "speed-profile",
             Feature::TestDriver(_) => "test-driver",
             Feature::Acc(_) => "acc",
+            Feature::Autopilot(_) => "autopilot",
+        }
+    }
+
+    /// ACC runs (ACC or autopilot).
+    pub fn longitudinal(&self) -> bool {
+        matches!(self, Feature::Acc(_) | Feature::Autopilot(_))
+    }
+
+    /// The ACC settings, if ACC runs.
+    pub fn acc(&self) -> Option<AccConfig> {
+        match self {
+            Feature::Acc(c) | Feature::Autopilot(c) => Some(*c),
+            _ => None,
         }
     }
 
@@ -55,7 +71,7 @@ impl Feature {
                 m.insert("steer_fade_speed".into(), c.steer_fade_speed.to_string());
                 m.insert("steer_rate".into(), c.steer_rate.to_string());
             }
-            Feature::Acc(_) => {}
+            Feature::Acc(_) | Feature::Autopilot(_) => {}
         }
         m
     }
@@ -81,6 +97,7 @@ impl Feature {
                 steer_rate: f("steer_rate")?,
             })),
             Some("acc") => Ok(Feature::Acc(AccConfig::default())),
+            Some("autopilot") => Ok(Feature::Autopilot(AccConfig::default())),
             other => Err(format!("unknown feature {other:?}")),
         }
     }
@@ -118,6 +135,10 @@ pub struct Ctx<'a> {
     pub t: f32,
     /// The lead ACC would follow, if any.
     pub follow: Option<Lead>,
+    /// The speed bends ahead allow (m/s; infinite = no limit).
+    pub curve_speed: f32,
+    /// Lane centering's road-wheel angle, when it can steer.
+    pub lane_angle: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -156,15 +177,18 @@ pub fn run(feature: &Feature, st: &mut FeatureState, speed: &mut SpeedController
                 following: false,
             }
         }
-        Feature::Acc(_) => {
+        Feature::Acc(_) | Feature::Autopilot(_) => {
             let r = acc.request(c.sample.speed, c.follow);
-            let o = speed.step(r.target, c.sample.speed, c.dt);
-            // Longitudinal only: no steering request (the driver steers).
+            // Bends ahead: no faster than the curve speed.
+            let target = r.target.min(c.curve_speed);
+            let o = speed.step(target, c.sample.speed, c.dt);
             Out {
                 throttle: o.throttle,
                 brake: o.brake,
                 hold: o.hold,
-                steer: None,
+                // ACC alone is longitudinal (the driver steers); the autopilot
+                // also centres in the lane.
+                steer: if matches!(feature, Feature::Autopilot(_)) { c.lane_angle } else { None },
                 diag: [r.target, o.reference, c.follow.map(|l| l.gap).unwrap_or(f32::NAN), r.desired_gap],
                 following: r.following,
             }

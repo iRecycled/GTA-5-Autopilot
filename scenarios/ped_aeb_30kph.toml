@@ -1,0 +1,29 @@
+# Phase 3 gate: pedestrian AEB stops in 10 of 10 runs at 30 km/h. A
+# pedestrian waits on the right kerb 4.5 m from the lane centre and steps out
+# at 1.5 m/s, timed to be in the car's path when it arrives. The driver
+# doesn't react. Only the camera sees pedestrians.
+name = "Pedestrian AEB: someone steps out at 30 km/h"
+feature = "none"
+duration = 15.0
+
+[ego]
+speed_kph = 30
+
+[[actor]]
+s = 45
+d = -4.5
+heading = 90
+pedestrian = true
+speed_kph = 0
+[[actor.event]]
+t = 2.0
+speed_kph = 5.4
+accel = 10
+
+[repeat]
+count = 10
+vary_s = 8
+
+[pass]
+min_aeb = 1
+end_speed_below = 0.1

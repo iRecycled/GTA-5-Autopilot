@@ -1,0 +1,22 @@
+# The right lane ends: its edge line sweeps across it over 150 m into the
+# middle lane's. Lane centering can't follow a lane that ends; it asks the
+# driver to take over well before, and the driver (1 s to react) moves over.
+name = "Lane centering: the lane ends"
+feature = "autopilot"
+duration = 50.0
+
+[road]
+lane_end = { lane = -1, s = 900, taper = 150 }
+
+[ego]
+speed_kph = 100
+lane = -1
+engage_at = 0.5
+set_kph = 100
+takeover_reaction = 1.0
+
+[pass]
+min_takeovers = 1
+takeover_before_end = 3.0
+max_departures = 0
+max_aeb = 0

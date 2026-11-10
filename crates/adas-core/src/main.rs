@@ -1,7 +1,7 @@
 //! The ADAS core process. Connects to the adapter link and runs one
 //! `Core::step` per host frame; records the whole run to MCAP.
 //!
-//! Usage: `adas-core [--feature acc|speed-profile|test-driver] [--spin]
+//! Usage: `adas-core [--feature acc|autopilot|speed-profile|test-driver] [--spin]
 //!                   [--record DIR | --no-record] [--link NAME]
 //!                   [--telemetry PORT,PORT... | --no-telemetry] [--no-profile-save]`
 //!
@@ -23,8 +23,82 @@ use std::sync::atomic::Ordering;
 use adapter_api::shm::{DEFAULT_NAME, SharedLink};
 use adapter_api::{CONTRACT_VERSION, Header, MsgKind, sample_flags, str_of, wall_time_ns};
 use adas_core::{Core, Event, Feature, Inputs, Stick, telem};
-use record::{Profile, Recorder, Stick3};
+use record::{FaultRec, Profile, Recorder, Stick3};
 use telemetry::Packet;
+
+/// Work for the writer thread: the recording and the telemetry sends. The
+/// control loop never does file or socket I/O itself, so a slow disk or a
+/// busy machine delays the recording, not the next command.
+enum Job {
+    Info(adapter_api::AdapterInfo),
+    Profile(Profile, u64),
+    Fault(FaultRec, u64),
+    Step(Box<StepRec>),
+    Packets(Vec<Packet>),
+}
+
+struct StepRec {
+    sample: adapter_api::VehicleSample,
+    actors: adapter_api::ActorList,
+    ranges: Option<adapter_api::RangeReport>,
+    lanes: Option<adapter_api::LaneMap>,
+    stick: Option<Stick3>,
+    cmd: adapter_api::Command,
+}
+
+/// About a minute of steps at 60 fps: the writer can fall that far behind
+/// before steps are dropped (and counted) rather than block the loop.
+const JOB_QUEUE: usize = 4096;
+
+fn writer(mut recorder: Option<Recorder>, mut tx: telemetry::Sender, jobs: std::sync::mpsc::Receiver<Job>) {
+    for job in jobs {
+        let r = match job {
+            Job::Packets(ps) => {
+                for p in &ps {
+                    tx.send(p);
+                }
+                continue;
+            }
+            job => match recorder.as_mut() {
+                None => continue,
+                Some(rec) => match job {
+                    Job::Info(i) => rec.info(&i),
+                    Job::Profile(p, t) => rec.profile(&p, t),
+                    Job::Fault(f, t) => rec.fault(&f, t),
+                    Job::Step(st) => rec.step(&st.sample, &st.actors, st.ranges.as_ref(), st.lanes.as_ref(), st.stick, &st.cmd),
+                    Job::Packets(_) => unreachable!(),
+                },
+            },
+        };
+        if let Err(e) = r {
+            eprintln!("recording failed: {e}");
+            recorder = None;
+        }
+    }
+}
+
+/// The core answers the game every frame, so it must not wait behind
+/// whatever else the machine is doing (a 2026-11-09 GTA run lost 6 frames,
+/// 97 ms, to that while the core's own step took 0.1 ms at most). It sleeps
+/// on the sample event between frames, so a high priority costs nothing.
+fn raise_priority() {
+    #[cfg(windows)]
+    unsafe {
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn GetCurrentThread() -> isize;
+            fn SetPriorityClass(process: isize, class: u32) -> i32;
+            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        }
+        const HIGH_PRIORITY_CLASS: u32 = 0x80;
+        const THREAD_PRIORITY_HIGHEST: i32 = 2;
+        let p = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) != 0;
+        let t = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+        if !(p && t) {
+            eprintln!("could not raise the core's priority (process {p}, thread {t})");
+        }
+    }
+}
 
 /// `config/vehicles/<host>/<model>.toml` (D19): a file-system-safe slug.
 fn slug(s: &str) -> String {
@@ -185,6 +259,7 @@ fn main() {
     let mut spin = false;
     let mut name = DEFAULT_NAME.to_string();
     let mut feature = Feature::speed_profile();
+    let mut driver_monitor = false;
     let mut rec_dir: Option<PathBuf> = Some(PathBuf::from("recordings"));
     let mut telemetry_ports = vec![telemetry::PANEL_PORT, telemetry::RERUN_PORT];
     // Tests load vehicle profiles but never rewrite them.
@@ -202,11 +277,13 @@ fn main() {
             "--link" => name = args.next().expect("--link needs a name"),
             "--record" => rec_dir = Some(PathBuf::from(args.next().expect("--record needs a directory"))),
             "--no-record" => rec_dir = None,
+            "--driver-monitor" => driver_monitor = true,
             "--feature" => {
                 feature = match args.next().as_deref() {
                     Some("speed-profile") => Feature::speed_profile(),
                     Some("test-driver") => Feature::TestDriver(Default::default()),
                     Some("acc") => Feature::Acc(Default::default()),
+                    Some("autopilot") => Feature::Autopilot(Default::default()),
                     other => {
                         eprintln!("unknown feature {other:?}");
                         std::process::exit(2);
@@ -240,6 +317,7 @@ fn main() {
 
     let first = link.sample.read().1;
     let mut core = Core::new(feature.clone(), first.flags & sample_flags::ENGAGE_REQUEST != 0);
+    core.set_toggles(adas_core::Toggles { driver_monitor, ..Default::default() });
     let mut stick_src = KeyStick { s: Stick::default() };
     let test_driver = matches!(feature, Feature::TestDriver(_));
     if test_driver {
@@ -282,7 +360,20 @@ fn main() {
 
     // Telemetry to the viewers, and fault injection from the panel.
     let telemetry_on = !telemetry_ports.is_empty();
-    let mut tx = telemetry::Sender::udp(&telemetry_ports);
+    let tx = telemetry::Sender::udp(&telemetry_ports);
+    let recording = recorder.is_some();
+    let (jobs, job_rx) = std::sync::mpsc::sync_channel::<Job>(JOB_QUEUE);
+    std::thread::Builder::new().name("writer".into()).spawn(move || writer(recorder, tx, job_rx)).expect("writer thread");
+    let mut dropped_jobs = 0u64;
+    let mut post = move |j: Job| {
+        if jobs.try_send(j).is_err() {
+            dropped_jobs += 1;
+            if dropped_jobs.is_power_of_two() {
+                eprintln!("writer behind: {dropped_jobs} recording/telemetry jobs dropped");
+            }
+        }
+    };
+    raise_priority();
     let mut control = if telemetry_on {
         match telemetry::Receiver::bind(telemetry::CONTROL_PORT) {
             Ok(r) => Some(r),
@@ -317,6 +408,13 @@ fn main() {
             continue;
         }
         seen_writes = link.sample.writes();
+        // One core per link: a newer core took over (the adapter follows the
+        // newest epoch), so this one stops rather than answer alongside it.
+        if link.epoch.load(Ordering::Acquire) != epoch {
+            println!("a newer core took the link (epoch {} after {epoch}): exiting", link.epoch.load(Ordering::Acquire));
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
         let (_, s) = link.sample.read();
         if last_seq == Some(s.header.seq) {
             continue;
@@ -339,9 +437,7 @@ fn main() {
             let mut l = *core.layout();
             l.header = Header { kind: MsgKind::SensorLayout, version: CONTRACT_VERSION, seq: layout_seq, wall_time_ns: wall_time_ns(), ..Default::default() };
             link.layout.write(&l);
-            if let Some(r) = recorder.as_mut() {
-                let _ = r.info(&info);
-            }
+            post(Job::Info(info));
             println!("adapter: {} / {}; sensor layout published ({} sensors)", str_of(&info.host), str_of(&info.vehicle), l.count);
             // A new vehicle: start from its profile, if there is one.
             let (host, vehicle) = (str_of(&info.host).to_string(), str_of(&info.vehicle).to_string());
@@ -352,9 +448,7 @@ fn main() {
                 match load_brake_gain(&path) {
                     Some(g) => {
                         core.set_brake_gain(g);
-                        if let Some(r) = recorder.as_mut() {
-                            let _ = r.profile(&Profile { brake_gain: g, ..Default::default() }, wall_time_ns());
-                        }
+                        post(Job::Profile(Profile { brake_gain: g, ..Default::default() }, wall_time_ns()));
                         println!("profile {}: brake gain {g:.2}", path.display());
                     }
                     None => println!("no profile at {} yet; learning", path.display()),
@@ -368,6 +462,9 @@ fn main() {
         // The range fans' answers, while the adapter gives them.
         let (_, ranges) = link.ranges.read();
         let ranges = (ranges.count > 0).then_some(ranges);
+        // The lane markings, while the adapter gives them.
+        let (_, lanes) = link.lanes.read();
+        let lanes = (lanes.count > 0).then_some(lanes);
         let dt = if last_game_us == 0 { 0.0 } else { s.header.game_time_us.saturating_sub(last_game_us) as f32 / 1e6 };
         last_game_us = s.header.game_time_us;
         let stick = test_driver.then(|| stick_src.read(dt.clamp(0.0, 0.1)));
@@ -383,16 +480,14 @@ fn main() {
                         let text = format!("fault at frame {}: {c:?}", s.header.frame);
                         println!("{text}");
                         events.push(text);
-                        if let Some(r) = recorder.as_mut() {
-                            let _ = r.fault(&f, s.header.wall_time_ns);
-                        }
+                        post(Job::Fault(f, s.header.wall_time_ns));
                     }
                     Err(e) => eprintln!("panel fault rejected: {e}"),
                 }
             }
         }
 
-        let (mut cmd, event) = core.step(Inputs { sample: &s, actors: &actors, ranges: ranges.as_ref(), stick });
+        let (mut cmd, event) = core.step(Inputs { sample: &s, actors: &actors, ranges: ranges.as_ref(), lanes: lanes.as_ref(), stick });
         cmd_seq = cmd_seq.wrapping_add(1);
         cmd.answers_seq = s.header.seq;
         let t1 = wall_time_ns();
@@ -460,18 +555,16 @@ fn main() {
         } else if cmd.flags & adapter_api::command_flags::AEB == 0 {
             aeb_logged = false;
         }
-        if let Some(r) = recorder.as_mut()
-            && let Err(e) = r.step(&s, &actors, ranges.as_ref(), stick3, &cmd)
-        {
-            eprintln!("recording failed: {e}");
-            recorder = None;
+        if recording {
+            post(Job::Step(Box::new(StepRec { sample: s, actors, ranges, lanes, stick: stick3, cmd })));
         }
 
         // Telemetry for the panel and the Rerun views.
         if telemetry_on {
+            let mut ps = Vec::with_capacity(8);
             if t1.saturating_sub(last_hello) > 1_000_000_000 {
                 last_hello = t1;
-                tx.send(&Packet::Hello {
+                ps.push(Packet::Hello {
                     contract: CONTRACT_VERSION,
                     feature: feature.name().to_string(),
                     host: host_names.0.clone(),
@@ -481,13 +574,12 @@ fn main() {
             }
             let latency = t1.saturating_sub(s.header.wall_time_ns).min(u32::MAX as u64) as u32;
             let step_time = t1.saturating_sub(t0).min(u32::MAX as u64) as u32;
-            tx.send(&Packet::Step(Box::new(telem::step(&core, &s, &actors, &cmd, latency, step_time))));
-            for p in telemetry::frame_packets(s.header.frame, telem::frames(&core)) {
-                tx.send(&p);
-            }
+            ps.push(Packet::Step(Box::new(telem::step(&core, &s, &actors, &cmd, latency, step_time))));
+            ps.extend(telemetry::frame_packets(s.header.frame, telem::frames(&core)));
             for text in events.drain(..) {
-                tx.send(&Packet::Event { frame: s.header.frame, text });
+                ps.push(Packet::Event { frame: s.header.frame, text });
             }
+            post(Job::Packets(ps));
         } else {
             events.clear();
         }

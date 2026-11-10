@@ -9,10 +9,12 @@
 //! The noise is a pure function of (seed, frame, object, quantity), not a
 //! running random generator, so replaying a recording reproduces it exactly.
 
+pub mod camera;
 pub mod radar;
 pub mod ultrasonic;
 
 pub use radar::{FrontRadar, Radar, RadarConfig, RadarObject, RadarScan, nearest_box_point};
+pub use camera::{CamObject, Camera, CameraConfig, CameraFrame, LaneFit};
 pub use ultrasonic::{ULTRASONIC_COUNT, UltrasonicConfig, UltrasonicScan, Ultrasonics};
 
 /// A deterministic hash → uniform in [0, 1).

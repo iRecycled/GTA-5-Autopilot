@@ -2,6 +2,8 @@
 
 2026-11-09
 
+> **Update, 2026-11-09: Phase 3 is closed without its gate.** Its camera read lanes laid out from GTA's road nodes, and the lane-centre numbers below measure the car against those same lanes, not against GTA's painted lanes. The PRD now draws a sensor boundary (D30): hosts give only raw sensor data, and lanes come from vision. The controllers, checks and junction AEB below carry over; the camera's perception is replaced in Phase 5, where this gate is run again. See the [implementation plan](../implementation-plan.md).
+
 Phase 3 adds a forward camera ECU and the features on it: lane keeping (LKA), lane centering (inside the autopilot, `--feature autopilot` = ACC + lane centering), curve speed and pedestrian AEB. Driving it in GTA added junction AEB, radar–camera fusion for stopped vehicles and a series of safety checks. Every item on the plan's checklist is built. The simulator scenarios pass. In GTA, lane centering meets its accuracy target, but no gate drive has yet run its full length.
 
 ## What changed

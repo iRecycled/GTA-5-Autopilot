@@ -19,7 +19,10 @@
 //!
 //! Only crossing traffic counts: moving across the path at ≥ 2 m/s, at an
 //! angle of ≥ 30° to it. Oncoming traffic in a bend and cars waiting at the
-//! line don't. Forward only, 7–70 km/h.
+//! line don't, nor does a car braking to give way: one decelerating across
+//! the path hard enough to stop before it (the track's acceleration
+//! estimate). One slowing less reaches the path later, and is timed so.
+//! Forward only, 7–70 km/h; vehicles reaching the path within 3 s.
 
 use fusion::{Lead, SurroundTrack};
 
@@ -41,6 +44,9 @@ pub struct JunctionConfig {
     pub path_margin: f32,
     /// Added to both time windows (s).
     pub time_margin: f32,
+    /// A crossing vehicle decelerating at least this much (m/s²) is taken
+    /// to be braking.
+    pub min_decel: f32,
 }
 
 impl Default for JunctionConfig {
@@ -51,9 +57,10 @@ impl Default for JunctionConfig {
             min_cross_speed: 2.0,
             min_angle: 30f32.to_radians(),
             lateral_range: 40.0,
-            horizon: 4.0,
+            horizon: 3.0,
             path_margin: 0.5,
             time_margin: 0.3,
+            min_decel: 1.0,
         }
     }
 }
@@ -101,8 +108,21 @@ pub fn conflict(c: &JunctionConfig, ego: &Ego, k: f32, t: &SurroundTrack) -> Opt
     if d.abs() - hy > hw && d * w > 0.0 {
         return None;
     }
-    let t_in = ((d.abs() - hy - hw) / w.abs()).max(0.0);
-    let t_out = (d.abs() + hy + hw) / w.abs();
+    // Braking across the path (to give way): stopping short is no conflict;
+    // slowing, it gets there later.
+    let a_w = -t.ax * sn + t.ay * cs;
+    let edge = (d.abs() - hy - hw).max(0.0);
+    let decel = if a_w * w < 0.0 { a_w.abs() } else { 0.0 };
+    if decel >= c.min_decel && edge > 0.0 && w * w / (2.0 * decel) < edge {
+        return None;
+    }
+    let t_in = if decel >= c.min_decel {
+        let disc = (w * w - 2.0 * decel * edge).max(0.0);
+        (w.abs() - disc.sqrt()) / decel
+    } else {
+        edge / w.abs()
+    };
+    let t_out = t_in + (2.0 * (hy + hw)) / w.abs().max(0.5);
     if t_in > c.horizon {
         return None;
     }
@@ -138,6 +158,36 @@ mod tests {
             t.update(1, &RadarScan { scan: i, objects: vec![o] });
         }
         t.tracks()[0].clone()
+    }
+
+    /// A car on a side road on the right, driving toward the path at `v0`
+    /// and changing speed at `a` (m/s²), tracked for 1.5 s: where it is then.
+    fn approaching(v0: f32, a: f32, x: f32, y0: f32) -> SurroundTrack {
+        let mut t = SurroundTracker::new(SurroundConfig::default());
+        let (mut y, mut v) = (y0, v0);
+        for i in 0..30 {
+            t.predict(0.05, 0.0, 0.0);
+            y += v * 0.05;
+            v = (v + a * 0.05).max(0.0);
+            let o = RadarObject { id: 1, x, y, vx: 0.0, vy: v, width: 1.9, half_length: 2.25, stationary: false, clutter: false };
+            t.update(2, &RadarScan { scan: i, objects: vec![o] });
+        }
+        t.tracks()[0].clone()
+    }
+
+    #[test]
+    fn a_car_braking_to_give_way_is_not_a_threat() {
+        let c = JunctionConfig::default();
+        let ego = driving(4.0);
+        // From 30 m out on the right at 11 m/s, braking at 3.5 m/s² for the
+        // line: 1.5 s on, 18 m out at 6 m/s, it stops 5 m from the path.
+        let braking = approaching(11.0, -3.5, 8.0, -30.0);
+        assert!(braking.ay < -2.0, "acceleration estimate {}", braking.ay);
+        assert!(conflict(&c, &ego, 0.0, &braking).is_none());
+        // The same car not braking (at 6 m/s, 21 m out after 1.5 s): a threat.
+        let steady = approaching(6.0, 0.0, 8.0, -30.0);
+        assert!(steady.ay.abs() < 0.5, "acceleration estimate {}", steady.ay);
+        assert!(conflict(&c, &ego, 0.0, &steady).is_some());
     }
 
     fn driving(speed: f32) -> Ego {

@@ -58,6 +58,12 @@ impl Default for SurroundConfig {
     }
 }
 
+/// The acceleration estimate: sampled at most every 0.1 s, each sample
+/// limited to ±10 m/s² and smoothed (about 0.5 s to settle at 20 Hz).
+const ACCEL_SAMPLE: f32 = 0.1;
+const ACCEL_MAX: f32 = 10.0;
+const ACCEL_SMOOTH: f32 = 0.3;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurroundTrack {
     pub id: u32,
@@ -76,6 +82,14 @@ pub struct SurroundTrack {
     /// Where it was first seen (ego frame at that time, m): BSD uses it to
     /// tell a car coming from behind from one the ego car is overtaking.
     pub first_x: f32,
+    /// Acceleration estimate in the ego frame (m/s²): the smoothed change of
+    /// the velocity between updates. Junction AEB uses it to see a car
+    /// braking to give way.
+    pub ax: f32,
+    pub ay: f32,
+    /// The velocity at the last acceleration sample, and the time since.
+    v_at: (f32, f32),
+    since: f32,
 }
 
 impl SurroundTrack {
@@ -150,6 +164,11 @@ impl SurroundTracker {
             let (vx, vy) = (t.x.v, t.y.v);
             t.x.v = c * vx - s * vy;
             t.y.v = s * vx + c * vy;
+            let (ux, uy) = t.v_at;
+            t.v_at = (c * ux - s * uy, s * ux + c * uy);
+            let (ax, ay) = (t.ax, t.ay);
+            (t.ax, t.ay) = (c * ax - s * ay, s * ax + c * ay);
+            t.since += dt;
             t.age += dt;
             t.life += dt;
         }
@@ -195,6 +214,14 @@ impl SurroundTracker {
                     t.y.update(o.y, o.vy, rp, rv);
                     t.width = o.width;
                     t.half_length = o.half_length;
+                    if t.since >= ACCEL_SAMPLE {
+                        let a = |v: f32, u: f32| ((v - u) / t.since).clamp(-ACCEL_MAX, ACCEL_MAX);
+                        let (sx, sy) = (a(t.x.v, t.v_at.0), a(t.y.v, t.v_at.1));
+                        t.ax += ACCEL_SMOOTH * (sx - t.ax);
+                        t.ay += ACCEL_SMOOTH * (sy - t.ay);
+                        t.v_at = (t.x.v, t.y.v);
+                        t.since = 0.0;
+                    }
                     t.hits += 1;
                     t.age = 0.0;
                     t.sources |= 1 << radar;
@@ -218,6 +245,10 @@ impl SurroundTracker {
                         life: 0.0,
                         sources: 1 << radar,
                         first_x: o.x,
+                        ax: 0.0,
+                        ay: 0.0,
+                        v_at: (o.vx, o.vy),
+                        since: 0.0,
                     });
                     id
                 }

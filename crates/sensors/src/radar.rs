@@ -40,6 +40,8 @@ pub struct RadarConfig {
     pub nearest_point: bool,
     /// Number objects with the radar's own 16-bit ids instead of the host's.
     pub own_ids: bool,
+    /// Half the vertical field of view (rad).
+    pub half_vfov: f32,
 }
 
 impl RadarConfig {
@@ -57,6 +59,7 @@ impl RadarConfig {
             seed: 0x00C0_4E12_ADA2,
             nearest_point: true,
             own_ids: true,
+            half_vfov: 15f32.to_radians(),
         }
     }
 }
@@ -93,6 +96,7 @@ impl Default for RadarConfig {
             seed: 0x0005_EED0_FFAD,
             nearest_point: false,
             own_ids: false,
+            half_vfov: 10f32.to_radians(),
         }
     }
 }
@@ -178,7 +182,7 @@ impl Radar {
             let (dx, dy) = (a.x - mount.x, a.y - mount.y);
             let range = dx.hypot(dy);
             let az = dy.atan2(dx) - mount.facing;
-            if range > mount.range || range < c.min_range || az.abs() > mount.half_fov {
+            if range > mount.range || range < c.min_range || az.abs() > mount.half_fov || !crate::in_vertical_view(a, mount.z, range, c.half_vfov) {
                 continue;
             }
             // Line of sight: the bit must be set and recent (4 refresh periods).
@@ -242,7 +246,7 @@ impl Radar {
         let (dx, dy) = (px - mount.x, py - mount.y);
         let range = dx.hypot(dy);
         let az = geom::wrap_pi(dy.atan2(dx) - mount.facing);
-        if range > mount.range || range < c.min_range || az.abs() > mount.half_fov {
+        if range > mount.range || range < c.min_range || az.abs() > mount.half_fov || !crate::in_vertical_view(a, mount.z, range, c.half_vfov) {
             return None;
         }
         if !self.ignore_los && (a.los_mask & bit == 0 || a.los_age as f32 > 4.0 * mount.refresh_frames.max(1.0)) {

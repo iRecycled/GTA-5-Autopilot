@@ -9,7 +9,7 @@
 //!   range, the marking type and a quality. Noise on the offset, heading and
 //!   curvature, and the occasional frame where a line is missed.
 //! - **Objects:** vehicles (to 120 m) and pedestrians (to 60 m) in its view
-//!   (±50°) and in sight, classified (with rare misclassification). Range is
+//!   (±50° across, ±25° up and down) and in sight, classified (with rare misclassification). Range is
 //!   worse than radar's (about 0.2 m + 4 %), as for a monocular camera.
 //! - 30 Hz.
 
@@ -34,6 +34,8 @@ pub struct CameraConfig {
     pub vel_noise: f32,
     pub p_miss: f32,
     pub p_misclass: f32,
+    /// Half the vertical field of view (rad).
+    pub half_vfov: f32,
     pub seed: u64,
 }
 
@@ -54,6 +56,7 @@ impl Default for CameraConfig {
             vel_noise: 0.4,
             p_miss: 0.02,
             p_misclass: 0.01,
+            half_vfov: 25f32.to_radians(),
             seed: 0x00CA_4E7A_0D26,
         }
     }
@@ -254,7 +257,7 @@ impl Camera {
             let range = dx.hypot(dy);
             let az = geom::wrap_pi(dy.atan2(dx) - mount.facing);
             let max = if ped { c.pedestrian_range } else { c.vehicle_range }.min(mount.range);
-            if range > max || range < 1.0 || az.abs() > mount.half_fov {
+            if range > max || range < 1.0 || az.abs() > mount.half_fov || !crate::in_vertical_view(a, mount.z, range, c.half_vfov) {
                 continue;
             }
             if !self.ignore_los && (a.los_mask & bit == 0 || a.los_age as f32 > 4.0 * mount.refresh_frames.max(1.0)) {

@@ -169,6 +169,10 @@ pub struct Core {
     /// demand (m/s²). Hosts differ a lot (sim 8, GTA about 80 at light
     /// braking); this is the D19 vehicle profile, learned rather than tuned.
     brake_gain: f32,
+    /// The brake gain loaded from a vehicle profile, if any, and the core's
+    /// brake demand smoothed (the learning waits for it to hold steady).
+    brake_profile: Option<f32>,
+    brake_smoothed: f32,
     prev_brake: f32,
     /// Recent (game time µs, speed), for impact detection.
     impact_window: std::collections::VecDeque<(u64, f32)>,
@@ -231,18 +235,43 @@ const BRAKE_GAIN_INIT: f32 = 8.0;
 /// (m/s²): well inside the tyres' grip.
 const GAIN_LEARN_MAX_DECEL: f32 = 6.0;
 
+/// The brake gain's learning time constant (s), and how far a session may
+/// move it from a saved profile (a factor either way).
+const GAIN_LEARN_TAU: f32 = 2.0;
+const GAIN_PROFILE_BAND: f32 = 1.3;
+
+/// What the brake-gain learning needs to know about the moment.
+#[derive(Clone, Copy, Debug)]
+struct BrakeSample {
+    /// Last frame's brake demand from the core, and that demand smoothed.
+    demand: f32,
+    smoothed: f32,
+    speed: f32,
+    a_est: f32,
+    /// The driver is on a pedal: the deceleration isn't the core's alone.
+    driver_pedals: bool,
+}
+
 /// One step of on-line brake-gain learning from what last frame's brake
-/// demand achieved. Only in the brakes' linear range: when the demand asks
-/// for more than the tyres can give, grip sets the deceleration and the gain
-/// would be learned far too low.
-fn learn_brake_gain(gain: f32, prev_brake: f32, speed: f32, a_est: f32, dt: f32) -> f32 {
-    let linear = prev_brake * gain < GAIN_LEARN_MAX_DECEL;
-    if prev_brake >= 0.03 && linear && speed > 2.0 && a_est < -0.5 {
-        let g = (-a_est / prev_brake).clamp(3.0, 150.0);
-        gain + (g - gain) * (dt / 0.5).min(1.0)
-    } else {
-        gain
+/// demand achieved. Only when the deceleration is the core's demand's doing:
+/// in the brakes' linear range (when the demand asks for more than the tyres
+/// can give, grip sets the deceleration and the gain would be learned far
+/// too low), with the demand steady (the brakes lag it), and with the
+/// driver off the pedals (a manual GTA drive taught 85 and 110 with the
+/// driver braking over a small AEB demand). Within `GAIN_PROFILE_BAND` of
+/// the saved profile, when there is one.
+fn learn_brake_gain(gain: f32, b: BrakeSample, profile: Option<f32>, dt: f32) -> f32 {
+    let linear = b.demand * gain < GAIN_LEARN_MAX_DECEL;
+    let steady = (b.demand - b.smoothed).abs() <= 0.15 * b.demand;
+    if b.demand < 0.03 || !linear || !steady || b.driver_pedals || b.speed <= 2.0 || b.a_est >= -0.5 {
+        return gain;
     }
+    let (lo, hi) = match profile {
+        Some(p) => (p / GAIN_PROFILE_BAND, p * GAIN_PROFILE_BAND),
+        None => (3.0, 150.0),
+    };
+    let g = (-b.a_est / b.demand).clamp(lo, hi);
+    (gain + (g - gain) * (dt / GAIN_LEARN_TAU).min(1.0)).clamp(lo, hi)
 }
 
 /// Acceleration per unit of throttle demand (m/s²), the calibration's guess.
@@ -279,6 +308,8 @@ impl Core {
             powertrain: actuators::Powertrain::new(),
             eps: actuators::Eps::with_limits(eps_limits),
             brake_gain: BRAKE_GAIN_INIT,
+            brake_profile: None,
+            brake_smoothed: 0.0,
             prev_brake: 0.0,
             impact_window: std::collections::VecDeque::new(),
             vehicle: vbus::Vehicle::new(can::Delivery::Reactive),
@@ -447,10 +478,12 @@ impl Core {
         self.brake_gain
     }
 
-    /// Starts from a known brake gain (a vehicle profile, D19).
+    /// Starts from a known brake gain (a vehicle profile, D19); the session
+    /// then learns within a band around it.
     pub fn set_brake_gain(&mut self, g: f32) {
         if g.is_finite() && (3.0..=150.0).contains(&g) {
             self.brake_gain = g;
+            self.brake_profile = Some(g);
         }
     }
 
@@ -616,7 +649,15 @@ impl Core {
                 self.a_est += (a - self.a_est) * (dt / 0.08).min(1.0);
             }
             self.prev_speed = Some(s.speed);
-            self.brake_gain = learn_brake_gain(self.brake_gain, self.prev_brake, s.speed, self.a_est, dt);
+            self.brake_smoothed += (self.prev_brake - self.brake_smoothed) * (dt / 0.3).min(1.0);
+            let b = BrakeSample {
+                demand: self.prev_brake,
+                smoothed: self.brake_smoothed,
+                speed: s.speed,
+                a_est: self.a_est,
+                driver_pedals: s.driver_brake > 0.02 || s.driver_throttle > 0.02,
+            };
+            self.brake_gain = learn_brake_gain(self.brake_gain, b, self.brake_profile, dt);
         }
 
         // An impact cancels everything, as a crash signal does on a real car.
@@ -1253,19 +1294,49 @@ mod tests {
         assert_eq!(run(), run());
     }
 
+    fn brake(demand: f32, a_est: f32) -> BrakeSample {
+        BrakeSample { demand, smoothed: demand, speed: 15.0, a_est, driver_pedals: false }
+    }
+
     #[test]
     fn the_brake_gain_is_learned_only_inside_grip() {
         // Brakes give 40 m/s² per unit: 0.1 of brake measures 4 m/s².
         let mut g = 8.0;
-        for _ in 0..200 {
-            g = learn_brake_gain(g, 0.1, 15.0, -4.0, 1.0 / 72.0);
+        for _ in 0..1000 {
+            g = learn_brake_gain(g, brake(0.1, -4.0), None, 1.0 / 72.0);
         }
         assert!((g - 40.0).abs() < 1.0, "learned {g}");
         // Full braking measures the tyres' 9 m/s², not the brakes: no change.
         for _ in 0..200 {
-            g = learn_brake_gain(g, 1.0, 15.0, -9.0, 1.0 / 72.0);
+            g = learn_brake_gain(g, brake(1.0, -9.0), None, 1.0 / 72.0);
         }
         assert!((g - 40.0).abs() < 1.0, "full braking taught {g}");
+    }
+
+    #[test]
+    fn the_brake_gain_is_not_taught_by_the_driver_or_a_ramp() {
+        // The driver brakes hard over a small demand: 0.05 "gives" 8 m/s².
+        let mut g = 43.0;
+        for _ in 0..500 {
+            g = learn_brake_gain(g, BrakeSample { driver_pedals: true, ..brake(0.05, -8.0) }, None, 1.0 / 72.0);
+        }
+        assert_eq!(g, 43.0, "the driver's braking taught {g}");
+        // The demand ramping up (the brakes lag it): not steady, no change.
+        for _ in 0..500 {
+            g = learn_brake_gain(g, BrakeSample { smoothed: 0.05, ..brake(0.1, -1.0) }, None, 1.0 / 72.0);
+        }
+        assert_eq!(g, 43.0, "a ramp taught {g}");
+    }
+
+    #[test]
+    fn a_session_stays_near_the_saved_profile() {
+        // Something the guards miss says 110: with a profile of 43, the
+        // session goes no further than 43 × 1.3.
+        let mut g = 43.0;
+        for _ in 0..5000 {
+            g = learn_brake_gain(g, brake(0.05, -5.5), Some(43.0), 1.0 / 72.0);
+        }
+        assert!((g - 43.0 * GAIN_PROFILE_BAND).abs() < 0.01, "{g}");
     }
 
     #[test]
